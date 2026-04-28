@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+playwright
+beautifulsoup4
+html2text
+pandas
+lxml
+aiohttp
+pyinstaller
+jinja2
