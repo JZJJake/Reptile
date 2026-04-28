@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>网页信息全量提取客户端</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f5f7fa;
+            color: #333;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .container {
+            background-color: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #2c3e50;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: bold;
+        }
+        input[type="url"] {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 16px;
+            box-sizing: border-box;
+        }
+        .checkbox-group {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        button {
+            background-color: #3498db;
+            color: white;
+            border: none;
+            padding: 12px 20px;
+            border-radius: 5px;
+            font-size: 16px;
+            cursor: pointer;
+            width: 100%;
+            transition: background-color 0.3s;
+        }
+        button:hover {
+            background-color: #2980b9;
+        }
+        button:disabled {
+            background-color: #95a5a6;
+            cursor: not-allowed;
+        }
+        #result {
+            margin-top: 20px;
+            padding: 15px;
+            border-radius: 5px;
+            display: none;
+        }
+        .success {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .error {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .loader {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #3498db;
+            border-radius: 50%;
+            width: 30px;
+            height: 30px;
+            animation: spin 1s linear infinite;
+            margin: 20px auto;
+            display: none;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        #status-text {
+            text-align: center;
+            color: #666;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>网页全量信息提取客户端</h1>
+
+    <div class="form-group">
+        <label for="url">目标网址 (URL)</label>
+        <input type="url" id="url" placeholder="https://www.gov.cn/..." required>
+    </div>
+
+    <div class="form-group checkbox-group">
+        <input type="checkbox" id="show-browser" checked>
+        <label for="show-browser" style="margin-bottom: 0; font-weight: normal;">显示浏览器爬取过程 (取消勾选可后台静默爬取)</label>
+    </div>
+
+    <button id="start-btn" onclick="startScraping()">开始提取</button>
+
+    <div class="loader" id="loader"></div>
+    <div id="status-text">正在爬取网页全量信息，请耐心等待...</div>
+
+    <div id="result"></div>
+</div>
+
+<script>
+    async function startScraping() {
+        const urlInput = document.getElementById('url').value;
+        const showBrowser = document.getElementById('show-browser').checked;
+        const btn = document.getElementById('start-btn');
+        const loader = document.getElementById('loader');
+        const statusText = document.getElementById('status-text');
+        const resultDiv = document.getElementById('result');
+
+        if (!urlInput) {
+            alert('请输入有效的网址！');
+            return;
+        }
+
+        // Reset UI
+        btn.disabled = true;
+        loader.style.display = 'block';
+        statusText.style.display = 'block';
+        resultDiv.style.display = 'none';
+        resultDiv.className = '';
+
+        try {
+            const response = await fetch('/api/scrape', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    url: urlInput,
+                    show_browser: showBrowser
+                })
+            });
+
+            const data = await response.json();
+
+            resultDiv.style.display = 'block';
+            if (response.ok && data.status === 'success') {
+                resultDiv.className = 'success';
+                resultDiv.innerHTML = `
+                    <strong>提取成功！</strong><br>
+                    ${data.message}<br><br>
+                    请在本地 <b>${data.path}</b> 文件夹中查看结果。
+                `;
+            } else {
+                resultDiv.className = 'error';
+                resultDiv.innerHTML = `<strong>提取失败：</strong> ${data.detail || data.message || '未知错误'}`;
+            }
+        } catch (error) {
+            resultDiv.style.display = 'block';
+            resultDiv.className = 'error';
+            resultDiv.innerHTML = `<strong>请求错误：</strong> ${error.message}`;
+        } finally {
+            btn.disabled = false;
+            loader.style.display = 'none';
+            statusText.style.display = 'none';
+        }
+    }
+</script>
+
+</body>
+</html>
