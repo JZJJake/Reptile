@@ -82,12 +82,12 @@ async def download_image(session, img_url, save_path):
     return False
 
 def get_sub_domain_links(html, current_url, base_url):
-    """Extract links that are sub-paths of the base_url to ensure we only crawl under the root dir."""
+    """Extract links that share the same domain as the base_url."""
     soup = BeautifulSoup(html, 'lxml')
     links = []
 
-    # Ensure base_url ends with '/' for proper prefix matching
-    base_prefix = base_url if base_url.endswith('/') else base_url + '/'
+    base_parsed = urllib.parse.urlparse(base_url)
+    base_domain = base_parsed.netloc
 
     # Common static file extensions to ignore
     ignored_extensions = {'.pdf', '.zip', '.rar', '.exe', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.mp3', '.mp4', '.avi', '.jpg', '.jpeg', '.png', '.gif'}
@@ -102,8 +102,8 @@ def get_sub_domain_links(html, current_url, base_url):
         ext = os.path.splitext(parsed_url.path)[1].lower()
 
         if parsed_url.scheme in ['http', 'https'] and ext not in ignored_extensions:
-            # Check if it's a sub-directory of the base root
-            if full_url.startswith(base_prefix) or full_url == base_url:
+            # Check if it shares the same domain (netloc)
+            if parsed_url.netloc == base_domain:
                 links.append(full_url)
     return list(set(links))
 
@@ -151,6 +151,73 @@ async def process_images(soup, base_url, images_path, session):
 
     if download_tasks:
         await asyncio.gather(*download_tasks)
+
+import re
+
+def extract_publish_info(soup):
+    """Extract publish date, source, and author information."""
+    info_text = []
+
+    # Common text patterns in government websites
+    patterns = [
+        re.compile(r'(?:发布|创建)时间\s*[:：]\s*(\d{4}[-/年]\d{1,2}[-/月]\d{1,2}[日]?[\s\d:]*)'),
+        re.compile(r'来源\s*[:：]\s*([^\s]+)'),
+        re.compile(r'作者\s*[:：]\s*([^\s]+)')
+    ]
+
+    # Check meta tags first
+    meta_date = soup.find('meta', attrs={'name': re.compile(r'pubdate', re.I)})
+    if meta_date and meta_date.get('content'):
+        info_text.append(f"**发布时间:** {meta_date['content']}")
+
+    meta_source = soup.find('meta', attrs={'name': re.compile(r'source', re.I)})
+    if meta_source and meta_source.get('content'):
+        info_text.append(f"**来源:** {meta_source['content']}")
+
+    # Search in text nodes if we don't have them
+    full_text = soup.get_text(separator=' ', strip=True)
+    if not any("发布时间" in t for t in info_text):
+        match = patterns[0].search(full_text)
+        if match:
+            info_text.append(f"**发布时间:** {match.group(1)}")
+
+    if not any("来源" in t for t in info_text):
+        match = patterns[1].search(full_text)
+        if match:
+            info_text.append(f"**来源:** {match.group(1)}")
+
+    match = patterns[2].search(full_text)
+    if match:
+        info_text.append(f"**作者:** {match.group(1)}")
+
+    return "\n".join(info_text)
+
+def clean_html_structure(soup):
+    """Remove boilerplate tags (nav, footer, sidebar) to extract clean core content."""
+    # Tags to remove entirely
+    tags_to_decompose = [
+        'nav', 'footer', 'header', 'aside', 'script', 'style', 'noscript', 'iframe'
+    ]
+    for tag in tags_to_decompose:
+        for match in soup.find_all(tag):
+            match.decompose()
+
+    # Classes/IDs commonly used for non-content wrappers
+    bad_classes_ids = re.compile(r'menu|nav|footer|sidebar|header|banner|ad|advert|breadcrumb|share|comment', re.I)
+
+    for tag in soup.find_all(['div', 'ul', 'ol', 'section']):
+        # Some tags might not have attributes dict if they are malformed or a NavigableString (though find_all filters)
+        if not hasattr(tag, 'attrs'):
+            continue
+
+        class_list = tag.attrs.get('class') if tag.attrs else None
+        class_str = " ".join(class_list) if isinstance(class_list, list) else (class_list if isinstance(class_list, str) else "")
+        id_str = tag.attrs.get('id', '') if tag.attrs else ''
+
+        if bad_classes_ids.search(class_str) or bad_classes_ids.search(id_str):
+            tag.decompose()
+
+    return soup
 
 def convert_to_markdown(html):
     """Convert HTML to clean Markdown text."""
@@ -202,6 +269,7 @@ async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
         page = await context.new_page()
 
         try:
+            import random
             while True:
                 # Check for pause/stop signals before fetching the next URL
                 should_stop = await check_pause_stop(task_id)
@@ -213,6 +281,10 @@ async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
                     # No more URLs to crawl
                     db_manager.update_task_status(task_id, 'completed')
                     break
+
+                # Add random delay to simulate human behavior and avoid WAF rate limiting
+                delay = random.uniform(1.0, 3.0)
+                await asyncio.sleep(delay)
 
                 try:
                     try:
@@ -238,19 +310,27 @@ async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
                     # Extract robust content
                     full_soup = BeautifulSoup(html_content, 'lxml')
 
+                    # Extract publish info BEFORE structural cleaning
+                    publish_info = extract_publish_info(full_soup)
+
                     # 1. Try to get title from document or fallback to <title> tag
                     title = full_soup.title.string if full_soup.title else "Untitled Page"
                     try:
-                        doc = Document(html_content)
+                        # Clean the raw HTML first so readability doesn't get confused by giant footers
+                        cleaned_soup = clean_html_structure(BeautifulSoup(html_content, 'lxml'))
+                        cleaned_html = str(cleaned_soup)
+
+                        doc = Document(cleaned_html)
                         title = doc.title() or title
                         main_html = doc.summary()
                         main_soup = BeautifulSoup(main_html, 'lxml')
 
-                        # Fallback if readability library stripped too much (e.g., node pages)
+                        # Fallback if readability library stripped too much
                         if len(main_soup.get_text(strip=True)) < 50:
-                            main_soup = full_soup.find('body') or full_soup
+                            main_soup = cleaned_soup.find('body') or cleaned_soup
                     except Exception:
-                        main_soup = full_soup.find('body') or full_soup
+                        cleaned_soup = clean_html_structure(BeautifulSoup(html_content, 'lxml'))
+                        main_soup = cleaned_soup.find('body') or cleaned_soup
 
                     page_path, tables_path, images_path = setup_page_directory(base_path, title)
 
@@ -277,17 +357,28 @@ async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
                         markdown_content += md_images
 
                     # Final markdown formatting
-                    markdown_content = f"# {title}\n\n**Source URL:** {current_url}\n\n---\n\n{markdown_content}"
+                    markdown_header = f"# {title}\n\n**Source URL:** {current_url}\n"
+                    if publish_info:
+                        markdown_header += f"{publish_info}\n"
+                    markdown_header += "\n---\n\n"
+
+                    markdown_content = markdown_header + markdown_content
 
                     # Content heuristic: differentiate between 'node' (navigational) and 'article' (substantive)
-                    # We can use text length of the extracted readable content as a primary heuristic.
-                    # Alternatively, if there are many links relative to the text length, it's likely a node.
-                    # We'll use a simple threshold on the raw markdown length (excluding the boilerplate we added).
-                    clean_md_len = len(markdown_content) - len(f"# {title}\n\n**Source URL:** {current_url}\n\n---\n\n")
+                    # We look for continuous text blocks > 30 characters in the parsed HTML tree.
+                    content_type = 'node'
+                    text_blocks = full_soup.find_all(['p', 'div', 'span', 'article', 'section'])
+                    for block in text_blocks:
+                        # Exclude links from text calculation to avoid counting giant lists of links as content
+                        # We temporarily remove 'a' tags for length calculation
+                        temp_block = BeautifulSoup(str(block), 'lxml')
+                        for a in temp_block.find_all('a'):
+                            a.decompose()
 
-                    content_type = 'article'
-                    if clean_md_len < 300: # Adjust threshold as needed
-                        content_type = 'node'
+                        text_content = temp_block.get_text(strip=True)
+                        if len(text_content) > 30:
+                            content_type = 'article'
+                            break
 
                     # Save markdown even for nodes, but we might want to optionally skip it in future.
                     md_path = os.path.join(page_path, "content.md")
@@ -298,6 +389,8 @@ async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
                     db_manager.mark_url_scraped(task_id, current_url, title, page_path, content_type)
 
                 except Exception as page_e:
+                    import traceback
+                    traceback.print_exc()
                     print(f"Error scraping {current_url}: {page_e}")
                     db_manager.mark_url_failed(task_id, current_url, str(page_e))
 

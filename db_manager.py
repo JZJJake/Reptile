@@ -79,9 +79,10 @@ def get_task(task_id: str):
     return dict(task) if task else None
 
 def get_pending_url(task_id: str) -> Optional[str]:
+    """Get the most recently added pending URL to simulate Depth-First Search (DFS LIFO stack)."""
     conn = get_db_connection()
     row = conn.execute(
-        'SELECT url FROM urls WHERE task_id = ? AND status = ? LIMIT 1',
+        'SELECT url FROM urls WHERE task_id = ? AND status = ? ORDER BY id DESC LIMIT 1',
         (task_id, 'pending')
     ).fetchone()
     conn.close()
