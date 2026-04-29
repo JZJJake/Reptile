@@ -64,12 +64,14 @@ async def get_scraping_status(task_id: str):
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    pending = db_manager.get_pending_url(task_id)
+    # In concurrent mode, "current" isn't just one pending, it's multiple processing
+    # Let's just return a count of active links or a general label
+    active_count = db_manager.get_active_count(task_id)
 
     return {
         "status": task['status'],
         "pages_scraped": task['total_scraped'],
-        "current_url": pending,
+        "current_url": f"{active_count} 个页面正在队列中...",
         "is_running": task['status'] == 'running'
     }
 
