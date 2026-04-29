@@ -82,12 +82,12 @@ async def download_image(session, img_url, save_path):
     return False
 
 def get_sub_domain_links(html, current_url, base_url):
-    """Extract links that are sub-paths of the base_url to ensure we only crawl under the root dir."""
+    """Extract links that share the same domain as the base_url."""
     soup = BeautifulSoup(html, 'lxml')
     links = []
 
-    # Ensure base_url ends with '/' for proper prefix matching
-    base_prefix = base_url if base_url.endswith('/') else base_url + '/'
+    base_parsed = urllib.parse.urlparse(base_url)
+    base_domain = base_parsed.netloc
 
     # Common static file extensions to ignore
     ignored_extensions = {'.pdf', '.zip', '.rar', '.exe', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.mp3', '.mp4', '.avi', '.jpg', '.jpeg', '.png', '.gif'}
@@ -102,8 +102,8 @@ def get_sub_domain_links(html, current_url, base_url):
         ext = os.path.splitext(parsed_url.path)[1].lower()
 
         if parsed_url.scheme in ['http', 'https'] and ext not in ignored_extensions:
-            # Check if it's a sub-directory of the base root
-            if full_url.startswith(base_prefix) or full_url == base_url:
+            # Check if it shares the same domain (netloc)
+            if parsed_url.netloc == base_domain:
                 links.append(full_url)
     return list(set(links))
 
