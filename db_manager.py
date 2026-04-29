@@ -31,9 +31,16 @@ def init_db():
             title TEXT,
             saved_folder TEXT,
             error_msg TEXT,
+            content_type TEXT, -- 'node' or 'article'
             UNIQUE(task_id, url)
         )
     ''')
+
+    # Try adding content_type to existing databases
+    try:
+        cursor.execute('ALTER TABLE urls ADD COLUMN content_type TEXT')
+    except sqlite3.OperationalError:
+        pass # Column already exists
 
     conn.commit()
     conn.close()
@@ -80,11 +87,11 @@ def get_pending_url(task_id: str) -> Optional[str]:
     conn.close()
     return row['url'] if row else None
 
-def mark_url_scraped(task_id: str, url: str, title: str = None, saved_folder: str = None):
+def mark_url_scraped(task_id: str, url: str, title: str = None, saved_folder: str = None, content_type: str = None):
     conn = get_db_connection()
     conn.execute(
-        'UPDATE urls SET status = ?, title = ?, saved_folder = ? WHERE task_id = ? AND url = ?',
-        ('scraped', title, saved_folder, task_id, url)
+        'UPDATE urls SET status = ?, title = ?, saved_folder = ?, content_type = ? WHERE task_id = ? AND url = ?',
+        ('scraped', title, saved_folder, content_type, task_id, url)
     )
     conn.execute(
         'UPDATE tasks SET total_scraped = total_scraped + 1 WHERE task_id = ?',
@@ -115,7 +122,7 @@ def add_discovered_urls(task_id: str, parent_url: str, new_urls: List[str]):
 
 def get_url_tree(task_id: str) -> List[Dict[str, Any]]:
     conn = get_db_connection()
-    rows = conn.execute('SELECT url, parent_url, status, title FROM urls WHERE task_id = ?', (task_id,)).fetchall()
+    rows = conn.execute('SELECT url, parent_url, status, title, content_type FROM urls WHERE task_id = ?', (task_id,)).fetchall()
     conn.close()
     return [dict(row) for row in rows]
 
