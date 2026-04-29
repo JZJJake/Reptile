@@ -280,14 +280,20 @@ async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
                     markdown_content = f"# {title}\n\n**Source URL:** {current_url}\n\n---\n\n{markdown_content}"
 
                     # Content heuristic: differentiate between 'node' (navigational) and 'article' (substantive)
-                    # We can use text length of the extracted readable content as a primary heuristic.
-                    # Alternatively, if there are many links relative to the text length, it's likely a node.
-                    # We'll use a simple threshold on the raw markdown length (excluding the boilerplate we added).
-                    clean_md_len = len(markdown_content) - len(f"# {title}\n\n**Source URL:** {current_url}\n\n---\n\n")
+                    # We look for continuous text blocks > 30 characters in the parsed HTML tree.
+                    content_type = 'node'
+                    text_blocks = full_soup.find_all(['p', 'div', 'span', 'article', 'section'])
+                    for block in text_blocks:
+                        # Exclude links from text calculation to avoid counting giant lists of links as content
+                        # We temporarily remove 'a' tags for length calculation
+                        temp_block = BeautifulSoup(str(block), 'lxml')
+                        for a in temp_block.find_all('a'):
+                            a.decompose()
 
-                    content_type = 'article'
-                    if clean_md_len < 300: # Adjust threshold as needed
-                        content_type = 'node'
+                        text_content = temp_block.get_text(strip=True)
+                        if len(text_content) > 30:
+                            content_type = 'article'
+                            break
 
                     # Save markdown even for nodes, but we might want to optionally skip it in future.
                     md_path = os.path.join(page_path, "content.md")

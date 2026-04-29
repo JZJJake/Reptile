@@ -114,10 +114,12 @@
         .icon-pending { color: #FFC107; font-weight: bold; margin-right: 5px; }
         .icon-failed { color: #F44336; font-weight: bold; margin-right: 5px; }
 
-        .node-article { color: #4CAF50; } /* Green for real content */
-        .node-node { color: #569CD6; } /* Blue for navigational nodes */
-        .node-pending { color: #aaaaaa; } /* Gray for pending */
+        .node-article { color: #4CAF50; font-weight: bold; } /* Green for real content */
+        .node-node { color: #569CD6; font-style: italic; } /* Blue for navigational nodes */
+        .node-pending { color: #888888; text-decoration: line-through; } /* Gray and struck out until loaded */
         .node-failed { color: #F44336; } /* Red for failed */
+
+        .icon-pending { color: #888888; font-weight: bold; margin-right: 5px; }
 
     </style>
 </head>
@@ -234,18 +236,18 @@
     function createNodeElement(node) {
         const li = document.createElement('li');
 
-        let icon = '<span class="icon-pending">○</span>';
+        let icon = '<span class="icon-pending">◷</span>';
         let textClass = 'node-text node-pending';
-        let typeLabel = '';
+        let typeLabel = ' <span style="color:#888888; font-size: 0.8em;">[未下载]</span>';
 
         if (node.status === 'scraped') {
             icon = '<span class="icon-scraped">●</span>';
             if (node.content_type === 'node') {
                 textClass = 'node-text node-node';
-                typeLabel = ' <span style="color:#569CD6; font-size: 0.8em;">[Node]</span>';
+                typeLabel = ' <span style="color:#569CD6; font-size: 0.8em;">[节点结构 Node]</span>';
             } else {
                 textClass = 'node-text node-article';
-                typeLabel = ' <span style="color:#4CAF50; font-size: 0.8em;">[Article]</span>';
+                typeLabel = ' <span style="color:#4CAF50; font-size: 0.8em;">[具体内容 Article]</span>';
             }
         }
         if (node.status === 'failed') {
