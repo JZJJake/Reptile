@@ -8,3 +8,4 @@ lxml
 aiohttp
 pyinstaller
 jinja2
+readability-lxml

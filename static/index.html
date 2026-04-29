@@ -32,13 +32,18 @@
             margin-bottom: 8px;
             font-weight: bold;
         }
-        input[type="url"] {
+        input[type="url"], input[type="number"] {
             width: 100%;
             padding: 12px;
             border: 1px solid #ddd;
             border-radius: 5px;
             font-size: 16px;
             box-sizing: border-box;
+        }
+        .settings-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
         }
         .checkbox-group {
             display: flex;
@@ -55,6 +60,7 @@
             cursor: pointer;
             width: 100%;
             transition: background-color 0.3s;
+            margin-top: 10px;
         }
         button:hover {
             background-color: #2980b9;
@@ -79,24 +85,35 @@
             color: #721c24;
             border: 1px solid #f5c6cb;
         }
+        .progress-box {
+            background-color: #e8f4fd;
+            border: 1px solid #b6d4fe;
+            color: #084298;
+            padding: 15px;
+            border-radius: 5px;
+            margin-top: 20px;
+            display: none;
+        }
         .loader {
             border: 4px solid #f3f3f3;
             border-top: 4px solid #3498db;
             border-radius: 50%;
-            width: 30px;
-            height: 30px;
+            width: 20px;
+            height: 20px;
             animation: spin 1s linear infinite;
-            margin: 20px auto;
-            display: none;
+            display: inline-block;
+            vertical-align: middle;
+            margin-right: 10px;
         }
         @keyframes spin {
             0% { transform: rotate(0deg); }
             100% { transform: rotate(360deg); }
         }
         #status-text {
-            text-align: center;
-            color: #666;
-            display: none;
+            font-family: monospace;
+            margin-top: 10px;
+            font-size: 14px;
+            word-wrap: break-word;
         }
     </style>
 </head>
@@ -110,25 +127,48 @@
         <input type="url" id="url" placeholder="https://www.gov.cn/..." required>
     </div>
 
+    <div class="settings-grid">
+        <div class="form-group">
+            <label for="max-pages">最大抓取页面数</label>
+            <input type="number" id="max-pages" value="10" min="1" max="1000">
+            <small style="color: #666;">防止无休止抓取</small>
+        </div>
+        <div class="form-group">
+            <label for="max-depth">链接深入层级</label>
+            <input type="number" id="max-depth" value="1" min="0" max="5">
+            <small style="color: #666;">0=仅当前页, 1=当前页及直接链接</small>
+        </div>
+    </div>
+
     <div class="form-group checkbox-group">
         <input type="checkbox" id="show-browser" checked>
-        <label for="show-browser" style="margin-bottom: 0; font-weight: normal;">显示浏览器爬取过程 (取消勾选可后台静默爬取)</label>
+        <label for="show-browser" style="margin-bottom: 0; font-weight: normal;">显示浏览器界面 (取消勾选可后台静默爬取)</label>
     </div>
 
     <button id="start-btn" onclick="startScraping()">开始提取</button>
 
-    <div class="loader" id="loader"></div>
-    <div id="status-text">正在爬取网页全量信息，请耐心等待...</div>
+    <div class="progress-box" id="progress-box">
+        <div>
+            <div class="loader"></div>
+            <strong>正在执行抓取任务...</strong>
+        </div>
+        <div id="status-text">初始化中...</div>
+    </div>
 
     <div id="result"></div>
 </div>
 
 <script>
+    let pollInterval;
+
     async function startScraping() {
         const urlInput = document.getElementById('url').value;
+        const maxPages = parseInt(document.getElementById('max-pages').value) || 10;
+        const maxDepth = parseInt(document.getElementById('max-depth').value) || 1;
         const showBrowser = document.getElementById('show-browser').checked;
+
         const btn = document.getElementById('start-btn');
-        const loader = document.getElementById('loader');
+        const progressBox = document.getElementById('progress-box');
         const statusText = document.getElementById('status-text');
         const resultDiv = document.getElementById('result');
 
@@ -139,46 +179,87 @@
 
         // Reset UI
         btn.disabled = true;
-        loader.style.display = 'block';
-        statusText.style.display = 'block';
+        progressBox.style.display = 'block';
         resultDiv.style.display = 'none';
         resultDiv.className = '';
+        statusText.innerText = '正在启动浏览器...';
 
         try {
-            const response = await fetch('/api/scrape', {
+            const response = await fetch('/api/scrape/start', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
                 },
                 body: JSON.stringify({
                     url: urlInput,
-                    show_browser: showBrowser
+                    show_browser: showBrowser,
+                    max_pages: maxPages,
+                    max_depth: maxDepth
                 })
             });
 
             const data = await response.json();
 
-            resultDiv.style.display = 'block';
-            if (response.ok && data.status === 'success') {
-                resultDiv.className = 'success';
-                resultDiv.innerHTML = `
-                    <strong>提取成功！</strong><br>
-                    ${data.message}<br><br>
-                    请在本地 <b>${data.path}</b> 文件夹中查看结果。
-                `;
+            if (response.ok && data.task_id) {
+                // Start polling
+                pollInterval = setInterval(() => pollStatus(data.task_id), 2000);
             } else {
-                resultDiv.className = 'error';
-                resultDiv.innerHTML = `<strong>提取失败：</strong> ${data.detail || data.message || '未知错误'}`;
+                showError(data.detail || '启动任务失败');
             }
         } catch (error) {
-            resultDiv.style.display = 'block';
-            resultDiv.className = 'error';
-            resultDiv.innerHTML = `<strong>请求错误：</strong> ${error.message}`;
-        } finally {
-            btn.disabled = false;
-            loader.style.display = 'none';
-            statusText.style.display = 'none';
+            showError(`请求错误：${error.message}`);
         }
+    }
+
+    async function pollStatus(taskId) {
+        const statusText = document.getElementById('status-text');
+
+        try {
+            const response = await fetch(`/api/scrape/status/${taskId}`);
+            const data = await response.json();
+
+            if (response.ok) {
+                statusText.innerText = data.status_message;
+
+                if (!data.is_running) {
+                    clearInterval(pollInterval);
+
+                    if (data.has_error) {
+                        showError(data.error_message);
+                    } else {
+                        showSuccess(`抓取完成！共抓取了 ${data.pages_scraped} 个页面。<br><br>数据保存在：<b>${data.current_url}</b>`);
+                    }
+                }
+            }
+        } catch (error) {
+            console.error("Polling error:", error);
+        }
+    }
+
+    function showError(message) {
+        const btn = document.getElementById('start-btn');
+        const progressBox = document.getElementById('progress-box');
+        const resultDiv = document.getElementById('result');
+
+        btn.disabled = false;
+        progressBox.style.display = 'none';
+
+        resultDiv.style.display = 'block';
+        resultDiv.className = 'error';
+        resultDiv.innerHTML = `<strong>提取失败：</strong> ${message}`;
+    }
+
+    function showSuccess(message) {
+        const btn = document.getElementById('start-btn');
+        const progressBox = document.getElementById('progress-box');
+        const resultDiv = document.getElementById('result');
+
+        btn.disabled = false;
+        progressBox.style.display = 'none';
+
+        resultDiv.style.display = 'block';
+        resultDiv.className = 'success';
+        resultDiv.innerHTML = `<strong>提取成功！</strong><br><br>${message}`;
     }
 </script>
 
