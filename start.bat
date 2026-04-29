@@ -9,7 +9,7 @@ echo     正在为您检查并配置运行环境...
 echo.
 echo ===================================================
 
-:: 检查 Python 是否安装
+REM 检查 Python 是否安装
 python --version >nul 2>&1
 if %errorlevel% neq 0 (
     echo [错误] 未检测到 Python，请先安装 Python 3.11 及以上版本。
@@ -28,7 +28,7 @@ if %errorlevel% neq 0 (
 
 echo.
 echo [2/3] 正在检查 Playwright 浏览器内核...
-:: 检查是否已经安装了 chromium 内核，如果没有则安装
+REM 检查是否已经安装了 chromium 内核，如果没有则安装
 python -m playwright install chromium
 if %errorlevel% neq 0 (
     echo [错误] Playwright 浏览器内核安装失败，请检查网络连接！
@@ -46,7 +46,7 @@ echo.
 echo 请不要关闭此黑色窗口，关闭窗口将会停止运行！
 echo ===================================================
 
-:: 运行主程序
+REM 运行主程序
 python main.py
 
 pause

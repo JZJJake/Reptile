@@ -9,7 +9,7 @@ echo     这可能需要几分钟时间，请耐心等待...
 echo.
 echo ===================================================
 
-:: 检查并安装打包所需的依赖
+REM 检查并安装打包所需的依赖
 echo [1/2] 检查 PyInstaller 环境...
 pip install pyinstaller -i https://pypi.tuna.tsinghua.edu.cn/simple
 
