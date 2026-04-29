@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>爬虫智能控制台 - 数据地图</title>
+    <style>
+        body {
+            font-family: 'Consolas', 'Courier New', Courier, monospace;
+            background-color: #1e1e1e;
+            color: #d4d4d4;
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            box-sizing: border-box;
+        }
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #333;
+            padding-bottom: 15px;
+            margin-bottom: 20px;
+        }
+        .controls {
+            display: flex;
+            gap: 10px;
+        }
+        button {
+            background-color: #0e639c;
+            color: white;
+            border: none;
+            padding: 8px 15px;
+            border-radius: 3px;
+            cursor: pointer;
+            font-family: inherit;
+        }
+        button:hover { background-color: #1177bb; }
+        button:disabled { background-color: #4d4d4d; color: #888; cursor: not-allowed; }
+        .btn-pause { background-color: #d97b00; }
+        .btn-pause:hover { background-color: #ff9100; }
+        .btn-stop { background-color: #c53929; }
+        .btn-stop:hover { background-color: #e54636; }
+
+        .status-bar {
+            background: #252526;
+            padding: 10px;
+            border: 1px solid #333;
+            margin-bottom: 20px;
+            font-size: 14px;
+        }
+        .status-badge {
+            display: inline-block;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 12px;
+            font-weight: bold;
+            margin-left: 10px;
+        }
+        .bg-running { background-color: #28a745; color: white;}
+        .bg-paused { background-color: #ffc107; color: black;}
+        .bg-stopped { background-color: #dc3545; color: white;}
+        .bg-completed { background-color: #17a2b8; color: white;}
+
+        .tree-container {
+            flex: 1;
+            background: #1e1e1e;
+            border: 1px solid #333;
+            overflow: auto;
+            padding: 15px;
+        }
+
+        /* Basic Tree CSS */
+        ul.tree, ul.tree ul {
+            list-style: none;
+            margin: 0;
+            padding: 0;
+        }
+        ul.tree ul {
+            margin-left: 20px;
+            border-left: 1px dashed #555;
+        }
+        ul.tree li {
+            margin: 0;
+            padding: 5px 0 5px 20px;
+            position: relative;
+            white-space: nowrap;
+        }
+        ul.tree li::before {
+            content: "";
+            position: absolute;
+            top: 15px;
+            left: 0;
+            width: 20px;
+            border-top: 1px dashed #555;
+        }
+        ul.tree li:last-child::before {
+            background: #1e1e1e;
+            height: auto;
+            bottom: 0;
+        }
+        .node-text {
+            color: #9cdcfe;
+            text-decoration: none;
+        }
+        .node-title {
+            color: #ce9178;
+            font-size: 0.9em;
+            margin-left: 10px;
+        }
+        .icon-scraped { color: #4CAF50; font-weight: bold; margin-right: 5px; }
+        .icon-pending { color: #FFC107; font-weight: bold; margin-right: 5px; }
+        .icon-failed { color: #F44336; font-weight: bold; margin-right: 5px; }
+
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <h2>🌐 智能爬虫控制台</h2>
+        <div class="controls">
+            <button id="btnResume" onclick="sendAction('resume')" style="display:none;">▶ 继续 (Resume)</button>
+            <button id="btnPause" class="btn-pause" onclick="sendAction('pause')">⏸ 暂停 (Pause)</button>
+            <button id="btnStop" class="btn-stop" onclick="sendAction('stop')">⏹ 停止 (Stop)</button>
+        </div>
+    </div>
+
+    <div class="status-bar">
+        <div><strong>任务状态:</strong> <span id="statusBadge" class="status-badge bg-running">RUNNING</span></div>
+        <div style="margin-top: 8px;"><strong>已抓取页面:</strong> <span id="pagesScraped">0</span></div>
+        <div style="margin-top: 8px;"><strong>当前正处理:</strong> <span id="currentUrl" style="color: #4fc1ff;">...</span></div>
+    </div>
+
+    <div class="tree-container">
+        <ul class="tree" id="treeRoot">
+            <li>加载数据地图中...</li>
+        </ul>
+    </div>
+
+<script>
+    const urlParams = new URLSearchParams(window.location.search);
+    const taskId = urlParams.get('taskId');
+
+    if (!taskId) {
+        document.body.innerHTML = "<h2 style='color:red'>错误: 缺少 Task ID</h2>";
+    }
+
+    let pollInterval;
+
+    async function fetchStatus() {
+        try {
+            const res = await fetch(`/api/scrape/status/${taskId}`);
+            const data = await res.json();
+
+            document.getElementById('pagesScraped').innerText = data.pages_scraped;
+            document.getElementById('currentUrl').innerText = data.current_url || '无 (Idle/Complete)';
+
+            const badge = document.getElementById('statusBadge');
+            badge.innerText = data.status.toUpperCase();
+            badge.className = 'status-badge'; // reset
+
+            const btnResume = document.getElementById('btnResume');
+            const btnPause = document.getElementById('btnPause');
+            const btnStop = document.getElementById('btnStop');
+
+            if (data.status === 'running') {
+                badge.classList.add('bg-running');
+                btnResume.style.display = 'none';
+                btnPause.style.display = 'inline-block';
+                btnStop.disabled = false;
+            } else if (data.status === 'paused') {
+                badge.classList.add('bg-paused');
+                btnResume.style.display = 'inline-block';
+                btnPause.style.display = 'none';
+                btnStop.disabled = false;
+            } else if (data.status === 'stopped' || data.status === 'completed' || data.status === 'failed') {
+                badge.classList.add(data.status === 'completed' ? 'bg-completed' : 'bg-stopped');
+                btnResume.style.display = 'none';
+                btnPause.style.display = 'none';
+                btnStop.disabled = true;
+                if (data.status === 'completed' || data.status === 'failed') {
+                    clearInterval(pollInterval);
+                }
+            }
+        } catch (e) {
+            console.error(e);
+        }
+    }
+
+    async function fetchTree() {
+        try {
+            const res = await fetch(`/api/scrape/tree/${taskId}`);
+            const data = await res.json();
+            renderTree(data.tree);
+        } catch (e) {
+            console.error(e);
+        }
+    }
+
+    function renderTree(flatData) {
+        if (!flatData || flatData.length === 0) return;
+
+        // Build map
+        const map = {};
+        const roots = [];
+
+        flatData.forEach(node => {
+            map[node.url] = { ...node, children: [] };
+        });
+
+        flatData.forEach(node => {
+            if (node.parent_url && map[node.parent_url]) {
+                map[node.parent_url].children.push(map[node.url]);
+            } else {
+                roots.push(map[node.url]);
+            }
+        });
+
+        const rootEl = document.getElementById('treeRoot');
+        rootEl.innerHTML = '';
+
+        roots.forEach(rootNode => {
+            rootEl.appendChild(createNodeElement(rootNode));
+        });
+    }
+
+    function createNodeElement(node) {
+        const li = document.createElement('li');
+
+        let icon = '<span class="icon-pending">○</span>';
+        if (node.status === 'scraped') icon = '<span class="icon-scraped">●</span>';
+        if (node.status === 'failed') icon = '<span class="icon-failed">✖</span>';
+
+        let html = `${icon} <a href="${node.url}" target="_blank" class="node-text">${node.url}</a>`;
+        if (node.title) {
+            html += `<span class="node-title">" ${node.title} "</span>`;
+        }
+
+        const wrapper = document.createElement('div');
+        wrapper.innerHTML = html;
+        li.appendChild(wrapper);
+
+        if (node.children && node.children.length > 0) {
+            const ul = document.createElement('ul');
+            node.children.forEach(child => {
+                ul.appendChild(createNodeElement(child));
+            });
+            li.appendChild(ul);
+        }
+
+        return li;
+    }
+
+    async function sendAction(action) {
+        try {
+            await fetch(`/api/scrape/${action}/${taskId}`, { method: 'POST' });
+            fetchStatus(); // immediate update
+        } catch (e) {
+            alert('操作失败');
+        }
+    }
+
+    // Init
+    fetchStatus();
+    fetchTree();
+    pollInterval = setInterval(() => {
+        fetchStatus();
+        fetchTree();
+    }, 2000);
+
+</script>
+</body>
+</html>

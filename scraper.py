@@ -9,20 +9,23 @@ from bs4 import BeautifulSoup
 import html2text
 import aiohttp
 from readability import Document
+import io
 
-class ScraperStatus:
-    def __init__(self):
-        self.visited_urls = set()
-        self.queue = []
-        self.pages_scraped = 0
-        self.current_url = ""
-        self.status_message = "Initializing..."
-        self.is_running = True
-        self.has_error = False
-        self.error_message = ""
-        self.base_domain = ""
+import db_manager
 
-scraper_status_store = {}
+# Global dictionary to hold asyncio.Event objects for each task
+# task_id -> {'pause': Event, 'stop': Event}
+task_events = {}
+
+def init_task_events(task_id: str):
+    task_events[task_id] = {
+        'pause': asyncio.Event(),
+        'stop': asyncio.Event()
+    }
+    # Initially NOT paused
+    task_events[task_id]['pause'].set()
+    # Initially NOT stopped
+    task_events[task_id]['stop'].clear()
 
 def sanitize_filename(name):
     """Sanitize string to create a safe file/folder name."""
@@ -78,21 +81,29 @@ async def download_image(session, img_url, save_path):
         print(f"Error downloading {img_url}: {e}")
     return False
 
-def get_same_domain_links(html, base_url, base_domain):
-    """Extract valid links that belong to the same domain."""
+def get_sub_domain_links(html, current_url, base_url):
+    """Extract links that are sub-paths of the base_url to ensure we only crawl under the root dir."""
     soup = BeautifulSoup(html, 'lxml')
     links = []
+
+    # Ensure base_url ends with '/' for proper prefix matching
+    base_prefix = base_url if base_url.endswith('/') else base_url + '/'
+
+    # Common static file extensions to ignore
+    ignored_extensions = {'.pdf', '.zip', '.rar', '.exe', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.mp3', '.mp4', '.avi', '.jpg', '.jpeg', '.png', '.gif'}
+
     for a_tag in soup.find_all('a', href=True):
         href = a_tag['href']
-        full_url = urllib.parse.urljoin(base_url, href)
+        full_url = urllib.parse.urljoin(current_url, href)
         # Remove fragment
         full_url = urllib.parse.urldefrag(full_url)[0]
 
-        # Check if same domain and http/https
         parsed_url = urllib.parse.urlparse(full_url)
-        if parsed_url.scheme in ['http', 'https']:
-            url_domain = parsed_url.netloc.replace("www.", "")
-            if base_domain in url_domain:
+        ext = os.path.splitext(parsed_url.path)[1].lower()
+
+        if parsed_url.scheme in ['http', 'https'] and ext not in ignored_extensions:
+            # Check if it's a sub-directory of the base root
+            if full_url.startswith(base_prefix) or full_url == base_url:
                 links.append(full_url)
     return list(set(links))
 
@@ -103,8 +114,6 @@ async def scroll_page(page):
         await page.wait_for_timeout(1000)
     await page.evaluate("window.scrollTo(0, 0)")
     await page.wait_for_timeout(1000)
-
-import io
 
 def process_tables(soup, tables_path):
     """Extract tables and save as CSV."""
@@ -151,17 +160,38 @@ def convert_to_markdown(html):
     h.body_width = 0
     return h.handle(html)
 
-async def crawl_worker(task_id, start_url, max_pages, max_depth, headless):
-    """Background worker that handles the BFS crawling."""
-    status = ScraperStatus()
-    scraper_status_store[task_id] = status
+async def check_pause_stop(task_id: str) -> bool:
+    """Returns True if the task should stop, False otherwise. Handles pausing."""
+    events = task_events.get(task_id)
+    if not events:
+        return False
+
+    if events['stop'].is_set():
+        db_manager.update_task_status(task_id, 'stopped')
+        return True
+
+    if not events['pause'].is_set():
+        db_manager.update_task_status(task_id, 'paused')
+        await events['pause'].wait() # Wait until unpaused
+
+        # Check if stopped while paused
+        if events['stop'].is_set():
+            db_manager.update_task_status(task_id, 'stopped')
+            return True
+
+        db_manager.update_task_status(task_id, 'running')
+
+    return False
+
+async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
+    """Background worker that handles the smart crawling."""
+
+    init_task_events(task_id)
 
     base_path, base_domain = setup_base_directory(start_url)
-    status.base_domain = base_domain
 
-    # queue stores tuples of (url, current_depth)
-    status.queue.append((start_url, 0))
-    status.visited_urls.add(start_url)
+    # Save the base folder path so we know where to save
+    db_manager.create_task(task_id, start_url, start_url)
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
@@ -171,64 +201,84 @@ async def crawl_worker(task_id, start_url, max_pages, max_depth, headless):
         page = await context.new_page()
 
         try:
-            while status.queue and status.pages_scraped < max_pages:
-                current_url, current_depth = status.queue.pop(0)
-                status.current_url = current_url
-                status.status_message = f"Scraping [{status.pages_scraped + 1}/{max_pages}]: {current_url}"
-                print(status.status_message)
+            while True:
+                # Check for pause/stop signals before fetching the next URL
+                should_stop = await check_pause_stop(task_id)
+                if should_stop:
+                    break
+
+                current_url = db_manager.get_pending_url(task_id)
+                if not current_url:
+                    # No more URLs to crawl
+                    db_manager.update_task_status(task_id, 'completed')
+                    break
 
                 try:
                     await page.goto(current_url, wait_until="networkidle", timeout=60000)
                     await scroll_page(page)
                     html_content = await page.content()
 
-                    # Add new links to queue if depth allows
-                    if current_depth < max_depth:
-                        new_links = get_same_domain_links(html_content, current_url, base_domain)
-                        for link in new_links:
-                            if link not in status.visited_urls:
-                                status.visited_urls.add(link)
-                                status.queue.append((link, current_depth + 1))
+                    # Extract new links under the start root
+                    new_links = get_sub_domain_links(html_content, current_url, start_url)
+                    if new_links:
+                        db_manager.add_discovered_urls(task_id, current_url, new_links)
 
-                    # Use readability to extract MAIN article content
-                    doc = Document(html_content)
-                    title = doc.title()
-                    main_html = doc.summary()
+                    # Extract robust content
+                    full_soup = BeautifulSoup(html_content, 'lxml')
 
-                    # Clean up HTML and extract components
-                    soup = BeautifulSoup(main_html, 'lxml')
+                    # 1. Try to get title from document or fallback to <title> tag
+                    try:
+                        doc = Document(html_content)
+                        title = doc.title()
+                        main_html = doc.summary()
+                        main_soup = BeautifulSoup(main_html, 'lxml')
+                    except Exception:
+                        title = full_soup.title.string if full_soup.title else "Untitled Page"
+                        main_soup = full_soup.find('body') or full_soup
 
-                    # Create directory for this specific page
                     page_path, tables_path, images_path = setup_page_directory(base_path, title)
 
-                    process_tables(soup, tables_path)
+                    # 2. Extract tables from the MAIN content area
+                    process_tables(main_soup, tables_path)
 
+                    # 3. Extract images from the ENTIRE page (or a broad wrapper like body/main)
+                    # to ensure we don't miss image-only posts that readability might filter out.
+                    body_soup = full_soup.find('body') or full_soup
                     async with aiohttp.ClientSession() as session:
-                        await process_images(soup, current_url, images_path, session)
+                        await process_images(body_soup, current_url, images_path, session)
 
-                    markdown_content = convert_to_markdown(str(soup))
+                    # 4. Generate Markdown. Combine robust readability text with ALL images to ensure no loss.
+                    markdown_content = convert_to_markdown(str(main_soup))
 
-                    # Also append the source URL to the markdown
+                    # If readability missed images, append the ones we found in body
+                    images_in_body = body_soup.find_all('img')
+                    if images_in_body:
+                        md_images = "\n\n### Page Images\n"
+                        for img in images_in_body:
+                            src = img.get('src')
+                            if src and src.startswith('./images/'):
+                                md_images += f"![Image]({src})\n"
+                        markdown_content += md_images
+
+                    # Final markdown formatting
                     markdown_content = f"# {title}\n\n**Source URL:** {current_url}\n\n---\n\n{markdown_content}"
 
                     md_path = os.path.join(page_path, "content.md")
                     with open(md_path, 'w', encoding='utf-8') as f:
                         f.write(markdown_content)
 
-                    status.pages_scraped += 1
+                    # Mark success
+                    db_manager.mark_url_scraped(task_id, current_url, title, page_path)
 
                 except Exception as page_e:
                     print(f"Error scraping {current_url}: {page_e}")
-                    # Continue to next url on page error
-                    continue
-
-            status.status_message = f"Completed successfully! Scraped {status.pages_scraped} pages."
+                    db_manager.mark_url_failed(task_id, current_url, str(page_e))
 
         except Exception as e:
-            status.has_error = True
-            status.error_message = str(e)
-            status.status_message = f"Crawl failed: {str(e)}"
+            print(f"Crawl fatally failed: {str(e)}")
+            db_manager.update_task_status(task_id, 'failed')
         finally:
-            status.is_running = False
-            status.current_url = base_path # Store final path here for the client
             await browser.close()
+            # Cleanup events
+            if task_id in task_events:
+                del task_events[task_id]

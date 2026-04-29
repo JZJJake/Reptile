@@ -1,3 +1,13 @@
 build/
 dist/
 __pycache__/
+# Logs
+*.log
+server.log
+
+# Database
+*.db
+scraper_state.db
+
+# Scraped Data
+scraped_data/
