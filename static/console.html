@@ -117,10 +117,17 @@
         .node-article { color: #4CAF50; font-weight: bold; } /* Green for real content */
         .node-node { color: #569CD6; font-style: italic; } /* Blue for navigational nodes */
         .node-pending { color: #888888; text-decoration: line-through; } /* Gray and struck out until loaded */
+        .node-processing { color: #FF9800; animation: blink 1.5s infinite; } /* Orange and blinking for active */
         .node-failed { color: #F44336; } /* Red for failed */
 
         .icon-pending { color: #888888; font-weight: bold; margin-right: 5px; }
+        .icon-processing { color: #FF9800; font-weight: bold; margin-right: 5px; }
 
+        @keyframes blink {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
     </style>
 </head>
 <body>
@@ -240,7 +247,11 @@
         let textClass = 'node-text node-pending';
         let typeLabel = ' <span style="color:#888888; font-size: 0.8em;">[未下载]</span>';
 
-        if (node.status === 'scraped') {
+        if (node.status === 'processing') {
+            icon = '<span class="icon-processing">↻</span>';
+            textClass = 'node-text node-processing';
+            typeLabel = ' <span style="color:#FF9800; font-size: 0.8em;">[抓取中 Processing]</span>';
+        } else if (node.status === 'scraped') {
             icon = '<span class="icon-scraped">●</span>';
             if (node.content_type === 'node') {
                 textClass = 'node-text node-node';

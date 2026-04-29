@@ -88,6 +88,53 @@ def get_pending_url(task_id: str) -> Optional[str]:
     conn.close()
     return row['url'] if row else None
 
+def get_and_lock_pending_url(task_id: str) -> Optional[str]:
+    """Atomically get the most recent pending URL and mark it as processing to prevent concurrent grabs."""
+    conn = get_db_connection()
+    conn.execute("BEGIN EXCLUSIVE")
+    try:
+        row = conn.execute(
+            'SELECT url FROM urls WHERE task_id = ? AND status = ? ORDER BY id DESC LIMIT 1',
+            (task_id, 'pending')
+        ).fetchone()
+
+        if row:
+            url = row['url']
+            conn.execute(
+                'UPDATE urls SET status = ? WHERE task_id = ? AND url = ?',
+                ('processing', task_id, url)
+            )
+            conn.commit()
+            return url
+
+        conn.commit()
+        return None
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
+
+def reset_processing_urls(task_id: str):
+    """Reset URLs that are stuck in 'processing' back to 'pending' (useful on startup/resume)."""
+    conn = get_db_connection()
+    conn.execute(
+        "UPDATE urls SET status = 'pending' WHERE task_id = ? AND status = 'processing'",
+        (task_id,)
+    )
+    conn.commit()
+    conn.close()
+
+def get_active_count(task_id: str) -> int:
+    """Returns the number of URLs currently being processed or pending."""
+    conn = get_db_connection()
+    row = conn.execute(
+        "SELECT COUNT(*) as count FROM urls WHERE task_id = ? AND status IN ('pending', 'processing')",
+        (task_id,)
+    ).fetchone()
+    conn.close()
+    return row['count'] if row else 0
+
 def mark_url_scraped(task_id: str, url: str, title: str = None, saved_folder: str = None, content_type: str = None):
     conn = get_db_connection()
     conn.execute(

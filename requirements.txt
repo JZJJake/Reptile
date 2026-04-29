@@ -9,3 +9,4 @@ aiohttp
 pyinstaller
 jinja2
 readability-lxml
+playwright-stealth
