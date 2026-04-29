@@ -263,12 +263,23 @@ async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
                     # Final markdown formatting
                     markdown_content = f"# {title}\n\n**Source URL:** {current_url}\n\n---\n\n{markdown_content}"
 
+                    # Content heuristic: differentiate between 'node' (navigational) and 'article' (substantive)
+                    # We can use text length of the extracted readable content as a primary heuristic.
+                    # Alternatively, if there are many links relative to the text length, it's likely a node.
+                    # We'll use a simple threshold on the raw markdown length (excluding the boilerplate we added).
+                    clean_md_len = len(markdown_content) - len(f"# {title}\n\n**Source URL:** {current_url}\n\n---\n\n")
+
+                    content_type = 'article'
+                    if clean_md_len < 300: # Adjust threshold as needed
+                        content_type = 'node'
+
+                    # Save markdown even for nodes, but we might want to optionally skip it in future.
                     md_path = os.path.join(page_path, "content.md")
                     with open(md_path, 'w', encoding='utf-8') as f:
                         f.write(markdown_content)
 
-                    # Mark success
-                    db_manager.mark_url_scraped(task_id, current_url, title, page_path)
+                    # Mark success with content type
+                    db_manager.mark_url_scraped(task_id, current_url, title, page_path, content_type)
 
                 except Exception as page_e:
                     print(f"Error scraping {current_url}: {page_e}")
