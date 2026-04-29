@@ -196,7 +196,8 @@ async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            ignore_https_errors=True
         )
         page = await context.new_page()
 
@@ -214,7 +215,18 @@ async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
                     break
 
                 try:
-                    await page.goto(current_url, wait_until="networkidle", timeout=60000)
+                    try:
+                        # Use commit to prevent timeouts on sites with persistent tracking scripts or broken resources
+                        await page.goto(current_url, wait_until="commit", timeout=60000)
+
+                        # Wait for body to ensure the DOM is at least partially ready
+                        await page.wait_for_selector('body', state='attached', timeout=30000)
+
+                        # Wait a short moment for dynamic scripts to render content
+                        await page.wait_for_timeout(3000)
+                    except Exception as goto_e:
+                        print(f"Warning: page.goto timeout or error for {current_url}: {goto_e}. Attempting to proceed with loaded content.")
+
                     await scroll_page(page)
                     html_content = await page.content()
 
@@ -227,13 +239,17 @@ async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
                     full_soup = BeautifulSoup(html_content, 'lxml')
 
                     # 1. Try to get title from document or fallback to <title> tag
+                    title = full_soup.title.string if full_soup.title else "Untitled Page"
                     try:
                         doc = Document(html_content)
-                        title = doc.title()
+                        title = doc.title() or title
                         main_html = doc.summary()
                         main_soup = BeautifulSoup(main_html, 'lxml')
+
+                        # Fallback if readability library stripped too much (e.g., node pages)
+                        if len(main_soup.get_text(strip=True)) < 50:
+                            main_soup = full_soup.find('body') or full_soup
                     except Exception:
-                        title = full_soup.title.string if full_soup.title else "Untitled Page"
                         main_soup = full_soup.find('body') or full_soup
 
                     page_path, tables_path, images_path = setup_page_directory(base_path, title)
