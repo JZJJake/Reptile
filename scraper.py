@@ -130,8 +130,8 @@ def get_sub_domain_links(html, current_url, base_url, dynamic_root_prefix=None):
         ext = os.path.splitext(parsed_url.path)[1].lower()
 
         if parsed_url.scheme in ['http', 'https'] and ext not in ignored_extensions:
-            # Check if it is the base_url itself, or a child path of the base_prefix
-            if full_url == base_url or full_url.startswith(base_prefix):
+            # Check if it is the base_url itself, or a child path of the base_prefix (case-insensitive)
+            if full_url.lower() == base_url.lower() or full_url.lower().startswith(base_prefix.lower()):
                 links.append(full_url)
     return list(set(links))
 
