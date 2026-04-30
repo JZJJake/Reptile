@@ -84,67 +84,37 @@ async def download_image(session, img_url, save_path):
         print(f"Error downloading {img_url}: {e}")
     return False
 
-def determine_dynamic_root_prefix(start_url, html):
+def determine_static_boundary(start_url):
     """
-    Dynamically determines the root node prefix by analyzing link patterns on the start page.
-    Generates all parent directory prefixes of the start URL and chooses the deepest one
-    that contains a significant cluster of internal links.
+    Determines the strict physical generic boundary.
+    Extracts the parent directory of the current directory to include siblings and their children.
     """
-    parsed_start = urllib.parse.urlparse(start_url)
-    soup = BeautifulSoup(html, 'lxml')
+    parsed = urllib.parse.urlparse(start_url)
+    ext = os.path.splitext(parsed.path)[1].lower()
+    is_file = ext in ['.html', '.htm', '.php', '.jsp', '.asp', '.aspx']
 
-    internal_paths = []
-    ignored_extensions = {'.zip', '.rar', '.exe', '.mp3', '.mp4', '.avi', '.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg'}
+    path = parsed.path
+    if is_file:
+        path = path.rsplit('/', 1)[0]
 
-    for a_tag in soup.find_all('a', href=True):
-        href = a_tag['href']
-        full_url = urllib.parse.urljoin(start_url, href)
-        parsed_url = urllib.parse.urlparse(full_url)
+    path = path.rstrip('/')
 
-        if parsed_url.netloc != parsed_start.netloc:
-            continue
+    if not path:
+        base_path = '/'
+    else:
+        parts = path.rsplit('/', 1)
+        base_path = parts[0] if parts[0] else '/'
+        if not base_path.endswith('/'):
+            base_path += '/'
 
-        ext = os.path.splitext(parsed_url.path)[1].lower()
-        if ext in ignored_extensions:
-            continue
-
-        internal_paths.append(parsed_url.path)
-
-    if not internal_paths:
-        return start_url if start_url.endswith('/') else start_url + '/'
-
-    path_segments = [p for p in parsed_start.path.split('/') if p]
-    if path_segments and '.' in path_segments[-1]:
-        path_segments.pop()
-
-    prefixes = []
-    current = "/"
-    prefixes.append(current)
-    for seg in path_segments:
-        current += seg + "/"
-        prefixes.append(current)
-
-    prefixes.reverse()
-
-    total_links = len(internal_paths)
-    threshold = max(3, total_links * 0.1)
-
-    selected_prefix = prefixes[-1]
-
-    for prefix in prefixes:
-        count = sum(1 for p in internal_paths if p.startswith(prefix))
-        if count >= threshold:
-            selected_prefix = prefix
-            break
-
-    return urllib.parse.urlunparse((parsed_start.scheme, parsed_start.netloc, selected_prefix, '', '', ''))
+    return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, base_path, '', '', ''))
 
 def get_sub_domain_links(html, current_url, base_url, dynamic_root_prefix=None):
-    """Extract links that are downward paths from the dynamic root prefix."""
+    """Extract links that are downward paths from the pre-calculated root prefix."""
     soup = BeautifulSoup(html, 'lxml')
     links = []
 
-    # Use the pre-computed dynamic root prefix if available, otherwise fallback to base_url
+    # Use the pre-computed static root prefix if available, otherwise fallback to base_url
     base_prefix = dynamic_root_prefix if dynamic_root_prefix else (base_url if base_url.endswith('/') else base_url + '/')
 
     # Ignore purely media/executable files, but ALLOW documents we want to download
@@ -400,7 +370,7 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
         await scroll_page(page)
         html_content = await page.content()
 
-        # Ensure we have the dynamic root prefix. If it's the start URL, calculate and save it.
+        # Ensure we have the root boundary prefix. If it's the start URL, calculate and save it.
         # If it's a child worker picking up a task after a restart, try to load it from the DB.
         dynamic_root = task_root_prefixes.get(task_id)
         if not dynamic_root:
@@ -410,11 +380,11 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
                 task_root_prefixes[task_id] = dynamic_root
 
         if current_url == start_url and not dynamic_root:
-            dynamic_root = determine_dynamic_root_prefix(start_url, html_content)
+            dynamic_root = determine_static_boundary(start_url)
             task_root_prefixes[task_id] = dynamic_root
             db_manager.update_task_dynamic_root(task_id, dynamic_root)
 
-        # Extract new links under the dynamically determined root
+        # Extract new links under the determined generic root boundary
         new_links = get_sub_domain_links(html_content, current_url, start_url, dynamic_root)
         if new_links:
             db_manager.add_discovered_urls(task_id, current_url, new_links)
