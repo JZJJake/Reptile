@@ -123,6 +123,26 @@ async def stop_scraping(task_id: str):
     return {"status": "stopped"}
 
 
+def install_playwright_browsers():
+    """Ensure playwright browsers are installed before starting."""
+    print("Checking/installing Playwright browsers...")
+    # This environment variable forces Playwright to install and look for browsers
+    # in the local folder structure, rather than a global appdata folder which might
+    # fail or be hidden when running as a PyInstaller executable.
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
+
+    # Check if we're running as a frozen executable
+    if getattr(sys, 'frozen', False):
+        print("Running as a frozen executable. Skipping automatic playwright install since sys.executable points to this executable.")
+        return
+
+    try:
+        import subprocess
+        subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
+        print("Playwright browsers ready.")
+    except Exception as e:
+        print(f"Warning: Failed to install playwright browsers automatically. Error: {e}")
+
 def open_browser():
     """Wait a second for the server to start, then open the browser."""
     import time
@@ -132,6 +152,9 @@ def open_browser():
 if __name__ == "__main__":
     os.makedirs("static", exist_ok=True)
     os.makedirs("scraped_data", exist_ok=True)
+
+    # Pre-install browsers before launching the UI so it doesn't fail when hitting start
+    install_playwright_browsers()
 
     threading.Thread(target=open_browser, daemon=True).start()
 

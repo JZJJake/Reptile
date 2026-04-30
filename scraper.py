@@ -496,6 +496,9 @@ async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
     # Strictly limit concurrency to 5 to prevent memory overload and aggressive IP blocks
     semaphore = asyncio.Semaphore(5)
 
+    # Force PLAYWRIGHT_BROWSERS_PATH to 0 here as well so the worker picks it up
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
+
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(
