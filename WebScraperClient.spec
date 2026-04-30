@@ -5,7 +5,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('static', 'static')],
+    datas=[('static', 'static'), ('/home/jules/.pyenv/versions/3.12.13/lib/python3.12/site-packages/playwright_stealth/js', 'playwright_stealth/js')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

@@ -17,20 +17,22 @@ def build_exe():
     print("Running PyInstaller...")
 
     # Using pyinstaller executable
+    # Need to include playwright_stealth javascript files manually as PyInstaller ignores non-py files by default
+    import playwright_stealth
+    stealth_dir = os.path.dirname(playwright_stealth.__file__)
+    stealth_js = os.path.join(stealth_dir, "js")
+
+    separator = ';' if os.name == 'nt' else ':'
+
     command = [
         "pyinstaller",
         "--name", "WebScraperClient",
         "--noconfirm",
         "--onedir", # Using onedir instead of onefile because Playwright and fastAPI don't always play nice with onefile
-        "--add-data", "static:static",
+        "--add-data", f"static{separator}static",
+        "--add-data", f"{stealth_js}{separator}playwright_stealth/js",
         "main.py"
     ]
-
-    # On linux for testing the script syntax, we use ':' separator
-    if os.name != 'nt':
-        command[command.index("static:static")] = "static:static"
-    else:
-        command[command.index("static:static")] = "static;static"
 
     subprocess.run(command, check=True)
 
