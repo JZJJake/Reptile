@@ -19,6 +19,12 @@ def build_exe():
     # Using pyinstaller executable
     separator = ';' if os.name == 'nt' else ':'
 
+    # Pre-download playwright browsers locally before building
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
+    print("Pre-downloading Playwright browsers locally for packaging...")
+    import sys
+    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+
     command = [
         "pyinstaller",
         "--name", "WebScraperClient",
