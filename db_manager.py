@@ -16,9 +16,16 @@ def init_db():
             start_url TEXT,
             status TEXT, -- 'running', 'paused', 'completed', 'failed', 'stopped'
             total_scraped INTEGER DEFAULT 0,
-            base_url TEXT
+            base_url TEXT,
+            dynamic_root TEXT
         )
     ''')
+
+    # Try to alter table if the column doesn't exist (for existing DBs)
+    try:
+        cursor.execute('ALTER TABLE tasks ADD COLUMN dynamic_root TEXT')
+    except sqlite3.OperationalError:
+        pass # Column already exists
 
     # Create urls table representing the data chain and tree
     cursor.execute('''
@@ -69,6 +76,12 @@ def create_task(task_id: str, start_url: str, base_url: str):
 def update_task_status(task_id: str, status: str):
     conn = get_db_connection()
     conn.execute('UPDATE tasks SET status = ? WHERE task_id = ?', (status, task_id))
+    conn.commit()
+    conn.close()
+
+def update_task_dynamic_root(task_id: str, dynamic_root: str):
+    conn = get_db_connection()
+    conn.execute('UPDATE tasks SET dynamic_root = ? WHERE task_id = ?', (dynamic_root, task_id))
     conn.commit()
     conn.close()
 
