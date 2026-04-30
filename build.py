@@ -17,11 +17,6 @@ def build_exe():
     print("Running PyInstaller...")
 
     # Using pyinstaller executable
-    # Need to include playwright_stealth javascript files manually as PyInstaller ignores non-py files by default
-    import playwright_stealth
-    stealth_dir = os.path.dirname(playwright_stealth.__file__)
-    stealth_js = os.path.join(stealth_dir, "js")
-
     separator = ';' if os.name == 'nt' else ':'
 
     command = [
@@ -30,7 +25,9 @@ def build_exe():
         "--noconfirm",
         "--onedir", # Using onedir instead of onefile because Playwright and fastAPI don't always play nice with onefile
         "--add-data", f"static{separator}static",
-        "--add-data", f"{stealth_js}{separator}playwright_stealth/js",
+        "--collect-all", "uvicorn",
+        "--collect-all", "playwright",
+        "--collect-data", "playwright_stealth",
         "main.py"
     ]
 

@@ -8,13 +8,27 @@ import webbrowser
 import threading
 import uvicorn
 import asyncio
+import sys
 
 import db_manager
 from scraper import crawl_worker, task_events
 
+# Support for PyInstaller paths
+if getattr(sys, 'frozen', False):
+    # If the application is run as a bundle, the PyInstaller bootloader
+    # extends the sys module by a flag frozen=True and sets the app
+    # path into variable _MEIPASS'.
+    application_path = sys._MEIPASS
+else:
+    application_path = os.path.dirname(os.path.abspath(__file__))
+
+static_dir = os.path.join(application_path, "static")
+if not os.path.exists(static_dir):
+    os.makedirs(static_dir, exist_ok=True)
+
 app = FastAPI(title="Web Scraper Client")
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 class ScrapeRequest(BaseModel):
     url: str
@@ -23,12 +37,14 @@ class ScrapeRequest(BaseModel):
 
 @app.get("/", response_class=HTMLResponse)
 async def get_index():
-    with open("static/index.html", "r", encoding="utf-8") as f:
+    index_path = os.path.join(static_dir, "index.html")
+    with open(index_path, "r", encoding="utf-8") as f:
         return f.read()
 
 @app.get("/console", response_class=HTMLResponse)
 async def get_console():
-    with open("static/console.html", "r", encoding="utf-8") as f:
+    console_path = os.path.join(static_dir, "console.html")
+    with open(console_path, "r", encoding="utf-8") as f:
         return f.read()
 
 @app.post("/api/scrape/start")
@@ -119,4 +135,6 @@ if __name__ == "__main__":
 
     threading.Thread(target=open_browser, daemon=True).start()
 
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+    # We pass the app object directly rather than a string "main:app"
+    # because string references often fail when packaged by PyInstaller.
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
