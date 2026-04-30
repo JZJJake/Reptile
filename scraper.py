@@ -84,15 +84,15 @@ async def download_image(session, img_url, save_path):
     return False
 
 def get_sub_domain_links(html, current_url, base_url):
-    """Extract links that share the same domain as the base_url."""
+    """Extract links that are downward paths from the base_url."""
     soup = BeautifulSoup(html, 'lxml')
     links = []
 
-    base_parsed = urllib.parse.urlparse(base_url)
-    base_domain = base_parsed.netloc
+    # Normalize base_url for strict downward matching
+    base_url_normalized = base_url if base_url.endswith('/') else base_url + '/'
 
-    # Common static file extensions to ignore
-    ignored_extensions = {'.pdf', '.zip', '.rar', '.exe', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.mp3', '.mp4', '.avi', '.jpg', '.jpeg', '.png', '.gif'}
+    # Ignore purely media/executable files, but ALLOW documents we want to download
+    ignored_extensions = {'.zip', '.rar', '.exe', '.mp3', '.mp4', '.avi', '.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg'}
 
     for a_tag in soup.find_all('a', href=True):
         href = a_tag['href']
@@ -104,8 +104,8 @@ def get_sub_domain_links(html, current_url, base_url):
         ext = os.path.splitext(parsed_url.path)[1].lower()
 
         if parsed_url.scheme in ['http', 'https'] and ext not in ignored_extensions:
-            # Check if it shares the same domain (netloc)
-            if parsed_url.netloc == base_domain:
+            # Check if it is the base_url itself or a child path of the base_url
+            if full_url == base_url or full_url.startswith(base_url_normalized):
                 links.append(full_url)
     return list(set(links))
 
@@ -224,10 +224,12 @@ def clean_html_structure(soup):
 
     return soup
 
-async def download_file(url, save_path):
+async def download_file(url, save_path, user_agent):
     """Download arbitrary files (PDF, Word, Excel, etc.) via aiohttp."""
     try:
-        async with aiohttp.ClientSession() as session:
+        connector = aiohttp.TCPConnector(ssl=False)
+        headers = {'User-Agent': user_agent}
+        async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
             async with session.get(url, timeout=300) as response:
                 if response.status == 200:
                     with open(save_path, 'wb') as f:
@@ -303,7 +305,8 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
         os.makedirs(page_path, exist_ok=True)
         save_path = os.path.join(page_path, filename)
 
-        success = await download_file(current_url, save_path)
+        ua = random.choice(USER_AGENTS)
+        success = await download_file(current_url, save_path, ua)
         if success:
             db_manager.mark_url_scraped(task_id, current_url, filename, page_path, 'article')
         else:
@@ -349,13 +352,23 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
         # Extract robust content
         full_soup = BeautifulSoup(html_content, 'lxml')
 
+        # 1. Try to get title from document or fallback to <title> tag
+        title = full_soup.title.string if full_soup.title else "Untitled Page"
+        page_path, tables_path, images_path = setup_page_directory(base_path, title)
+
+        # Process images on the ENTIRE page FIRST to mutate src tags to local relative paths
+        body_soup = full_soup.find('body') or full_soup
+        connector = aiohttp.TCPConnector(ssl=False)
+        headers = {'User-Agent': ua}
+        async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
+            await process_images(body_soup, current_url, images_path, session)
+
         # Extract publish info BEFORE structural cleaning
         publish_info = extract_publish_info(full_soup)
 
-        # 1. Try to get title from document or fallback to <title> tag
-        title = full_soup.title.string if full_soup.title else "Untitled Page"
+        # Now create a cleaned copy from the mutated full_soup (so local image src is preserved)
         try:
-            cleaned_soup = clean_html_structure(BeautifulSoup(html_content, 'lxml'))
+            cleaned_soup = clean_html_structure(BeautifulSoup(str(full_soup), 'lxml'))
             cleaned_html = str(cleaned_soup)
 
             doc = Document(cleaned_html)
@@ -366,30 +379,14 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
             if len(main_soup.get_text(strip=True)) < 50:
                 main_soup = cleaned_soup.find('body') or cleaned_soup
         except Exception:
-            cleaned_soup = clean_html_structure(BeautifulSoup(html_content, 'lxml'))
+            cleaned_soup = clean_html_structure(BeautifulSoup(str(full_soup), 'lxml'))
             main_soup = cleaned_soup.find('body') or cleaned_soup
-
-        page_path, tables_path, images_path = setup_page_directory(base_path, title)
 
         # 2. Extract tables from the MAIN content area
         process_tables(main_soup, tables_path)
 
-        # 3. Extract images from the ENTIRE page
-        body_soup = full_soup.find('body') or full_soup
-        async with aiohttp.ClientSession() as session:
-            await process_images(body_soup, current_url, images_path, session)
-
-        # 4. Generate Markdown
+        # 3. Generate Markdown from the main_soup (which now contains local image src attributes)
         markdown_content = convert_to_markdown(str(main_soup))
-
-        images_in_body = body_soup.find_all('img')
-        if images_in_body:
-            md_images = "\n\n### Page Images\n"
-            for img in images_in_body:
-                src = img.get('src')
-                if src and src.startswith('./images/'):
-                    md_images += f"![Image]({src})\n"
-            markdown_content += md_images
 
         markdown_header = f"# {title}\n\n**Source URL:** {current_url}\n"
         if publish_info:
@@ -466,28 +463,39 @@ async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
                 args=["--disable-blink-features=AutomationControlled"]
             )
 
+            active_tasks = set()
             while True:
                 # Check global stop/pause
                 should_stop = await check_pause_stop(task_id)
                 if should_stop:
                     break
 
-                # If active count (pending + processing) is 0, we are completely done
+                # Clean up completed tasks
+                done = {t for t in active_tasks if t.done()}
+                active_tasks.difference_update(done)
+
+                # Check if any completed task signaled to stop
+                if any(t.result() is False for t in done if not t.cancelled() and t.exception() is None):
+                    break
+
+                # If active count (pending + processing) is 0 and no tasks are running, we are done
                 active_count = db_manager.get_active_count(task_id)
-                if active_count == 0:
+                if active_count == 0 and len(active_tasks) == 0:
                     db_manager.update_task_status(task_id, 'completed')
                     break
 
-                # Fetch up to 5 URLs to process concurrently
-                tasks = []
-                for _ in range(5):
-                    tasks.append(asyncio.create_task(worker_task(task_id, start_url, base_path, browser, semaphore)))
+                # Replenish workers up to the concurrency limit (5)
+                while len(active_tasks) < 5 and active_count > 0:
+                    task = asyncio.create_task(worker_task(task_id, start_url, base_path, browser, semaphore))
+                    active_tasks.add(task)
+                    active_count -= 1 # Optimistically decrement to avoid over-spawning if DB hasn't caught up
 
-                # Wait for this batch to complete
-                results = await asyncio.gather(*tasks)
-
-                if False in results: # A worker signaled to stop
-                    break
+                if active_tasks:
+                    # Wait for at least one task to complete before continuing the loop
+                    await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
+                else:
+                    # Brief pause if nothing to do but DB says there should be (rare race condition)
+                    await asyncio.sleep(1)
 
     except Exception as e:
         print(f"Crawl fatally failed: {str(e)}")
