@@ -72,16 +72,41 @@ def setup_page_directory(base_path, title):
     return page_path, tables_path, images_path
 
 async def download_image(session, img_url, save_path):
-    """Download an image asynchronously."""
-    try:
-        async with session.get(img_url, timeout=10) as response:
-            if response.status == 200:
-                content = await response.read()
-                with open(save_path, 'wb') as f:
-                    f.write(content)
-                return True
-    except Exception as e:
-        print(f"Error downloading {img_url}: {e}")
+    """Download an image asynchronously with retries and headers."""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Referer': img_url # Some CDNs require referer
+    }
+
+    for attempt in range(3):
+        try:
+            # We use verify_ssl=False in case of self-signed certs
+            async with session.get(img_url, headers=headers, timeout=15, ssl=False) as response:
+                if response.status == 200:
+                    content = await response.read()
+                    with open(save_path, 'wb') as f:
+                        f.write(content)
+                    return True
+                elif response.status in [301, 302, 303, 307, 308]:
+                    # Follow redirect manually if aiohttp doesn't handle it
+                    redirect_url = response.headers.get('Location')
+                    if redirect_url:
+                        if not redirect_url.startswith('http'):
+                            import urllib.parse
+                            redirect_url = urllib.parse.urljoin(img_url, redirect_url)
+                        img_url = redirect_url
+                        continue
+                else:
+                    print(f"Failed to download {img_url}: HTTP {response.status}")
+                    break # Don't retry 404s etc.
+        except Exception as e:
+            if attempt == 2:
+                print(f"Error downloading {img_url} after 3 attempts: {e}")
+            import asyncio
+            await asyncio.sleep(1)
+
     return False
 
 def determine_static_boundary(start_url):
@@ -160,25 +185,95 @@ def process_tables(soup, tables_path):
             print(f"Error processing table {i+1}: {e}")
 
 async def process_images(soup, base_url, images_path, session):
-    """Extract image URLs, download them, and update src in HTML."""
-    images = soup.find_all('img')
+    """Extract image URLs from various sources, download them, and update HTML."""
     download_tasks = []
+    image_count = 0
 
-    for i, img in enumerate(images):
-        src = img.get('src') or img.get('data-src')
+    # Process <img> tags
+    for img in soup.find_all('img'):
+        src = None
+        # Try a variety of common attributes for lazy-loaded images
+        for attr in ['src', 'data-src', 'data-original', 'data-url', 'data-echo', 'data-lazy-src']:
+            val = img.get(attr)
+            if val and isinstance(val, str) and val.strip():
+                src = val.strip()
+                break
+
         if src:
             img_url = urllib.parse.urljoin(base_url, src)
+            if img_url.startswith('data:'):
+                continue
+
+            parsed_img_url = urllib.parse.urlparse(img_url)
+            ext = os.path.splitext(parsed_img_url.path)[1]
+            if not ext or ext.lower() not in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg']:
+                ext = '.jpg'
+
+            image_count += 1
+            filename = f"image_{image_count}{ext}"
+            save_path = os.path.join(images_path, filename)
+
+            # Unify all sources to 'src' pointing to local file
+            img['src'] = f"./images/{filename}"
+            # Remove other data attributes to prevent lazy-loaders from overriding it
+            for attr in ['data-src', 'data-original', 'data-url', 'data-echo', 'data-lazy-src']:
+                if img.get(attr):
+                    del img[attr]
+
+            download_tasks.append(download_image(session, img_url, save_path))
+
+    # Process <video> poster attributes
+    for video in soup.find_all('video'):
+        poster = video.get('poster')
+        if poster and isinstance(poster, str) and poster.strip():
+            img_url = urllib.parse.urljoin(base_url, poster.strip())
+            if img_url.startswith('data:'):
+                continue
 
             parsed_img_url = urllib.parse.urlparse(img_url)
             ext = os.path.splitext(parsed_img_url.path)[1]
             if not ext or ext.lower() not in ['.jpg', '.jpeg', '.png', '.gif', '.webp']:
                 ext = '.jpg'
 
-            filename = f"image_{i+1}{ext}"
+            image_count += 1
+            filename = f"image_{image_count}{ext}"
             save_path = os.path.join(images_path, filename)
 
-            img['src'] = f"./images/{filename}"
+            video['poster'] = f"./images/{filename}"
             download_tasks.append(download_image(session, img_url, save_path))
+
+    # Process inline background-image styles and custom elements like <xg-poster>
+    import re
+    url_pattern = re.compile(r'url\(\s*['"]?(.*?)['"]?\s*\)')
+
+    for tag in soup.find_all(style=True):
+        style_content = tag['style']
+        if 'background' in style_content:
+            matches = url_pattern.findall(style_content)
+            new_style = style_content
+            for match in matches:
+                if match.startswith('data:'):
+                    continue
+                img_url = urllib.parse.urljoin(base_url, match)
+                parsed_img_url = urllib.parse.urlparse(img_url)
+                ext = os.path.splitext(parsed_img_url.path)[1]
+                if not ext or ext.lower() not in ['.jpg', '.jpeg', '.png', '.gif', '.webp']:
+                    ext = '.jpg'
+
+                image_count += 1
+                filename = f"image_{image_count}{ext}"
+                save_path = os.path.join(images_path, filename)
+
+                # Replace the URL in the style attribute
+                new_style = new_style.replace(match, f"./images/{filename}")
+                download_tasks.append(download_image(session, img_url, save_path))
+
+                # If it's a specific poster tag, also insert an img tag so markdown captures it
+                if tag.name in ['xg-poster', 'div', 'span'] and 'poster' in tag.get('class', []):
+                    new_img = soup.new_tag('img', src=f"./images/{filename}")
+                    tag.append(new_img)
+
+            tag['style'] = new_style
 
     if download_tasks:
         await asyncio.gather(*download_tasks)
