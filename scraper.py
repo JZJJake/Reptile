@@ -244,7 +244,7 @@ async def process_images(soup, base_url, images_path, session):
 
     # Process inline background-image styles and custom elements like <xg-poster>
     import re
-    url_pattern = re.compile(r'url\(\s*['"]?(.*?)['"]?\s*\)')
+    url_pattern = re.compile(r'url\(\s*[\'\"]?(.*?)[\'\"]?\s*\)')
 
     for tag in soup.find_all(style=True):
         style_content = tag['style']
