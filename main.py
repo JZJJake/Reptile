@@ -26,7 +26,27 @@ static_dir = os.path.join(application_path, "static")
 if not os.path.exists(static_dir):
     os.makedirs(static_dir, exist_ok=True)
 
-app = FastAPI(title="Web Scraper Client")
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # This runs when the app starts up
+    # Pre-install browsers before launching the UI so it doesn't fail when hitting start
+    install_playwright_browsers()
+
+    # Spawn the browser asynchronously after startup
+    import asyncio
+    async def open_browser_async():
+        await asyncio.sleep(0.5) # Slight delay to let uvicorn print its startup message
+        webbrowser.open('http://127.0.0.1:8000')
+
+    asyncio.create_task(open_browser_async())
+
+    yield
+    # This runs when the app shuts down
+    pass
+
+app = FastAPI(title="Web Scraper Client", lifespan=lifespan)
 
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
@@ -52,18 +72,18 @@ async def start_scraping(request: ScrapeRequest, background_tasks: BackgroundTas
     task_id = str(uuid.uuid5(uuid.NAMESPACE_URL, request.url))
 
     if request.update_data:
-        db_manager.clear_task_data(task_id)
+        await asyncio.to_thread(db_manager.clear_task_data, task_id)
 
-    task = db_manager.get_task(task_id)
+    task = await asyncio.to_thread(db_manager.get_task, task_id)
     if not task:
-        db_manager.create_task(task_id, request.url, request.url)
+        await asyncio.to_thread(db_manager.create_task, task_id, request.url, request.url)
 
     # If the task is already running in memory, don't start a new one
     if task_id in task_events and not task_events[task_id]['stop'].is_set():
          return {"task_id": task_id, "status": "already running or paused"}
 
     # Make sure status is set to running
-    db_manager.update_task_status(task_id, "running")
+    await asyncio.to_thread(db_manager.update_task_status, task_id, "running")
 
     background_tasks.add_task(
         crawl_worker,
@@ -76,13 +96,13 @@ async def start_scraping(request: ScrapeRequest, background_tasks: BackgroundTas
 
 @app.get("/api/scrape/status/{task_id}")
 async def get_scraping_status(task_id: str):
-    task = db_manager.get_task(task_id)
+    task = await asyncio.to_thread(db_manager.get_task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
     # In concurrent mode, "current" isn't just one pending, it's multiple processing
     # Let's just return a count of active links or a general label
-    active_count = db_manager.get_active_count(task_id)
+    active_count = await asyncio.to_thread(db_manager.get_active_count, task_id)
 
     return {
         "status": task['status'],
@@ -93,21 +113,21 @@ async def get_scraping_status(task_id: str):
 
 @app.get("/api/scrape/tree/{task_id}")
 async def get_scrape_tree(task_id: str):
-    tree_data = db_manager.get_url_tree(task_id)
+    tree_data = await asyncio.to_thread(db_manager.get_url_tree, task_id)
     return {"tree": tree_data}
 
 @app.post("/api/scrape/pause/{task_id}")
 async def pause_scraping(task_id: str):
     if task_id in task_events:
         task_events[task_id]['pause'].clear()
-        db_manager.update_task_status(task_id, "paused")
+        await asyncio.to_thread(db_manager.update_task_status, task_id, "paused")
     return {"status": "paused"}
 
 @app.post("/api/scrape/resume/{task_id}")
 async def resume_scraping(task_id: str):
     if task_id in task_events:
         task_events[task_id]['pause'].set()
-        db_manager.update_task_status(task_id, "running")
+        await asyncio.to_thread(db_manager.update_task_status, task_id, "running")
     else:
         # Task may have fully stopped, so we can't just resume, we must restart the worker loop via /start
         pass
@@ -119,7 +139,7 @@ async def stop_scraping(task_id: str):
         task_events[task_id]['stop'].set()
         # Unpause in case it's paused so it can process the stop signal
         task_events[task_id]['pause'].set()
-    db_manager.update_task_status(task_id, "stopped")
+    await asyncio.to_thread(db_manager.update_task_status, task_id, "stopped")
     return {"status": "stopped"}
 
 
@@ -143,20 +163,9 @@ def install_playwright_browsers():
     except Exception as e:
         print(f"Warning: Failed to install playwright browsers automatically. Error: {e}")
 
-def open_browser():
-    """Wait a second for the server to start, then open the browser."""
-    import time
-    time.sleep(1)
-    webbrowser.open('http://127.0.0.1:8000')
-
 if __name__ == "__main__":
     os.makedirs("static", exist_ok=True)
     os.makedirs("scraped_data", exist_ok=True)
-
-    # Pre-install browsers before launching the UI so it doesn't fail when hitting start
-    install_playwright_browsers()
-
-    threading.Thread(target=open_browser, daemon=True).start()
 
     # We pass the app object directly rather than a string "main:app"
     # because string references often fail when packaged by PyInstaller.

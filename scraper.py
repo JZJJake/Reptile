@@ -55,17 +55,20 @@ def setup_page_directory(base_path, title):
         safe_title = "Untitled_" + datetime.now().strftime("%H%M%S")
 
     page_path = os.path.join(base_path, safe_title)
-    # Ensure unique directory
+    # Ensure unique directory, use atomic creation to prevent TOCTOU race condition
     counter = 1
     original_path = page_path
-    while os.path.exists(page_path):
-        page_path = f"{original_path}_{counter}"
-        counter += 1
+    while True:
+        try:
+            os.makedirs(page_path, exist_ok=False)
+            break
+        except FileExistsError:
+            page_path = f"{original_path}_{counter}"
+            counter += 1
 
     tables_path = os.path.join(page_path, "tables")
     images_path = os.path.join(page_path, "images")
 
-    os.makedirs(page_path, exist_ok=True)
     os.makedirs(tables_path, exist_ok=True)
     os.makedirs(images_path, exist_ok=True)
 
@@ -366,8 +369,8 @@ async def download_file(url, save_path, user_agent):
 def convert_to_markdown(html):
     """Convert HTML to clean Markdown text."""
     h = html2text.HTML2Text()
-    h.ignore_links = False
-    h.ignore_images = False
+    h.ignore_links = True
+    h.ignore_images = True
     h.body_width = 0
     return h.handle(html)
 
@@ -378,19 +381,19 @@ async def check_pause_stop(task_id: str) -> bool:
         return False
 
     if events['stop'].is_set():
-        db_manager.update_task_status(task_id, 'stopped')
+        await asyncio.to_thread(db_manager.update_task_status, task_id, 'stopped')
         return True
 
     if not events['pause'].is_set():
-        db_manager.update_task_status(task_id, 'paused')
+        await asyncio.to_thread(db_manager.update_task_status, task_id, 'paused')
         await events['pause'].wait() # Wait until unpaused
 
         # Check if stopped while paused
         if events['stop'].is_set():
-            db_manager.update_task_status(task_id, 'stopped')
+            await asyncio.to_thread(db_manager.update_task_status, task_id, 'stopped')
             return True
 
-        db_manager.update_task_status(task_id, 'running')
+        await asyncio.to_thread(db_manager.update_task_status, task_id, 'running')
 
     return False
 
@@ -431,9 +434,9 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
         ua = random.choice(USER_AGENTS)
         success = await download_file(current_url, save_path, ua)
         if success:
-            db_manager.mark_url_scraped(task_id, current_url, filename, page_path, 'article')
+            await asyncio.to_thread(db_manager.mark_url_scraped, task_id, current_url, filename, page_path, 'article')
         else:
-            db_manager.mark_url_failed(task_id, current_url, "File download failed")
+            await asyncio.to_thread(db_manager.mark_url_failed, task_id, current_url, "File download failed")
         return
 
     # Normal HTML processing
@@ -456,9 +459,9 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
         # Intercept and block unnecessary resources
         await page.route("**/*", intercept_route)
 
-        # Use commit to prevent timeouts on sites with persistent tracking scripts or broken resources
+        # Use domcontentloaded to ensure SPA and dynamic frameworks generate the DOM
         try:
-            await page.goto(current_url, wait_until="commit", timeout=60000)
+            await page.goto(current_url, wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_selector('body', state='attached', timeout=30000)
             await page.wait_for_timeout(3000)
         except Exception as goto_e:
@@ -471,7 +474,7 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
         # If it's a child worker picking up a task after a restart, try to load it from the DB.
         dynamic_root = task_root_prefixes.get(task_id)
         if not dynamic_root:
-            task_data = db_manager.get_task(task_id)
+            task_data = await asyncio.to_thread(db_manager.get_task, task_id)
             if task_data and task_data.get('dynamic_root'):
                 dynamic_root = task_data['dynamic_root']
                 task_root_prefixes[task_id] = dynamic_root
@@ -479,19 +482,20 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
         if current_url == start_url and not dynamic_root:
             dynamic_root = determine_static_boundary(start_url)
             task_root_prefixes[task_id] = dynamic_root
-            db_manager.update_task_dynamic_root(task_id, dynamic_root)
+            await asyncio.to_thread(db_manager.update_task_dynamic_root, task_id, dynamic_root)
 
         # Extract new links under the determined generic root boundary
         new_links = get_sub_domain_links(html_content, current_url, start_url, dynamic_root)
         if new_links:
-            db_manager.add_discovered_urls(task_id, current_url, new_links)
+            await asyncio.to_thread(db_manager.add_discovered_urls, task_id, current_url, new_links)
 
         # Extract robust content
         full_soup = BeautifulSoup(html_content, 'lxml')
 
         # 1. Try to get title from document or fallback to <title> tag
         title = full_soup.title.string if full_soup.title else "Untitled Page"
-        page_path, tables_path, images_path = setup_page_directory(base_path, title)
+        # Directory creation is I/O blocking, offload to thread
+        page_path, tables_path, images_path = await asyncio.to_thread(setup_page_directory, base_path, title)
 
         # Process images on the ENTIRE page FIRST to mutate src tags to local relative paths
         body_soup = full_soup.find('body') or full_soup
@@ -550,13 +554,13 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
         with open(md_path, 'w', encoding='utf-8') as f:
             f.write(markdown_content)
 
-        db_manager.mark_url_scraped(task_id, current_url, title, page_path, content_type)
+        await asyncio.to_thread(db_manager.mark_url_scraped, task_id, current_url, title, page_path, content_type)
 
     except Exception as page_e:
         import traceback
         traceback.print_exc()
         print(f"Error scraping {current_url}: {page_e}")
-        db_manager.mark_url_failed(task_id, current_url, str(page_e))
+        await asyncio.to_thread(db_manager.mark_url_failed, task_id, current_url, str(page_e))
     finally:
         if page:
             await page.close()
@@ -566,29 +570,35 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
 async def worker_task(task_id: str, start_url: str, base_path: str, browser, semaphore: asyncio.Semaphore):
     """A worker task that runs under a semaphore to limit concurrency."""
     async with semaphore:
-        should_stop = await check_pause_stop(task_id)
-        if should_stop:
-            return False # Indicate stopping
+        try:
+            should_stop = await check_pause_stop(task_id)
+            if should_stop:
+                return False # Indicate stopping
 
-        current_url = db_manager.get_and_lock_pending_url(task_id)
-        if not current_url:
-            return True # Queue empty for now
+            current_url = await asyncio.to_thread(db_manager.get_and_lock_pending_url, task_id)
+            if not current_url:
+                return True # Queue empty for now
 
-        # Add random delay to simulate human behavior and avoid WAF rate limiting
-        delay = random.uniform(1.0, 3.0)
-        await asyncio.sleep(delay)
+            # Add random delay to simulate human behavior and avoid WAF rate limiting
+            delay = random.uniform(1.0, 3.0)
+            await asyncio.sleep(delay)
 
-        await process_single_url(task_id, current_url, start_url, base_path, browser)
-        return True
+            await process_single_url(task_id, current_url, start_url, base_path, browser)
+            return True
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"Worker task crashed unexpectedly: {e}")
+            return True # Don't stop the whole crawl, just this worker cycle
 
 async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
     """Background manager that schedules concurrent workers."""
 
     init_task_events(task_id)
-    db_manager.reset_processing_urls(task_id)
+    await asyncio.to_thread(db_manager.reset_processing_urls, task_id)
 
     base_path, base_domain = setup_base_directory(start_url)
-    db_manager.create_task(task_id, start_url, start_url)
+    await asyncio.to_thread(db_manager.create_task, task_id, start_url, start_url)
 
     # Strictly limit concurrency to 5 to prevent memory overload and aggressive IP blocks
     semaphore = asyncio.Semaphore(5)
@@ -614,14 +624,25 @@ async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
                 done = {t for t in active_tasks if t.done()}
                 active_tasks.difference_update(done)
 
-                # Check if any completed task signaled to stop
-                if any(t.result() is False for t in done if not t.cancelled() and t.exception() is None):
+                # Check if any completed task signaled to stop or failed
+                stop_signal = False
+                for t in done:
+                    if t.cancelled():
+                        continue
+                    if t.exception() is not None:
+                        print(f"Task exception caught in manager: {t.exception()}")
+                        continue
+                    if t.result() is False:
+                        stop_signal = True
+                        break
+
+                if stop_signal:
                     break
 
                 # If active count (pending + processing) is 0 and no tasks are running, we are done
-                active_count = db_manager.get_active_count(task_id)
+                active_count = await asyncio.to_thread(db_manager.get_active_count, task_id)
                 if active_count == 0 and len(active_tasks) == 0:
-                    db_manager.update_task_status(task_id, 'completed')
+                    await asyncio.to_thread(db_manager.update_task_status, task_id, 'completed')
                     break
 
                 # Replenish workers up to the concurrency limit (5)
@@ -639,9 +660,9 @@ async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
 
     except Exception as e:
         print(f"Crawl fatally failed: {str(e)}")
-        db_manager.update_task_status(task_id, 'failed')
+        await asyncio.to_thread(db_manager.update_task_status, task_id, 'failed')
     finally:
-        db_manager.reset_processing_urls(task_id)
+        await asyncio.to_thread(db_manager.reset_processing_urls, task_id)
         if task_id in task_events:
             del task_events[task_id]
         if task_id in task_root_prefixes:
