@@ -366,8 +366,8 @@ async def download_file(url, save_path, user_agent):
 def convert_to_markdown(html):
     """Convert HTML to clean Markdown text."""
     h = html2text.HTML2Text()
-    h.ignore_links = False
-    h.ignore_images = False
+    h.ignore_links = True
+    h.ignore_images = True
     h.body_width = 0
     return h.handle(html)
 
