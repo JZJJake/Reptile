@@ -192,10 +192,12 @@ async def process_images(soup, base_url, images_path, session):
     # Process <img> tags
     for img in soup.find_all('img'):
         src = None
-        # Try a variety of common attributes for lazy-loaded images
-        for attr in ['src', 'data-src', 'data-original', 'data-url', 'data-echo', 'data-lazy-src']:
+        # Try a variety of common attributes for lazy-loaded images, prioritizing real image over placeholder
+        for attr in ['data-src', 'data-original', 'data-url', 'data-echo', 'data-lazy-src', 'src']:
             val = img.get(attr)
             if val and isinstance(val, str) and val.strip():
+                if val.strip().startswith('data:image'):
+                    continue
                 src = val.strip()
                 break
 
