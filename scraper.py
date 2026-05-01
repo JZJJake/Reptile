@@ -427,8 +427,9 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
     if ext in ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx']:
         filename = os.path.basename(parsed_url.path) or f"download_{random.randint(1000,9999)}{ext}"
         safe_title = re.sub(r'[\\/*?:"<>|]', "", filename)
-        page_path = os.path.join(base_path, safe_title)
-        os.makedirs(page_path, exist_ok=True)
+
+        # Directory creation is I/O blocking, offload to thread, atomic generation to prevent override
+        page_path, _, _ = await asyncio.to_thread(setup_page_directory, base_path, safe_title)
         save_path = os.path.join(page_path, filename)
 
         ua = random.choice(USER_AGENTS)
