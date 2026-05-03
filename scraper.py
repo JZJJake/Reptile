@@ -431,7 +431,7 @@ async def intercept_route(route):
     else:
         await route.continue_()
 
-async def process_single_url(task_id: str, current_url: str, start_url: str, base_path: str, browser) -> None:
+async def process_single_url(task_id: str, current_url: str, start_url: str, base_path: str, browser_context) -> None:
     """Processes a single URL within a worker context."""
     api_extracted_links = set()
 
@@ -458,15 +458,7 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
     context = None
     page = None
     try:
-        ua = random.choice(USER_AGENTS)
-        vp = random.choice(VIEWPORTS)
-
-        context = await browser.new_context(
-            user_agent=ua,
-            viewport=vp,
-            ignore_https_errors=True
-        )
-        page = await context.new_page()
+        page = await browser_context.new_page()
 
         # Apply stealth
         await Stealth().apply_stealth_async(page)
@@ -512,6 +504,13 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
             await page.wait_for_timeout(3000)
         except Exception as goto_e:
             print(f"Warning: page.goto timeout or error for {current_url}: {goto_e}. Attempting to proceed with loaded content.")
+
+        # Check if we got blocked by CAPTCHA/WAF/Login Wall
+        page_title = await page.title()
+        if "人机验证" in page_title or "用户登录" in page_title:
+            print(f"[{task_id}] Blocked by WAF or Login page for URL: {current_url} (Title: {page_title})")
+            await asyncio.to_thread(db_manager.update_url_status, task_id, current_url, "failed")
+            return
 
         # Enhance SPA support by forcing longer loading for known infinite scroll or dynamic load pages
         # If the page has elements that trigger loads on scroll, scroll repeatedly with a brief pause
@@ -632,10 +631,8 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
     finally:
         if page:
             await page.close()
-        if context:
-            await context.close()
 
-async def worker_task(task_id: str, start_url: str, base_path: str, browser, semaphore: asyncio.Semaphore):
+async def worker_task(task_id: str, start_url: str, base_path: str, browser_context, semaphore: asyncio.Semaphore):
     """A worker task that runs under a semaphore to limit concurrency."""
     async with semaphore:
         try:
@@ -648,10 +645,10 @@ async def worker_task(task_id: str, start_url: str, base_path: str, browser, sem
                 return True # Queue empty for now
 
             # Add random delay to simulate human behavior and avoid WAF rate limiting
-            delay = random.uniform(1.0, 3.0)
+            delay = random.uniform(2.0, 5.0)
             await asyncio.sleep(delay)
 
-            await process_single_url(task_id, current_url, start_url, base_path, browser)
+            await process_single_url(task_id, current_url, start_url, base_path, browser_context)
             return True
         except Exception as e:
             import traceback
@@ -668,8 +665,8 @@ async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
     base_path, base_domain = setup_base_directory(start_url)
     await asyncio.to_thread(db_manager.create_task, task_id, start_url, start_url)
 
-    # Strictly limit concurrency to 5 to prevent memory overload and aggressive IP blocks
-    semaphore = asyncio.Semaphore(5)
+    # Limit concurrency to 2 to avoid aggressive IP blocks and WAF rate limits
+    semaphore = asyncio.Semaphore(2)
 
     # Force PLAYWRIGHT_BROWSERS_PATH to 0 here as well so the worker picks it up
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
@@ -679,6 +676,15 @@ async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
             browser = await p.chromium.launch(
                 headless=headless,
                 args=["--disable-blink-features=AutomationControlled"]
+            )
+
+            # Create a single shared context for the entire task
+            ua = random.choice(USER_AGENTS)
+            vp = random.choice(VIEWPORTS)
+            browser_context = await browser.new_context(
+                user_agent=ua,
+                viewport=vp,
+                ignore_https_errors=True
             )
 
             active_tasks = set()
@@ -713,9 +719,9 @@ async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
                     await asyncio.to_thread(db_manager.update_task_status, task_id, 'completed')
                     break
 
-                # Replenish workers up to the concurrency limit (5)
-                while len(active_tasks) < 5 and active_count > 0:
-                    task = asyncio.create_task(worker_task(task_id, start_url, base_path, browser, semaphore))
+                # Replenish workers up to the concurrency limit (2)
+                while len(active_tasks) < 2 and active_count > 0:
+                    task = asyncio.create_task(worker_task(task_id, start_url, base_path, browser_context, semaphore))
                     active_tasks.add(task)
                     active_count -= 1 # Optimistically decrement to avoid over-spawning if DB hasn't caught up
 
