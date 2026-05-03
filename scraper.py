@@ -674,17 +674,54 @@ async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
     # Force PLAYWRIGHT_BROWSERS_PATH to 0 here as well so the worker picks it up
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
 
+    import platform
+    # Try to find the local Chromium executable provided by Playwright
+    # Handle Windows vs Linux/Mac cache paths
+    is_windows = platform.system() == "Windows"
+    if is_windows:
+        playwright_cache = os.path.join(os.environ.get("USERPROFILE", os.path.expanduser("~")), "AppData", "Local", "ms-playwright")
+        chrome_exe_name = "chrome.exe"
+    else:
+        playwright_cache = os.path.expanduser("~/.cache/ms-playwright")
+        chrome_exe_name = "chrome"
+
+    chromium_path = None
+    if os.path.exists(playwright_cache):
+        for root, dirs, files in os.walk(playwright_cache):
+            if chrome_exe_name in files:
+                chromium_path = os.path.join(root, chrome_exe_name)
+                break
+
+    if not chromium_path:
+        print("Warning: Could not find local Chromium. Falling back to default launch.")
+        chromium_path = "google-chrome" if not is_windows else "chrome.exe"
+
+    # Launch Chromium as a separate process to avoid detection
+    port = random.randint(9200, 9300)
+    args = [
+        chromium_path,
+        f"--remote-debugging-port={port}",
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-blink-features=AutomationControlled"
+    ]
+    if headless:
+        args.append("--headless")
+
+    import subprocess
+    chrome_proc = None
     try:
+        chrome_proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        await asyncio.sleep(2) # Wait for chrome to start
+
         async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=headless,
-                args=["--disable-blink-features=AutomationControlled"]
-            )
+            # Connect to the real browser instance via CDP
+            browser = await p.chromium.connect_over_cdp(f"http://localhost:{port}")
 
             # Create a single shared context for the entire task
             ua = random.choice(USER_AGENTS)
             vp = random.choice(VIEWPORTS)
-            browser_context = await browser.new_context(
+            browser_context = browser.contexts[0] if browser.contexts else await browser.new_context(
                 user_agent=ua,
                 viewport=vp,
                 ignore_https_errors=True
@@ -739,6 +776,12 @@ async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
         print(f"Crawl fatally failed: {str(e)}")
         await asyncio.to_thread(db_manager.update_task_status, task_id, 'failed')
     finally:
+        if chrome_proc:
+            try:
+                chrome_proc.terminate()
+                chrome_proc.wait(timeout=5)
+            except Exception:
+                chrome_proc.kill()
         await asyncio.to_thread(db_manager.reset_processing_urls, task_id)
         if task_id in task_events:
             del task_events[task_id]
