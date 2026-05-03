@@ -433,6 +433,7 @@ async def intercept_route(route):
 
 async def process_single_url(task_id: str, current_url: str, start_url: str, base_path: str, browser) -> None:
     """Processes a single URL within a worker context."""
+    api_extracted_links = set()
 
     # Check for direct file downloads
     parsed_url = urllib.parse.urlparse(current_url)
@@ -472,6 +473,37 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
 
         # Intercept and block unnecessary resources
         await page.route("**/*", intercept_route)
+
+        # --- API Interception for SPAs ---
+        async def handle_response(res):
+            try:
+                if "application/json" in res.headers.get("content-type", ""):
+                    data = await res.json()
+
+                    # Recursive helper to find paperId/thesisId/id
+                    def find_ids(obj):
+                        if isinstance(obj, dict):
+                            for k, v in obj.items():
+                                if k in ["paperId", "thesisId"] and isinstance(v, (str, int)):
+                                    parsed_res_url = urllib.parse.urlparse(res.url)
+                                    origin = f"{parsed_res_url.scheme}://{parsed_res_url.netloc}"
+                                    api_extracted_links.add(f"{origin}/paper/article/{v}")
+                                elif k == "id" and isinstance(v, (str, int)) and "xmobile/paper" in res.url:
+                                    parsed_res_url = urllib.parse.urlparse(res.url)
+                                    origin = f"{parsed_res_url.scheme}://{parsed_res_url.netloc}"
+                                    api_extracted_links.add(f"{origin}/paper/article/{v}")
+                                else:
+                                    find_ids(v)
+                        elif isinstance(obj, list):
+                            for item in obj:
+                                find_ids(item)
+
+                    find_ids(data)
+            except Exception:
+                pass
+
+        page.on("response", handle_response)
+        # ---------------------------------
 
         # Use domcontentloaded to ensure SPA and dynamic frameworks generate the DOM
         try:
@@ -515,6 +547,13 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
 
         # Extract new links based on the boundary rules
         new_links = get_sub_domain_links(html_content, current_url, start_url, dynamic_root, crawl_scope)
+
+        # Merge links extracted directly from the DOM with those extracted from APIs
+        if api_extracted_links:
+            print(f"[Worker] Found {len(api_extracted_links)} links from API JSON responses.")
+            new_links.extend(list(api_extracted_links))
+            new_links = list(set(new_links))
+
         if new_links:
             await asyncio.to_thread(db_manager.add_discovered_urls, task_id, current_url, new_links)
 

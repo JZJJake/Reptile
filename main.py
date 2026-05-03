@@ -52,7 +52,6 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 class ScrapeRequest(BaseModel):
     url: str
-    crawl_scope: str = "subpages"
     show_browser: bool = True
     update_data: bool = False
     crawl_scope: str = "subpages" # "subpages" or "all_site"
