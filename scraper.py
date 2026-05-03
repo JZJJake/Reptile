@@ -509,7 +509,7 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
         page_title = await page.title()
         if "人机验证" in page_title or "用户登录" in page_title:
             print(f"[{task_id}] Blocked by WAF or Login page for URL: {current_url} (Title: {page_title})")
-            await asyncio.to_thread(db_manager.update_url_status, task_id, current_url, "failed")
+            await asyncio.to_thread(db_manager.mark_url_failed, task_id, current_url, f"Blocked by WAF (Title: {page_title})")
             return
 
         # Enhance SPA support by forcing longer loading for known infinite scroll or dynamic load pages
@@ -567,7 +567,10 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
         # Process images on the ENTIRE page FIRST to mutate src tags to local relative paths
         body_soup = full_soup.find('body') or full_soup
         connector = aiohttp.TCPConnector(ssl=False)
-        headers = {'User-Agent': ua}
+
+        # Use a random UA for image downloads if context UA isn't accessible here
+        aiohttp_ua = random.choice(USER_AGENTS)
+        headers = {'User-Agent': aiohttp_ua}
         async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
             await process_images(body_soup, current_url, images_path, session)
 
