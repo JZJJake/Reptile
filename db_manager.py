@@ -17,13 +17,19 @@ def init_db():
             status TEXT, -- 'running', 'paused', 'completed', 'failed', 'stopped'
             total_scraped INTEGER DEFAULT 0,
             base_url TEXT,
-            dynamic_root TEXT
+            dynamic_root TEXT,
+            crawl_scope TEXT DEFAULT 'subpages'
         )
     ''')
 
     # Try to alter table if the column doesn't exist (for existing DBs)
     try:
         cursor.execute('ALTER TABLE tasks ADD COLUMN dynamic_root TEXT')
+    except sqlite3.OperationalError:
+        pass # Column already exists
+
+    try:
+        cursor.execute("ALTER TABLE tasks ADD COLUMN crawl_scope TEXT DEFAULT 'subpages'")
     except sqlite3.OperationalError:
         pass # Column already exists
 
@@ -60,11 +66,11 @@ def get_db_connection():
 
 # Database helper functions
 
-def create_task(task_id: str, start_url: str, base_url: str):
+def create_task(task_id: str, start_url: str, base_url: str, crawl_scope: str = 'subpages'):
     conn = get_db_connection()
     conn.execute(
-        'INSERT OR IGNORE INTO tasks (task_id, start_url, status, base_url) VALUES (?, ?, ?, ?)',
-        (task_id, start_url, 'running', base_url)
+        'INSERT OR IGNORE INTO tasks (task_id, start_url, status, base_url, crawl_scope) VALUES (?, ?, ?, ?, ?)',
+        (task_id, start_url, 'running', base_url, crawl_scope)
     )
     # Add initial URL to the urls table
     conn.execute(
@@ -77,6 +83,12 @@ def create_task(task_id: str, start_url: str, base_url: str):
 def update_task_status(task_id: str, status: str):
     conn = get_db_connection()
     conn.execute('UPDATE tasks SET status = ? WHERE task_id = ?', (status, task_id))
+    conn.commit()
+    conn.close()
+
+def update_task_crawl_scope(task_id: str, crawl_scope: str):
+    conn = get_db_connection()
+    conn.execute('UPDATE tasks SET crawl_scope = ? WHERE task_id = ?', (crawl_scope, task_id))
     conn.commit()
     conn.close()
 

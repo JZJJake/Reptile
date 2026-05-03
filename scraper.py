@@ -137,19 +137,27 @@ def determine_static_boundary(start_url):
 
     return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, base_path, '', '', ''))
 
-def get_sub_domain_links(html, current_url, base_url, dynamic_root_prefix=None):
-    """Extract links that are downward paths from the pre-calculated root prefix."""
+def get_sub_domain_links(html, current_url, base_url, dynamic_root_prefix=None, crawl_scope="subpages"):
+    """Extract links based on the crawl scope."""
     soup = BeautifulSoup(html, 'lxml')
     links = []
 
     # Use the pre-computed static root prefix if available, otherwise fallback to base_url
     base_prefix = dynamic_root_prefix if dynamic_root_prefix else (base_url if base_url.endswith('/') else base_url + '/')
 
+    # Pre-compute base domain for all_site scope
+    base_parsed = urllib.parse.urlparse(base_url)
+    base_domain = base_parsed.netloc
+
     # Ignore purely media/executable files, but ALLOW documents we want to download
     ignored_extensions = {'.zip', '.rar', '.exe', '.mp3', '.mp4', '.avi', '.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg'}
 
     for a_tag in soup.find_all('a', href=True):
         href = a_tag['href']
+        # Ignore empty hrefs or js calls
+        if not href or href.startswith('javascript:'):
+            continue
+
         full_url = urllib.parse.urljoin(current_url, href)
         # Remove fragment
         full_url = urllib.parse.urldefrag(full_url)[0]
@@ -158,9 +166,14 @@ def get_sub_domain_links(html, current_url, base_url, dynamic_root_prefix=None):
         ext = os.path.splitext(parsed_url.path)[1].lower()
 
         if parsed_url.scheme in ['http', 'https'] and ext not in ignored_extensions:
-            # Check if it is the base_url itself, or a child path of the base_prefix (case-insensitive)
-            if full_url.lower() == base_url.lower() or full_url.lower().startswith(base_prefix.lower()):
-                links.append(full_url)
+            if crawl_scope == "all_site":
+                # Check if it shares the same domain (or subdomain depending on strictness, here we use strict netloc match)
+                if parsed_url.netloc.lower() == base_domain.lower():
+                    links.append(full_url)
+            else:
+                # Check if it is the base_url itself, or a child path of the base_prefix (case-insensitive)
+                if full_url.lower() == base_url.lower() or full_url.lower().startswith(base_prefix.lower()):
+                    links.append(full_url)
     return list(set(links))
 
 async def scroll_page(page):
@@ -418,8 +431,9 @@ async def intercept_route(route):
     else:
         await route.continue_()
 
-async def process_single_url(task_id: str, current_url: str, start_url: str, base_path: str, browser) -> None:
+async def process_single_url(task_id: str, current_url: str, start_url: str, base_path: str, browser_context) -> None:
     """Processes a single URL within a worker context."""
+    api_extracted_links = set()
 
     # Check for direct file downloads
     parsed_url = urllib.parse.urlparse(current_url)
@@ -444,21 +458,44 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
     context = None
     page = None
     try:
-        ua = random.choice(USER_AGENTS)
-        vp = random.choice(VIEWPORTS)
-
-        context = await browser.new_context(
-            user_agent=ua,
-            viewport=vp,
-            ignore_https_errors=True
-        )
-        page = await context.new_page()
+        page = await browser_context.new_page()
 
         # Apply stealth
         await Stealth().apply_stealth_async(page)
 
         # Intercept and block unnecessary resources
         await page.route("**/*", intercept_route)
+
+        # --- API Interception for SPAs ---
+        async def handle_response(res):
+            try:
+                if "application/json" in res.headers.get("content-type", ""):
+                    data = await res.json()
+
+                    # Recursive helper to find paperId/thesisId/id
+                    def find_ids(obj):
+                        if isinstance(obj, dict):
+                            for k, v in obj.items():
+                                if k in ["paperId", "thesisId"] and isinstance(v, (str, int)):
+                                    parsed_res_url = urllib.parse.urlparse(res.url)
+                                    origin = f"{parsed_res_url.scheme}://{parsed_res_url.netloc}"
+                                    api_extracted_links.add(f"{origin}/paper/article/{v}")
+                                elif k == "id" and isinstance(v, (str, int)) and "xmobile/paper" in res.url:
+                                    parsed_res_url = urllib.parse.urlparse(res.url)
+                                    origin = f"{parsed_res_url.scheme}://{parsed_res_url.netloc}"
+                                    api_extracted_links.add(f"{origin}/paper/article/{v}")
+                                else:
+                                    find_ids(v)
+                        elif isinstance(obj, list):
+                            for item in obj:
+                                find_ids(item)
+
+                    find_ids(data)
+            except Exception:
+                pass
+
+        page.on("response", handle_response)
+        # ---------------------------------
 
         # Use domcontentloaded to ensure SPA and dynamic frameworks generate the DOM
         try:
@@ -468,7 +505,26 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
         except Exception as goto_e:
             print(f"Warning: page.goto timeout or error for {current_url}: {goto_e}. Attempting to proceed with loaded content.")
 
-        await scroll_page(page)
+        # Check if we got blocked by CAPTCHA/WAF/Login Wall
+        page_title = await page.title()
+        if "人机验证" in page_title or "用户登录" in page_title:
+            print(f"[{task_id}] Blocked by WAF or Login page for URL: {current_url} (Title: {page_title})")
+            await asyncio.to_thread(db_manager.mark_url_failed, task_id, current_url, f"Blocked by WAF (Title: {page_title})")
+            return
+
+        # Enhance SPA support by forcing longer loading for known infinite scroll or dynamic load pages
+        # If the page has elements that trigger loads on scroll, scroll repeatedly with a brief pause
+        try:
+            for _ in range(5):
+                await page.evaluate("window.scrollBy(0, document.body.scrollHeight / 5)")
+                await page.wait_for_timeout(1000)
+
+            # Additional wait for any trailing ajax requests to complete and DOM to update
+            await page.wait_for_timeout(3000)
+            await page.evaluate("window.scrollTo(0, 0)")
+        except Exception as scroll_e:
+            print(f"Warning: Failed to scroll page fully: {scroll_e}")
+
         html_content = await page.content()
 
         # Ensure we have the root boundary prefix. If it's the start URL, calculate and save it.
@@ -485,8 +541,18 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
             task_root_prefixes[task_id] = dynamic_root
             await asyncio.to_thread(db_manager.update_task_dynamic_root, task_id, dynamic_root)
 
-        # Extract new links under the determined generic root boundary
-        new_links = get_sub_domain_links(html_content, current_url, start_url, dynamic_root)
+        task_data = await asyncio.to_thread(db_manager.get_task, task_id)
+        crawl_scope = task_data.get('crawl_scope', 'subpages') if task_data else 'subpages'
+
+        # Extract new links based on the boundary rules
+        new_links = get_sub_domain_links(html_content, current_url, start_url, dynamic_root, crawl_scope)
+
+        # Merge links extracted directly from the DOM with those extracted from APIs
+        if api_extracted_links:
+            print(f"[Worker] Found {len(api_extracted_links)} links from API JSON responses.")
+            new_links.extend(list(api_extracted_links))
+            new_links = list(set(new_links))
+
         if new_links:
             await asyncio.to_thread(db_manager.add_discovered_urls, task_id, current_url, new_links)
 
@@ -501,7 +567,10 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
         # Process images on the ENTIRE page FIRST to mutate src tags to local relative paths
         body_soup = full_soup.find('body') or full_soup
         connector = aiohttp.TCPConnector(ssl=False)
-        headers = {'User-Agent': ua}
+
+        # Use a random UA for image downloads if context UA isn't accessible here
+        aiohttp_ua = random.choice(USER_AGENTS)
+        headers = {'User-Agent': aiohttp_ua}
         async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
             await process_images(body_soup, current_url, images_path, session)
 
@@ -565,10 +634,8 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
     finally:
         if page:
             await page.close()
-        if context:
-            await context.close()
 
-async def worker_task(task_id: str, start_url: str, base_path: str, browser, semaphore: asyncio.Semaphore):
+async def worker_task(task_id: str, start_url: str, base_path: str, browser_context, semaphore: asyncio.Semaphore):
     """A worker task that runs under a semaphore to limit concurrency."""
     async with semaphore:
         try:
@@ -581,10 +648,10 @@ async def worker_task(task_id: str, start_url: str, base_path: str, browser, sem
                 return True # Queue empty for now
 
             # Add random delay to simulate human behavior and avoid WAF rate limiting
-            delay = random.uniform(1.0, 3.0)
+            delay = random.uniform(3.0, 6.0)
             await asyncio.sleep(delay)
 
-            await process_single_url(task_id, current_url, start_url, base_path, browser)
+            await process_single_url(task_id, current_url, start_url, base_path, browser_context)
             return True
         except Exception as e:
             import traceback
@@ -601,8 +668,8 @@ async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
     base_path, base_domain = setup_base_directory(start_url)
     await asyncio.to_thread(db_manager.create_task, task_id, start_url, start_url)
 
-    # Strictly limit concurrency to 5 to prevent memory overload and aggressive IP blocks
-    semaphore = asyncio.Semaphore(5)
+    # Limit concurrency to 1 to avoid aggressive IP blocks and WAF rate limits (strictly serial)
+    semaphore = asyncio.Semaphore(1)
 
     # Force PLAYWRIGHT_BROWSERS_PATH to 0 here as well so the worker picks it up
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
@@ -612,6 +679,15 @@ async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
             browser = await p.chromium.launch(
                 headless=headless,
                 args=["--disable-blink-features=AutomationControlled"]
+            )
+
+            # Create a single shared context for the entire task
+            ua = random.choice(USER_AGENTS)
+            vp = random.choice(VIEWPORTS)
+            browser_context = await browser.new_context(
+                user_agent=ua,
+                viewport=vp,
+                ignore_https_errors=True
             )
 
             active_tasks = set()
@@ -646,9 +722,9 @@ async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
                     await asyncio.to_thread(db_manager.update_task_status, task_id, 'completed')
                     break
 
-                # Replenish workers up to the concurrency limit (5)
-                while len(active_tasks) < 5 and active_count > 0:
-                    task = asyncio.create_task(worker_task(task_id, start_url, base_path, browser, semaphore))
+                # Replenish workers up to the concurrency limit (1)
+                while len(active_tasks) < 1 and active_count > 0:
+                    task = asyncio.create_task(worker_task(task_id, start_url, base_path, browser_context, semaphore))
                     active_tasks.add(task)
                     active_count -= 1 # Optimistically decrement to avoid over-spawning if DB hasn't caught up
 

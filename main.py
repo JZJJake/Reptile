@@ -54,6 +54,7 @@ class ScrapeRequest(BaseModel):
     url: str
     show_browser: bool = True
     update_data: bool = False
+    crawl_scope: str = "subpages" # "subpages" or "all_site"
 
 @app.get("/", response_class=HTMLResponse)
 async def get_index():
@@ -76,7 +77,10 @@ async def start_scraping(request: ScrapeRequest, background_tasks: BackgroundTas
 
     task = await asyncio.to_thread(db_manager.get_task, task_id)
     if not task:
-        await asyncio.to_thread(db_manager.create_task, task_id, request.url, request.url)
+        await asyncio.to_thread(db_manager.create_task, task_id, request.url, request.url, request.crawl_scope)
+    else:
+        # Update the crawl_scope if it's an existing task being resumed/updated
+        await asyncio.to_thread(db_manager.update_task_crawl_scope, task_id, request.crawl_scope)
 
     # If the task is already running in memory, don't start a new one
     if task_id in task_events and not task_events[task_id]['stop'].is_set():

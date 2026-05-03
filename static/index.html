@@ -96,6 +96,14 @@
         <label for="show-browser" style="margin-bottom: 0; font-weight: normal;">显示浏览器界面 (取消勾选可后台静默爬取)</label>
     </div>
 
+    <div class="form-group mt-3" style="margin-top: 15px;">
+        <label for="crawlScope">爬取范围 (Crawl Scope)</label>
+        <select id="crawlScope" style="width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 5px;">
+            <option value="subpages" selected>仅子页面 (向下钻取)</option>
+            <option value="all_site">全站爬取 (只要是相同域名)</option>
+        </select>
+    </div>
+
     <div class="notice">
         <b>工作流说明：</b><br>
         1. 系统会自动构建数据链并防止重复爬取。<br>
@@ -129,7 +137,8 @@
                 body: JSON.stringify({
                     url: urlInput,
                     show_browser: showBrowser,
-                    update_data: isUpdate
+                    update_data: isUpdate,
+                    crawl_scope: document.getElementById('crawlScope').value
                 })
             });
 
