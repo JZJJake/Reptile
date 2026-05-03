@@ -645,7 +645,7 @@ async def worker_task(task_id: str, start_url: str, base_path: str, browser_cont
                 return True # Queue empty for now
 
             # Add random delay to simulate human behavior and avoid WAF rate limiting
-            delay = random.uniform(2.0, 5.0)
+            delay = random.uniform(3.0, 6.0)
             await asyncio.sleep(delay)
 
             await process_single_url(task_id, current_url, start_url, base_path, browser_context)
@@ -665,8 +665,8 @@ async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
     base_path, base_domain = setup_base_directory(start_url)
     await asyncio.to_thread(db_manager.create_task, task_id, start_url, start_url)
 
-    # Limit concurrency to 2 to avoid aggressive IP blocks and WAF rate limits
-    semaphore = asyncio.Semaphore(2)
+    # Limit concurrency to 1 to avoid aggressive IP blocks and WAF rate limits (strictly serial)
+    semaphore = asyncio.Semaphore(1)
 
     # Force PLAYWRIGHT_BROWSERS_PATH to 0 here as well so the worker picks it up
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
@@ -719,8 +719,8 @@ async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
                     await asyncio.to_thread(db_manager.update_task_status, task_id, 'completed')
                     break
 
-                # Replenish workers up to the concurrency limit (2)
-                while len(active_tasks) < 2 and active_count > 0:
+                # Replenish workers up to the concurrency limit (1)
+                while len(active_tasks) < 1 and active_count > 0:
                     task = asyncio.create_task(worker_task(task_id, start_url, base_path, browser_context, semaphore))
                     active_tasks.add(task)
                     active_count -= 1 # Optimistically decrement to avoid over-spawning if DB hasn't caught up
