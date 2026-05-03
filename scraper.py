@@ -137,19 +137,27 @@ def determine_static_boundary(start_url):
 
     return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, base_path, '', '', ''))
 
-def get_sub_domain_links(html, current_url, base_url, dynamic_root_prefix=None):
-    """Extract links that are downward paths from the pre-calculated root prefix."""
+def get_sub_domain_links(html, current_url, base_url, dynamic_root_prefix=None, crawl_scope="subpages"):
+    """Extract links based on the crawl scope."""
     soup = BeautifulSoup(html, 'lxml')
     links = []
 
     # Use the pre-computed static root prefix if available, otherwise fallback to base_url
     base_prefix = dynamic_root_prefix if dynamic_root_prefix else (base_url if base_url.endswith('/') else base_url + '/')
 
+    # Pre-compute base domain for all_site scope
+    base_parsed = urllib.parse.urlparse(base_url)
+    base_domain = base_parsed.netloc
+
     # Ignore purely media/executable files, but ALLOW documents we want to download
     ignored_extensions = {'.zip', '.rar', '.exe', '.mp3', '.mp4', '.avi', '.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg'}
 
     for a_tag in soup.find_all('a', href=True):
         href = a_tag['href']
+        # Ignore empty hrefs or js calls
+        if not href or href.startswith('javascript:'):
+            continue
+
         full_url = urllib.parse.urljoin(current_url, href)
         # Remove fragment
         full_url = urllib.parse.urldefrag(full_url)[0]
@@ -158,9 +166,14 @@ def get_sub_domain_links(html, current_url, base_url, dynamic_root_prefix=None):
         ext = os.path.splitext(parsed_url.path)[1].lower()
 
         if parsed_url.scheme in ['http', 'https'] and ext not in ignored_extensions:
-            # Check if it is the base_url itself, or a child path of the base_prefix (case-insensitive)
-            if full_url.lower() == base_url.lower() or full_url.lower().startswith(base_prefix.lower()):
-                links.append(full_url)
+            if crawl_scope == "all_site":
+                # Check if it shares the same domain (or subdomain depending on strictness, here we use strict netloc match)
+                if parsed_url.netloc.lower() == base_domain.lower():
+                    links.append(full_url)
+            else:
+                # Check if it is the base_url itself, or a child path of the base_prefix (case-insensitive)
+                if full_url.lower() == base_url.lower() or full_url.lower().startswith(base_prefix.lower()):
+                    links.append(full_url)
     return list(set(links))
 
 async def scroll_page(page):
@@ -468,7 +481,19 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
         except Exception as goto_e:
             print(f"Warning: page.goto timeout or error for {current_url}: {goto_e}. Attempting to proceed with loaded content.")
 
-        await scroll_page(page)
+        # Enhance SPA support by forcing longer loading for known infinite scroll or dynamic load pages
+        # If the page has elements that trigger loads on scroll, scroll repeatedly with a brief pause
+        try:
+            for _ in range(5):
+                await page.evaluate("window.scrollBy(0, document.body.scrollHeight / 5)")
+                await page.wait_for_timeout(1000)
+
+            # Additional wait for any trailing ajax requests to complete and DOM to update
+            await page.wait_for_timeout(3000)
+            await page.evaluate("window.scrollTo(0, 0)")
+        except Exception as scroll_e:
+            print(f"Warning: Failed to scroll page fully: {scroll_e}")
+
         html_content = await page.content()
 
         # Ensure we have the root boundary prefix. If it's the start URL, calculate and save it.
@@ -485,8 +510,11 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
             task_root_prefixes[task_id] = dynamic_root
             await asyncio.to_thread(db_manager.update_task_dynamic_root, task_id, dynamic_root)
 
-        # Extract new links under the determined generic root boundary
-        new_links = get_sub_domain_links(html_content, current_url, start_url, dynamic_root)
+        task_data = await asyncio.to_thread(db_manager.get_task, task_id)
+        crawl_scope = task_data.get('crawl_scope', 'subpages') if task_data else 'subpages'
+
+        # Extract new links based on the boundary rules
+        new_links = get_sub_domain_links(html_content, current_url, start_url, dynamic_root, crawl_scope)
         if new_links:
             await asyncio.to_thread(db_manager.add_discovered_urls, task_id, current_url, new_links)
 

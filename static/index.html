@@ -91,6 +91,14 @@
         <input type="url" id="url" placeholder="https://example.com/docs/" required>
     </div>
 
+    <div class="form-group">
+        <label for="crawl-scope">爬取范围 (Crawl Scope)</label>
+        <select id="crawl-scope" style="width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 5px; font-size: 16px; box-sizing: border-box;">
+            <option value="subpages">仅爬取子页面（当前路径及其下级）</option>
+            <option value="all_site">爬取全站（放宽至当前域名下所有页面）</option>
+        </select>
+    </div>
+
     <div class="form-group checkbox-group">
         <input type="checkbox" id="show-browser" checked>
         <label for="show-browser" style="margin-bottom: 0; font-weight: normal;">显示浏览器界面 (取消勾选可后台静默爬取)</label>
@@ -114,6 +122,7 @@
     async function startTask(isUpdate) {
         const urlInput = document.getElementById('url').value;
         const showBrowser = document.getElementById('show-browser').checked;
+        const crawlScope = document.getElementById('crawl-scope').value;
 
         if (!urlInput) {
             alert('请输入有效的网址！');
@@ -129,7 +138,8 @@
                 body: JSON.stringify({
                     url: urlInput,
                     show_browser: showBrowser,
-                    update_data: isUpdate
+                    update_data: isUpdate,
+                    crawl_scope: crawlScope
                 })
             });
 
