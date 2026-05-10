@@ -432,7 +432,7 @@ async def intercept_route(route):
 async def process_single_url(task_id: str, current_url: str, start_url: str, base_path: str, browser) -> None:
     """Processes a single URL within a worker context."""
 
-    # Early check for pause/stop
+    # Check if task is paused (will block here if paused) or stopped (returns True)
     if await check_pause_stop(task_id):
         return
 
@@ -477,17 +477,16 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
 
         # Use domcontentloaded to ensure SPA and dynamic frameworks generate the DOM
         try:
-            # Check pause/stop before heavy load
-            if await check_pause_stop(task_id):
-                return
-
             await page.goto(current_url, wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_selector('body', state='attached', timeout=30000)
 
-            # Check again during the wait phase
+            # Let asyncio natively handle CancellationError if stopped during sleep,
+            # but we can check pause state just in case it was paused immediately after loading.
             if await check_pause_stop(task_id):
                 return
             await page.wait_for_timeout(3000)
+        except asyncio.CancelledError:
+            raise
         except Exception as goto_e:
             print(f"Warning: page.goto timeout or error for {current_url}: {goto_e}. Attempting to proceed with loaded content.")
 
@@ -605,15 +604,14 @@ async def worker_task(task_id: str, start_url: str, base_path: str, browser, sem
 
             # Add random delay to simulate human behavior and avoid WAF rate limiting
             delay = random.uniform(1.0, 3.0)
-            # Sleep in chunks to remain responsive to pause/stop signals
-            steps = int(delay * 10)
-            for _ in range(steps):
-                if await check_pause_stop(task_id):
-                    return False
-                await asyncio.sleep(0.1)
+            # Let asyncio natively handle CancellationErrors during sleep if the stop button is pressed
+            await asyncio.sleep(delay)
 
             await process_single_url(task_id, current_url, start_url, base_path, browser)
             return True
+        except asyncio.CancelledError:
+            print(f"Worker task cancelled natively for task {task_id}.")
+            raise
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -681,9 +679,18 @@ async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
                     active_count -= 1 # Optimistically decrement to avoid over-spawning if DB hasn't caught up
 
                 if active_tasks:
-                    # Wait for at least one task to complete before continuing the loop,
-                    # but use a timeout so we can frequently check for pause/stop signals.
-                    await asyncio.wait(active_tasks, timeout=1.0, return_when=asyncio.FIRST_COMPLETED)
+                    # Wait for either a worker to complete OR the global stop event to be triggered
+                    stop_event_task = asyncio.create_task(task_events[task_id]['stop'].wait())
+                    wait_tasks = list(active_tasks) + [stop_event_task]
+
+                    done, pending = await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_COMPLETED)
+
+                    # If the stop event was triggered, cancel the stop_event_task to clean up, and break
+                    if stop_event_task in done:
+                        await asyncio.to_thread(db_manager.update_task_status, task_id, 'stopped')
+                        break
+                    else:
+                        stop_event_task.cancel()
                 else:
                     # Brief pause if nothing to do but DB says there should be (rare race condition)
                     await asyncio.sleep(1)
