@@ -12,6 +12,7 @@ import html2text
 import aiohttp
 from readability import Document
 import io
+import hashlib
 
 import db_manager
 
@@ -36,7 +37,13 @@ def sanitize_filename(name):
         return "Untitled_" + datetime.now().strftime("%H%M%S")
     safe_name = re.sub(r'[\\/*?:"<>|]', "", str(name))
     safe_name = re.sub(r'\s+', "_", safe_name)
-    return safe_name[:50] # Limit length
+
+    # Strictly limit length to prevent WinError 206 (Path too long)
+    if len(safe_name) > 30:
+        hash_suffix = hashlib.md5(safe_name.encode('utf-8')).hexdigest()[:6]
+        safe_name = safe_name[:23] + "_" + hash_suffix
+
+    return safe_name
 
 def setup_base_directory(start_url):
     """Create the root directory for this crawl session."""
@@ -44,6 +51,8 @@ def setup_base_directory(start_url):
     parsed = urllib.parse.urlparse(start_url)
     domain = parsed.netloc.replace("www.", "")
     safe_domain = re.sub(r'[^a-zA-Z0-9]', '_', domain)
+    if len(safe_domain) > 20:
+        safe_domain = safe_domain[:20]
 
     folder_name = f"{timestamp}_{safe_domain}"
     base_path = os.path.join(os.getcwd(), "scraped_data", folder_name)
@@ -423,6 +432,10 @@ async def intercept_route(route):
 async def process_single_url(task_id: str, current_url: str, start_url: str, base_path: str, browser) -> None:
     """Processes a single URL within a worker context."""
 
+    # Early check for pause/stop
+    if await check_pause_stop(task_id):
+        return
+
     # Check for direct file downloads
     parsed_url = urllib.parse.urlparse(current_url)
     ext = os.path.splitext(parsed_url.path)[1].lower()
@@ -464,8 +477,16 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
 
         # Use domcontentloaded to ensure SPA and dynamic frameworks generate the DOM
         try:
+            # Check pause/stop before heavy load
+            if await check_pause_stop(task_id):
+                return
+
             await page.goto(current_url, wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_selector('body', state='attached', timeout=30000)
+
+            # Check again during the wait phase
+            if await check_pause_stop(task_id):
+                return
             await page.wait_for_timeout(3000)
         except Exception as goto_e:
             print(f"Warning: page.goto timeout or error for {current_url}: {goto_e}. Attempting to proceed with loaded content.")
@@ -584,7 +605,12 @@ async def worker_task(task_id: str, start_url: str, base_path: str, browser, sem
 
             # Add random delay to simulate human behavior and avoid WAF rate limiting
             delay = random.uniform(1.0, 3.0)
-            await asyncio.sleep(delay)
+            # Sleep in chunks to remain responsive to pause/stop signals
+            steps = int(delay * 10)
+            for _ in range(steps):
+                if await check_pause_stop(task_id):
+                    return False
+                await asyncio.sleep(0.1)
 
             await process_single_url(task_id, current_url, start_url, base_path, browser)
             return True
@@ -655,8 +681,9 @@ async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
                     active_count -= 1 # Optimistically decrement to avoid over-spawning if DB hasn't caught up
 
                 if active_tasks:
-                    # Wait for at least one task to complete before continuing the loop
-                    await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
+                    # Wait for at least one task to complete before continuing the loop,
+                    # but use a timeout so we can frequently check for pause/stop signals.
+                    await asyncio.wait(active_tasks, timeout=1.0, return_when=asyncio.FIRST_COMPLETED)
                 else:
                     # Brief pause if nothing to do but DB says there should be (rare race condition)
                     await asyncio.sleep(1)
@@ -665,6 +692,14 @@ async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
         print(f"Crawl fatally failed: {str(e)}")
         await asyncio.to_thread(db_manager.update_task_status, task_id, 'failed')
     finally:
+        # Cancel any remaining active tasks to prevent them from running in the background
+        if 'active_tasks' in locals() and active_tasks:
+            for t in active_tasks:
+                if not t.done():
+                    t.cancel()
+            # Wait briefly for tasks to acknowledge cancellation
+            await asyncio.wait(active_tasks, timeout=2.0)
+
         await asyncio.to_thread(db_manager.reset_processing_urls, task_id)
         if task_id in task_events:
             del task_events[task_id]

@@ -1,3 +1,4 @@
+import time
 import sqlite3
 import os
 import json
@@ -104,38 +105,41 @@ def get_pending_url(task_id: str) -> Optional[str]:
 
 def get_and_lock_pending_url(task_id: str) -> Optional[str]:
     """Atomically get the most recent pending URL and mark it as processing to prevent concurrent grabs."""
-    import time
     for attempt in range(5):
+        conn = None
         try:
             conn = get_db_connection()
             conn.execute("BEGIN EXCLUSIVE")
-            try:
-                row = conn.execute(
-                    'SELECT url FROM urls WHERE task_id = ? AND status = ? ORDER BY id DESC LIMIT 1',
-                    (task_id, 'pending')
-                ).fetchone()
+            row = conn.execute(
+                'SELECT url FROM urls WHERE task_id = ? AND status = ? ORDER BY id DESC LIMIT 1',
+                (task_id, 'pending')
+            ).fetchone()
 
-                if row:
-                    url = row['url']
-                    conn.execute(
-                        'UPDATE urls SET status = ? WHERE task_id = ? AND url = ?',
-                        ('processing', task_id, url)
-                    )
-                    conn.commit()
-                    return url
-
+            if row:
+                url = row['url']
+                conn.execute(
+                    'UPDATE urls SET status = ? WHERE task_id = ? AND url = ?',
+                    ('processing', task_id, url)
+                )
                 conn.commit()
-                return None
-            except Exception as e:
-                conn.rollback()
-                raise e
-            finally:
-                conn.close()
+                return url
+
+            conn.commit()
+            return None
         except sqlite3.OperationalError as e:
+            if conn:
+                conn.rollback()
             if 'database is locked' in str(e).lower() and attempt < 4:
                 time.sleep(0.5 * (attempt + 1))
                 continue
             raise e
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            raise e
+        finally:
+            if conn:
+                conn.close()
 
 def reset_processing_urls(task_id: str):
     """Reset URLs that are stuck in 'processing' back to 'pending' (useful on startup/resume)."""
