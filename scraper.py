@@ -363,18 +363,22 @@ def clean_html_structure(soup):
 
 async def download_file(url, save_path, user_agent):
     """Download arbitrary files (PDF, Word, Excel, etc.) via aiohttp."""
-    try:
-        connector = aiohttp.TCPConnector(ssl=False)
-        headers = {'User-Agent': user_agent}
-        async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
-            async with session.get(url, timeout=300) as response:
-                if response.status == 200:
-                    with open(save_path, 'wb') as f:
-                        async for chunk in response.content.iter_chunked(8192):
-                            f.write(chunk)
-                    return True
-    except Exception as e:
-        print(f"Error downloading file {url}: {e}")
+    headers = {'User-Agent': user_agent}
+    for attempt in range(3):
+        try:
+            connector = aiohttp.TCPConnector(ssl=False)
+            async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
+                async with session.get(url, timeout=300) as response:
+                    if response.status == 200:
+                        with open(save_path, 'wb') as f:
+                            async for chunk in response.content.iter_chunked(8192):
+                                f.write(chunk)
+                        return True
+                    else:
+                        print(f"Download {url} failed with status {response.status}, attempt {attempt+1}")
+        except Exception as e:
+            print(f"Error downloading file {url} (attempt {attempt+1}): {e}")
+            await asyncio.sleep(2) # Backoff before retry
     return False
 
 def convert_to_markdown(html):
@@ -476,19 +480,26 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
         await page.route("**/*", intercept_route)
 
         # Use domcontentloaded to ensure SPA and dynamic frameworks generate the DOM
-        try:
-            await page.goto(current_url, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_selector('body', state='attached', timeout=30000)
+        # Implement retry logic for Playwright page loading (handles transient network errors/timeouts)
+        for attempt in range(3):
+            try:
+                await page.goto(current_url, wait_until="domcontentloaded", timeout=60000)
+                await page.wait_for_selector('body', state='attached', timeout=30000)
 
-            # Let asyncio natively handle CancellationError if stopped during sleep,
-            # but we can check pause state just in case it was paused immediately after loading.
-            if await check_pause_stop(task_id):
-                return
-            await page.wait_for_timeout(3000)
-        except asyncio.CancelledError:
-            raise
-        except Exception as goto_e:
-            print(f"Warning: page.goto timeout or error for {current_url}: {goto_e}. Attempting to proceed with loaded content.")
+                # Let asyncio natively handle CancellationError if stopped during sleep,
+                # but we can check pause state just in case it was paused immediately after loading.
+                if await check_pause_stop(task_id):
+                    return
+                await page.wait_for_timeout(3000)
+                break  # Success, exit retry loop
+            except asyncio.CancelledError:
+                raise
+            except Exception as goto_e:
+                print(f"Warning: page.goto error for {current_url} (attempt {attempt+1}): {goto_e}")
+                if attempt == 2:
+                    print(f"Attempting to proceed with loaded content after {attempt+1} failures.")
+                else:
+                    await asyncio.sleep(2)
 
         await scroll_page(page)
         html_content = await page.content()
