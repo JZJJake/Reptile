@@ -49,6 +49,12 @@ def init_db():
     except sqlite3.OperationalError:
         pass # Column already exists
 
+    # Try adding attachment_paths to existing databases
+    try:
+        cursor.execute('ALTER TABLE urls ADD COLUMN attachment_paths TEXT')
+    except sqlite3.OperationalError:
+        pass # Column already exists
+
     conn.commit()
     conn.close()
 
@@ -149,11 +155,11 @@ def get_active_count(task_id: str) -> int:
     conn.close()
     return row['count'] if row else 0
 
-def mark_url_scraped(task_id: str, url: str, title: str = None, saved_folder: str = None, content_type: str = None):
+def mark_url_scraped(task_id: str, url: str, title: str = None, saved_folder: str = None, content_type: str = None, attachment_paths: str = None):
     conn = get_db_connection()
     conn.execute(
-        'UPDATE urls SET status = ?, title = ?, saved_folder = ?, content_type = ? WHERE task_id = ? AND url = ?',
-        ('scraped', title, saved_folder, content_type, task_id, url)
+        'UPDATE urls SET status = ?, title = ?, saved_folder = ?, content_type = ?, attachment_paths = ? WHERE task_id = ? AND url = ?',
+        ('scraped', title, saved_folder, content_type, attachment_paths, task_id, url)
     )
     conn.execute(
         'UPDATE tasks SET total_scraped = total_scraped + 1 WHERE task_id = ?',

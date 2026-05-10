@@ -19,6 +19,13 @@ import db_manager
 # task_id -> {'pause': Event, 'stop': Event}
 task_events = {}
 task_root_prefixes = {} # task_id -> dynamic root prefix
+global_error_counter = 0
+global_pause_event = asyncio.Event()
+global_pause_event.set()
+
+def get_proxy_config():
+    """Stub to return proxy configuration if needed."""
+    return None
 
 def init_task_events(task_id: str):
     task_events[task_id] = {
@@ -69,10 +76,13 @@ def setup_page_directory(base_path, title):
     tables_path = os.path.join(page_path, "tables")
     images_path = os.path.join(page_path, "images")
 
+    attachments_path = os.path.join(page_path, "attachments")
+
     os.makedirs(tables_path, exist_ok=True)
     os.makedirs(images_path, exist_ok=True)
+    os.makedirs(attachments_path, exist_ok=True)
 
-    return page_path, tables_path, images_path
+    return page_path, tables_path, images_path, attachments_path
 
 async def download_image(session, img_url, save_path):
     """Download an image asynchronously with retries and headers."""
@@ -285,41 +295,96 @@ async def process_images(soup, base_url, images_path, session):
 
 import re
 
-def extract_publish_info(soup):
-    """Extract publish date, source, and author information."""
-    info_text = []
+def extract_publish_info(soup, page=None):
+    """Extract breadcrumbs, publish date, source, author, and government metadata."""
+    info_dict = {}
 
-    # Common text patterns in government websites
-    patterns = [
-        re.compile(r'(?:发布|创建)时间\s*[:：]\s*(\d{4}[-/年]\d{1,2}[-/月]\d{1,2}[日]?[\s\d:]*)'),
-        re.compile(r'来源\s*[:：]\s*([^\s]+)'),
-        re.compile(r'作者\s*[:：]\s*([^\s]+)')
-    ]
+    # 1. Breadcrumbs
+    breadcrumbs = []
+    breadcrumb_elem = soup.select_one('.location, .breadcrumb')
+    if breadcrumb_elem:
+        breadcrumbs = [item.get_text(strip=True) for item in breadcrumb_elem.find_all('a')]
+        if not breadcrumbs:
+            breadcrumbs = [breadcrumb_elem.get_text(strip=True)]
+    else:
+        # Fallback to finding "当前位置"
+        for elem in soup.find_all(string=re.compile(r'当前位置')):
+            parent = elem.parent
+            if parent:
+                # Get the whole text of the container
+                text = parent.get_text(separator='>', strip=True)
+                # Clean up multiple '>'
+                text = re.sub(r'>+', '>', text)
+                breadcrumbs = [text]
+                break
 
-    # Check meta tags first
+    if breadcrumbs:
+        info_dict['面包屑导航'] = " > ".join(breadcrumbs)
+
+    # 2. Government Metadata (索引号, 发文字号, 主题分类, 成文日期)
+    gov_meta_keys = ['索引号', '发文字号', '主题分类', '成文日期', '发布机构', '组配分类']
+
+    # Try finding the first table which often contains these
+    first_table = soup.find('table')
+    if first_table:
+        for tr in first_table.find_all('tr'):
+            text = tr.get_text(separator='|', strip=True)
+            for key in gov_meta_keys:
+                if key in text and key not in info_dict:
+                    # Very simple extraction: if a cell matches the key, the next cell might be the value
+                    tds = tr.find_all(['td', 'th'])
+                    for i, td in enumerate(tds):
+                        if key in td.get_text(strip=True) and i + 1 < len(tds):
+                            val = tds[i+1].get_text(strip=True)
+                            if val:
+                                info_dict[key] = val
+
+    # Fallback to regex for government metadata
+    full_text = soup.get_text(separator=' ', strip=True)
+    for key in gov_meta_keys:
+        if key not in info_dict:
+            match = re.search(f"{key}[\\s:：]*([^\\n<]+)", full_text)
+            if match:
+                info_dict[key] = match.group(1).strip()
+
+    # 3. Common publish info (Date, Source, Author)
+    patterns = {
+        '发布时间': re.compile(r'(?:发布|创建)时间\s*[:：]\s*(\d{4}[-/年]\d{1,2}[-/月]\d{1,2}[日]?[\s\d:]*)'),
+        '来源': re.compile(r'来源\s*[:：]\s*([^\s]+)'),
+        '作者': re.compile(r'作者\s*[:：]\s*([^\s]+)')
+    }
+
+    # Meta tags
     meta_date = soup.find('meta', attrs={'name': re.compile(r'pubdate', re.I)})
     if meta_date and meta_date.get('content'):
-        info_text.append(f"**发布时间:** {meta_date['content']}")
+        info_dict['发布时间'] = meta_date['content']
 
     meta_source = soup.find('meta', attrs={'name': re.compile(r'source', re.I)})
     if meta_source and meta_source.get('content'):
-        info_text.append(f"**来源:** {meta_source['content']}")
+        info_dict['来源'] = meta_source['content']
 
-    # Search in text nodes if we don't have them
-    full_text = soup.get_text(separator=' ', strip=True)
-    if not any("发布时间" in t for t in info_text):
-        match = patterns[0].search(full_text)
+    # Regex fallback
+    if '发布时间' not in info_dict:
+        match = patterns['发布时间'].search(full_text)
         if match:
-            info_text.append(f"**发布时间:** {match.group(1)}")
+            info_dict['发布时间'] = match.group(1)
 
-    if not any("来源" in t for t in info_text):
-        match = patterns[1].search(full_text)
+    if '来源' not in info_dict:
+        match = patterns['来源'].search(full_text)
         if match:
-            info_text.append(f"**来源:** {match.group(1)}")
+            info_dict['来源'] = match.group(1)
 
-    match = patterns[2].search(full_text)
+    match = patterns['作者'].search(full_text)
     if match:
-        info_text.append(f"**作者:** {match.group(1)}")
+        info_dict['作者'] = match.group(1)
+
+    # Format as Markdown lines
+    info_text = []
+    for k, v in info_dict.items():
+        if k == '面包屑导航':
+            info_text.append(f"**{k}:** {v}")
+        else:
+            info_text.append(f"**{k}:** {v}")
 
     return "\n".join(info_text)
 
@@ -348,6 +413,15 @@ def clean_html_structure(soup):
         if bad_classes_ids.search(class_str) or bad_classes_ids.search(id_str):
             tag.decompose()
 
+    # Blacklist text removal for government sites
+    blacklist_phrases = ["打印本页", "扫码关注", "相关稿件", "浏览次数", "二维码"]
+    for tag in soup.find_all(['div', 'ul', 'span', 'p']):
+        text = tag.get_text(strip=True)
+        # Avoid decomposing entire articles if they happen to mention the word.
+        # Only decompose if the text block is relatively short, or the exact phrases make up a large portion
+        if len(text) < 100 and any(phrase in text for phrase in blacklist_phrases):
+            tag.decompose()
+
     return soup
 
 async def download_file(url, save_path, user_agent):
@@ -372,10 +446,16 @@ def convert_to_markdown(html):
     h.ignore_links = True
     h.ignore_images = True
     h.body_width = 0
+    h.bypass_tables = False # ensure tables are converted correctly
     return h.handle(html)
 
 async def check_pause_stop(task_id: str) -> bool:
     """Returns True if the task should stop, False otherwise. Handles pausing."""
+    # Handle global cooldown pause
+    if not global_pause_event.is_set():
+        print("Global cooldown active, pausing task...")
+        await global_pause_event.wait()
+
     events = task_events.get(task_id)
     if not events:
         return False
@@ -445,31 +525,75 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
     page = None
     try:
         ua = random.choice(USER_AGENTS)
-        vp = random.choice(VIEWPORTS)
 
-        context = await browser.new_context(
-            user_agent=ua,
-            viewport=vp,
-            ignore_https_errors=True
-        )
-        page = await context.new_page()
+        # Hybrid Request Mechanism: Try aiohttp first
+        use_playwright = False
+        html_content = ""
 
-        # Apply stealth
-        await Stealth().apply_stealth_async(page)
-
-        # Intercept and block unnecessary resources
-        await page.route("**/*", intercept_route)
-
-        # Use domcontentloaded to ensure SPA and dynamic frameworks generate the DOM
         try:
-            await page.goto(current_url, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_selector('body', state='attached', timeout=30000)
-            await page.wait_for_timeout(3000)
-        except Exception as goto_e:
-            print(f"Warning: page.goto timeout or error for {current_url}: {goto_e}. Attempting to proceed with loaded content.")
+            connector = aiohttp.TCPConnector(ssl=False)
+            headers = {'User-Agent': ua}
+            async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
+                async with session.get(current_url, timeout=15) as response:
+                    if response.status == 200:
+                        text = await response.text()
 
-        await scroll_page(page)
-        html_content = await page.content()
+                        # Detect dynamic content or missing title in body
+                        soup_test = BeautifulSoup(text, 'lxml')
+                        title_text = soup_test.title.string.strip() if soup_test.title and soup_test.title.string else ""
+                        body_text = soup_test.body.get_text(strip=True) if soup_test.body else ""
+
+                        if 'id="app"' in text or 'id="root"' in text or (title_text and title_text not in body_text):
+                            use_playwright = True
+                        else:
+                            html_content = text
+                    else:
+                        use_playwright = True
+        except Exception as e:
+            print(f"Warning: aiohttp pre-fetch failed for {current_url}: {e}")
+            use_playwright = True
+
+        if use_playwright:
+            print(f"Falling back to Playwright for: {current_url}")
+            vp = random.choice(VIEWPORTS)
+
+            proxy_config = get_proxy_config()
+            context_args = {
+                "user_agent": ua,
+                "viewport": vp,
+                "ignore_https_errors": True,
+                "color_scheme": random.choice(["dark", "light"])
+            }
+            if proxy_config:
+                context_args["proxy"] = proxy_config
+
+            context = await browser.new_context(**context_args)
+            page = await context.new_page()
+
+            # Additional evasion strategies (like modifying navigator properties) can be injected
+            await page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                window.screen = Object.assign(window.screen, {
+                    colorDepth: """ + str(random.choice([24, 32])) + """
+                });
+            """)
+
+            # Apply stealth
+            await Stealth().apply_stealth_async(page)
+
+            # Intercept and block unnecessary resources
+            await page.route("**/*", intercept_route)
+
+            # Use domcontentloaded to ensure SPA and dynamic frameworks generate the DOM
+            try:
+                await page.goto(current_url, wait_until="domcontentloaded", timeout=60000)
+                await page.wait_for_selector('body', state='attached', timeout=30000)
+                await page.wait_for_timeout(3000)
+            except Exception as goto_e:
+                print(f"Warning: page.goto timeout or error for {current_url}: {goto_e}. Attempting to proceed with loaded content.")
+
+            await scroll_page(page)
+            html_content = await page.content()
 
         # Ensure we have the root boundary prefix. If it's the start URL, calculate and save it.
         # If it's a child worker picking up a task after a restart, try to load it from the DB.
@@ -496,14 +620,38 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
         # 1. Try to get title from document or fallback to <title> tag
         title = full_soup.title.string if full_soup.title else "Untitled Page"
         # Directory creation is I/O blocking, offload to thread
-        page_path, tables_path, images_path = await asyncio.to_thread(setup_page_directory, base_path, title)
+        page_path, tables_path, images_path, attachments_path = await asyncio.to_thread(setup_page_directory, base_path, title)
 
         # Process images on the ENTIRE page FIRST to mutate src tags to local relative paths
         body_soup = full_soup.find('body') or full_soup
         connector = aiohttp.TCPConnector(ssl=False)
         headers = {'User-Agent': ua}
+
+        attachment_paths = []
         async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
             await process_images(body_soup, current_url, images_path, session)
+
+            # Find document attachments in the page
+            attachment_links = body_soup.find_all('a', href=re.compile(r'\.(pdf|doc|docx|xls|xlsx|ppt|pptx)$', re.I))
+            for a in attachment_links:
+                href = a.get('href')
+                if not href:
+                    continue
+                file_url = urllib.parse.urljoin(current_url, href)
+                parsed_file_url = urllib.parse.urlparse(file_url)
+                filename = os.path.basename(parsed_file_url.path)
+                if not filename:
+                    continue
+
+                safe_filename = sanitize_filename(filename)
+                save_path = os.path.join(attachments_path, safe_filename)
+
+                success = await download_file(file_url, save_path, ua)
+                if success:
+                    rel_path = f"./attachments/{safe_filename}"
+                    attachment_paths.append(rel_path)
+                    # Update href to point to local file
+                    a['href'] = rel_path
 
         # Extract publish info BEFORE structural cleaning
         publish_info = extract_publish_info(full_soup)
@@ -533,6 +681,10 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
         markdown_header = f"# {title}\n\n**Source URL:** {current_url}\n"
         if publish_info:
             markdown_header += f"{publish_info}\n"
+        if attachment_paths:
+            markdown_header += f"**Attachments:**\n"
+            for att in attachment_paths:
+                markdown_header += f"- {att}\n"
         markdown_header += "\n---\n\n"
 
         markdown_content = markdown_header + markdown_content
@@ -555,12 +707,32 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
         with open(md_path, 'w', encoding='utf-8') as f:
             f.write(markdown_content)
 
-        await asyncio.to_thread(db_manager.mark_url_scraped, task_id, current_url, title, page_path, content_type)
+        import json
+        att_json = json.dumps(attachment_paths) if attachment_paths else None
+        await asyncio.to_thread(db_manager.mark_url_scraped, task_id, current_url, title, page_path, content_type, att_json)
 
     except Exception as page_e:
         import traceback
         traceback.print_exc()
         print(f"Error scraping {current_url}: {page_e}")
+
+        # Trigger global cooldown on 403 or 503 like errors (Playwright or aiohttp)
+        error_str = str(page_e).lower()
+        if "403" in error_str or "503" in error_str or "forbidden" in error_str:
+            global global_error_counter
+            global_error_counter += 1
+            if global_error_counter >= 3:
+                print("Detected 3 errors (403/503). Triggering 10-minute global cooldown...")
+                global_error_counter = 0
+                global_pause_event.clear()
+
+                async def cooldown():
+                    await asyncio.sleep(600)
+                    global_pause_event.set()
+                    print("Global cooldown finished. Resuming tasks.")
+
+                asyncio.create_task(cooldown())
+
         await asyncio.to_thread(db_manager.mark_url_failed, task_id, current_url, str(page_e))
     finally:
         if page:
