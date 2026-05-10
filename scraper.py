@@ -361,20 +361,32 @@ def clean_html_structure(soup):
 
     return soup
 
-async def download_file(url, save_path, user_agent):
+async def download_file(url, save_path, user_agent, cookies=None):
     """Download arbitrary files (PDF, Word, Excel, etc.) via aiohttp."""
-    try:
-        connector = aiohttp.TCPConnector(ssl=False)
-        headers = {'User-Agent': user_agent}
-        async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
-            async with session.get(url, timeout=300) as response:
-                if response.status == 200:
-                    with open(save_path, 'wb') as f:
-                        async for chunk in response.content.iter_chunked(8192):
-                            f.write(chunk)
-                    return True
-    except Exception as e:
-        print(f"Error downloading file {url}: {e}")
+    headers = {
+        'User-Agent': user_agent,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'same-origin',
+        'Sec-Fetch-User': '?1',
+    }
+    for attempt in range(3):
+        try:
+            connector = aiohttp.TCPConnector(ssl=False)
+            async with aiohttp.ClientSession(connector=connector, headers=headers, cookies=cookies) as session:
+                async with session.get(url, timeout=300) as response:
+                    if response.status == 200:
+                        with open(save_path, 'wb') as f:
+                            async for chunk in response.content.iter_chunked(8192):
+                                f.write(chunk)
+                        return True
+                    else:
+                        print(f"Download {url} failed with status {response.status}, attempt {attempt+1}")
+        except Exception as e:
+            print(f"Error downloading file {url} (attempt {attempt+1}): {e}")
+            await asyncio.sleep(2) # Backoff before retry
     return False
 
 def convert_to_markdown(html):
@@ -448,7 +460,17 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
         save_path = os.path.join(page_path, filename)
 
         ua = random.choice(USER_AGENTS)
-        success = await download_file(current_url, save_path, ua)
+
+        # Try to get cookies if browser has existing contexts
+        cookie_dict = None
+        try:
+            if browser.contexts:
+                pw_cookies = await browser.contexts[0].cookies()
+                cookie_dict = {cookie['name']: cookie['value'] for cookie in pw_cookies}
+        except Exception:
+            pass
+
+        success = await download_file(current_url, save_path, ua, cookies=cookie_dict)
         if success:
             await asyncio.to_thread(db_manager.mark_url_scraped, task_id, current_url, filename, page_path, 'article')
         else:
@@ -461,12 +483,16 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
     try:
         ua = random.choice(USER_AGENTS)
         vp = random.choice(VIEWPORTS)
+        # Check if browser already has a warmed-up shared context
+        if browser.contexts:
+            context = browser.contexts[0]
+        else:
+            context = await browser.new_context(
+                user_agent=ua,
+                viewport=vp,
+                ignore_https_errors=True
+            )
 
-        context = await browser.new_context(
-            user_agent=ua,
-            viewport=vp,
-            ignore_https_errors=True
-        )
         page = await context.new_page()
 
         # Apply stealth
@@ -476,19 +502,26 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
         await page.route("**/*", intercept_route)
 
         # Use domcontentloaded to ensure SPA and dynamic frameworks generate the DOM
-        try:
-            await page.goto(current_url, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_selector('body', state='attached', timeout=30000)
+        # Implement retry logic for Playwright page loading (handles transient network errors/timeouts)
+        for attempt in range(3):
+            try:
+                await page.goto(current_url, wait_until="domcontentloaded", timeout=60000)
+                await page.wait_for_selector('body', state='attached', timeout=30000)
 
-            # Let asyncio natively handle CancellationError if stopped during sleep,
-            # but we can check pause state just in case it was paused immediately after loading.
-            if await check_pause_stop(task_id):
-                return
-            await page.wait_for_timeout(3000)
-        except asyncio.CancelledError:
-            raise
-        except Exception as goto_e:
-            print(f"Warning: page.goto timeout or error for {current_url}: {goto_e}. Attempting to proceed with loaded content.")
+                # Let asyncio natively handle CancellationError if stopped during sleep,
+                # but we can check pause state just in case it was paused immediately after loading.
+                if await check_pause_stop(task_id):
+                    return
+                await page.wait_for_timeout(3000)
+                break  # Success, exit retry loop
+            except asyncio.CancelledError:
+                raise
+            except Exception as goto_e:
+                print(f"Warning: page.goto error for {current_url} (attempt {attempt+1}): {goto_e}")
+                if attempt == 2:
+                    print(f"Attempting to proceed with loaded content after {attempt+1} failures.")
+                else:
+                    await asyncio.sleep(2)
 
         await scroll_page(page)
         html_content = await page.content()
@@ -522,9 +555,14 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
 
         # Process images on the ENTIRE page FIRST to mutate src tags to local relative paths
         body_soup = full_soup.find('body') or full_soup
+
+        # Sync cookies from Playwright to aiohttp
+        pw_cookies = await context.cookies()
+        cookie_dict = {cookie['name']: cookie['value'] for cookie in pw_cookies}
+
         connector = aiohttp.TCPConnector(ssl=False)
         headers = {'User-Agent': ua}
-        async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
+        async with aiohttp.ClientSession(connector=connector, headers=headers, cookies=cookie_dict) as session:
             await process_images(body_soup, current_url, images_path, session)
 
         # Extract publish info BEFORE structural cleaning
@@ -552,10 +590,23 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
         # 3. Generate Markdown from the main_soup (which now contains local image src attributes)
         markdown_content = convert_to_markdown(str(main_soup))
 
-        markdown_header = f"# {title}\n\n**Source URL:** {current_url}\n"
+        # Build YAML Frontmatter for Vector DB / LLM Embedding
+        markdown_header = "---\n"
+        markdown_header += f"title: \"{title}\"\n"
+        markdown_header += f"source_url: \"{current_url}\"\n"
+
+        # Parse publish_info to extract YAML fields if present
         if publish_info:
-            markdown_header += f"{publish_info}\n"
-        markdown_header += "\n---\n\n"
+            for line in publish_info.split('\n'):
+                if line.startswith("**发布时间:**"):
+                    markdown_header += f"publish_date: \"{line.replace('**发布时间:**', '').strip()}\"\n"
+                elif line.startswith("**来源:**"):
+                    markdown_header += f"source: \"{line.replace('**来源:**', '').strip()}\"\n"
+                elif line.startswith("**作者:**"):
+                    markdown_header += f"author: \"{line.replace('**作者:**', '').strip()}\"\n"
+
+        markdown_header += "---\n\n"
+        markdown_header += f"# {title}\n\n"
 
         markdown_content = markdown_header + markdown_content
 
@@ -639,6 +690,29 @@ async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
                 headless=headless,
                 args=["--disable-blink-features=AutomationControlled"]
             )
+
+            # Session Warm-up Mechanism & Global Context Setup:
+            # Pre-visit the start URL to solve initial WAF challenges and set global cookies
+            # inside a shared context before unleashing high-concurrency workers.
+            print(f"[{task_id}] Initiating session warm-up on {start_url}...")
+            shared_context = await browser.new_context(
+                user_agent=random.choice(USER_AGENTS),
+                viewport=random.choice(VIEWPORTS),
+                ignore_https_errors=True
+            )
+            try:
+                warmup_page = await shared_context.new_page()
+                await Stealth().apply_stealth_async(warmup_page)
+                await warmup_page.route("**/*", intercept_route)
+
+                # We use a shorter timeout for warm-up, and don't fail the whole task if it fails
+                await warmup_page.goto(start_url, wait_until="domcontentloaded", timeout=45000)
+                await scroll_page(warmup_page)
+                await warmup_page.wait_for_timeout(2000)
+                print(f"[{task_id}] Session warm-up completed successfully.")
+                await warmup_page.close() # Close page, but KEEP context alive for workers
+            except Exception as e:
+                print(f"[{task_id}] Session warm-up encountered an error (continuing anyway): {e}")
 
             active_tasks = set()
             while True:
