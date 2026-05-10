@@ -32,7 +32,9 @@ def init_task_events(task_id: str):
 
 def sanitize_filename(name):
     """Sanitize string to create a safe file/folder name."""
-    safe_name = re.sub(r'[\\/*?:"<>|]', "", name)
+    if not name:
+        return "Untitled_" + datetime.now().strftime("%H%M%S")
+    safe_name = re.sub(r'[\\/*?:"<>|]', "", str(name))
     safe_name = re.sub(r'\s+', "_", safe_name)
     return safe_name[:50] # Limit length
 
@@ -494,7 +496,7 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
         full_soup = BeautifulSoup(html_content, 'lxml')
 
         # 1. Try to get title from document or fallback to <title> tag
-        title = full_soup.title.string if full_soup.title else "Untitled Page"
+        title = full_soup.title.string if full_soup.title and full_soup.title.string else "Untitled Page"
         # Directory creation is I/O blocking, offload to thread
         page_path, tables_path, images_path = await asyncio.to_thread(setup_page_directory, base_path, title)
 
