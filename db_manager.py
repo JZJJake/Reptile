@@ -103,10 +103,12 @@ def get_pending_url(task_id: str) -> Optional[str]:
     return row['url'] if row else None
 
 def get_and_lock_pending_url(task_id: str) -> Optional[str]:
-    """Atomically get the most recent pending URL and mark it as processing to prevent concurrent grabs."""
-    conn = get_db_connection()
-    conn.execute("BEGIN EXCLUSIVE")
+    """Atomically get the most recent pending URL and mark it as processing to prevent concurrent grabs.
+    Relies on SQLite native timeout handling instead of explicit backoff polling."""
+    conn = None
     try:
+        conn = get_db_connection()
+        conn.execute("BEGIN EXCLUSIVE")
         row = conn.execute(
             'SELECT url FROM urls WHERE task_id = ? AND status = ? ORDER BY id DESC LIMIT 1',
             (task_id, 'pending')
@@ -124,10 +126,12 @@ def get_and_lock_pending_url(task_id: str) -> Optional[str]:
         conn.commit()
         return None
     except Exception as e:
-        conn.rollback()
+        if conn:
+            conn.rollback()
         raise e
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
 def reset_processing_urls(task_id: str):
     """Reset URLs that are stuck in 'processing' back to 'pending' (useful on startup/resume)."""
