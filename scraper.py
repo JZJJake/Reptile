@@ -361,17 +361,29 @@ def clean_html_structure(soup):
 
     return soup
 
+def get_cookies_for_url(pw_cookies, url):
+    """Filter Playwright cookies for the given URL to avoid cross-origin cookie leaks."""
+    if not pw_cookies:
+        return None
+    parsed_url = urllib.parse.urlparse(url)
+    domain = parsed_url.hostname
+    if not domain:
+        return None
+    valid_cookies = {}
+    for cookie in pw_cookies:
+        c_domain = cookie['domain']
+        if c_domain == domain or (c_domain.startswith('.') and domain.endswith(c_domain[1:])) or domain == c_domain.lstrip('.'):
+            valid_cookies[cookie['name']] = cookie['value']
+    return valid_cookies if valid_cookies else None
+
 async def download_file(url, save_path, user_agent, cookies=None):
     """Download arbitrary files (PDF, Word, Excel, etc.) via aiohttp."""
     headers = {
         'User-Agent': user_agent,
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
         'Upgrade-Insecure-Requests': '1',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'same-origin',
-        'Sec-Fetch-User': '?1',
     }
+    # Optional Sec-Fetch headers can be problematic for cross-origin downloads, so we omit them here for broad compatibility.
     for attempt in range(3):
         try:
             connector = aiohttp.TCPConnector(ssl=False)
@@ -466,7 +478,7 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
         try:
             if browser.contexts:
                 pw_cookies = await browser.contexts[0].cookies()
-                cookie_dict = {cookie['name']: cookie['value'] for cookie in pw_cookies}
+                cookie_dict = get_cookies_for_url(pw_cookies, current_url)
         except Exception:
             pass
 
@@ -556,13 +568,14 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
         # Process images on the ENTIRE page FIRST to mutate src tags to local relative paths
         body_soup = full_soup.find('body') or full_soup
 
-        # Sync cookies from Playwright to aiohttp
+        # Sync cookies from Playwright to aiohttp (wait to filter per image inside process_images)
         pw_cookies = await context.cookies()
-        cookie_dict = {cookie['name']: cookie['value'] for cookie in pw_cookies}
 
         connector = aiohttp.TCPConnector(ssl=False)
         headers = {'User-Agent': ua}
-        async with aiohttp.ClientSession(connector=connector, headers=headers, cookies=cookie_dict) as session:
+        async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
+            # We pass pw_cookies to process_images to filter cookies per image URL
+            session._pw_cookies = pw_cookies
             await process_images(body_soup, current_url, images_path, session)
 
         # Extract publish info BEFORE structural cleaning
