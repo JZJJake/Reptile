@@ -21,7 +21,6 @@ def init_db():
             base_path TEXT
         )
     ''')
-
     for col in ['dynamic_root TEXT', 'base_path TEXT']:
         try:
             cursor.execute(f'ALTER TABLE tasks ADD COLUMN {col}')
@@ -36,20 +35,27 @@ def init_db():
             parent_url TEXT,
             status TEXT,
             title TEXT,
-            saved_folder TEXT,
+            saved_file TEXT,
             error_msg TEXT,
-            content_type TEXT,
-            last_crawled_at TEXT,
             content_hash TEXT,
+            last_crawled_at TEXT,
             UNIQUE(task_id, url)
         )
     ''')
-
-    for col in ['content_type TEXT', 'last_crawled_at TEXT', 'content_hash TEXT']:
+    for col in ['content_hash TEXT', 'last_crawled_at TEXT', 'saved_file TEXT']:
         try:
             cursor.execute(f'ALTER TABLE urls ADD COLUMN {col}')
         except sqlite3.OperationalError:
             pass
+
+    # Cache DeepSeek site analysis per domain
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS site_analysis (
+            domain TEXT PRIMARY KEY,
+            selectors_json TEXT,
+            analyzed_at TEXT
+        )
+    ''')
 
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS wiki_log (
@@ -70,14 +76,16 @@ def get_db_connection():
     conn.row_factory = sqlite3.Row
     return conn
 
+# ── Tasks ────────────────────────────────────────────────────────────────────
+
 def create_task(task_id: str, start_url: str, base_url: str):
     conn = get_db_connection()
     conn.execute(
-        'INSERT OR IGNORE INTO tasks (task_id, start_url, status, base_url) VALUES (?, ?, ?, ?)',
+        'INSERT OR IGNORE INTO tasks (task_id, start_url, status, base_url) VALUES (?,?,?,?)',
         (task_id, start_url, 'running', base_url)
     )
     conn.execute(
-        'INSERT OR IGNORE INTO urls (task_id, url, parent_url, status) VALUES (?, ?, ?, ?)',
+        'INSERT OR IGNORE INTO urls (task_id, url, parent_url, status) VALUES (?,?,?,?)',
         (task_id, start_url, None, 'pending')
     )
     conn.commit()
@@ -85,57 +93,56 @@ def create_task(task_id: str, start_url: str, base_url: str):
 
 def update_task_status(task_id: str, status: str):
     conn = get_db_connection()
-    conn.execute('UPDATE tasks SET status = ? WHERE task_id = ?', (status, task_id))
+    conn.execute('UPDATE tasks SET status=? WHERE task_id=?', (status, task_id))
     conn.commit()
     conn.close()
 
 def update_task_dynamic_root(task_id: str, dynamic_root: str):
     conn = get_db_connection()
-    conn.execute('UPDATE tasks SET dynamic_root = ? WHERE task_id = ?', (dynamic_root, task_id))
+    conn.execute('UPDATE tasks SET dynamic_root=? WHERE task_id=?', (dynamic_root, task_id))
     conn.commit()
     conn.close()
 
 def update_task_base_path(task_id: str, base_path: str):
     conn = get_db_connection()
-    conn.execute('UPDATE tasks SET base_path = ? WHERE task_id = ?', (base_path, task_id))
+    conn.execute('UPDATE tasks SET base_path=? WHERE task_id=?', (base_path, task_id))
     conn.commit()
     conn.close()
 
-def get_task(task_id: str):
+def get_task(task_id: str) -> Optional[dict]:
     conn = get_db_connection()
-    task = conn.execute('SELECT * FROM tasks WHERE task_id = ?', (task_id,)).fetchone()
+    row = conn.execute('SELECT * FROM tasks WHERE task_id=?', (task_id,)).fetchone()
     conn.close()
-    return dict(task) if task else None
+    return dict(row) if row else None
 
-def get_pending_url(task_id: str) -> Optional[str]:
+def get_active_tasks() -> List[dict]:
+    """Return tasks that are running or paused."""
     conn = get_db_connection()
-    row = conn.execute(
-        'SELECT url FROM urls WHERE task_id = ? AND status = ? ORDER BY id DESC LIMIT 1',
-        (task_id, 'pending')
-    ).fetchone()
+    rows = conn.execute(
+        "SELECT * FROM tasks WHERE status IN ('running','paused')"
+    ).fetchall()
     conn.close()
-    return row['url'] if row else None
+    return [dict(r) for r in rows]
+
+# ── URLs ─────────────────────────────────────────────────────────────────────
 
 def get_and_lock_pending_url(task_id: str) -> Optional[str]:
-    """Atomically get the most recent pending URL and mark it as processing."""
     conn = None
     try:
         conn = get_db_connection()
         conn.execute("BEGIN EXCLUSIVE")
         row = conn.execute(
-            'SELECT url FROM urls WHERE task_id = ? AND status = ? ORDER BY id DESC LIMIT 1',
+            'SELECT url FROM urls WHERE task_id=? AND status=? ORDER BY id DESC LIMIT 1',
             (task_id, 'pending')
         ).fetchone()
-
         if row:
             url = row['url']
             conn.execute(
-                'UPDATE urls SET status = ? WHERE task_id = ? AND url = ?',
+                'UPDATE urls SET status=? WHERE task_id=? AND url=?',
                 ('processing', task_id, url)
             )
             conn.commit()
             return url
-
         conn.commit()
         return None
     except Exception as e:
@@ -149,7 +156,7 @@ def get_and_lock_pending_url(task_id: str) -> Optional[str]:
 def reset_processing_urls(task_id: str):
     conn = get_db_connection()
     conn.execute(
-        "UPDATE urls SET status = 'pending' WHERE task_id = ? AND status = 'processing'",
+        "UPDATE urls SET status='pending' WHERE task_id=? AND status='processing'",
         (task_id,)
     )
     conn.commit()
@@ -158,25 +165,23 @@ def reset_processing_urls(task_id: str):
 def get_active_count(task_id: str) -> int:
     conn = get_db_connection()
     row = conn.execute(
-        "SELECT COUNT(*) as count FROM urls WHERE task_id = ? AND status IN ('pending', 'processing')",
+        "SELECT COUNT(*) as c FROM urls WHERE task_id=? AND status IN ('pending','processing')",
         (task_id,)
     ).fetchone()
     conn.close()
-    return row['count'] if row else 0
+    return row['c'] if row else 0
 
-def mark_url_scraped(task_id: str, url: str, title: str = None, saved_folder: str = None,
-                     content_type: str = None, content_hash: str = None, last_crawled_at: str = None):
-    if last_crawled_at is None:
-        last_crawled_at = datetime.utcnow().isoformat()
+def mark_url_scraped(task_id: str, url: str, title: str = None, saved_file: str = None,
+                     content_hash: str = None):
+    ts = datetime.utcnow().isoformat()
     conn = get_db_connection()
     conn.execute(
-        '''UPDATE urls SET status = ?, title = ?, saved_folder = ?, content_type = ?,
-           content_hash = ?, last_crawled_at = ? WHERE task_id = ? AND url = ?''',
-        ('scraped', title, saved_folder, content_type, content_hash, last_crawled_at, task_id, url)
+        '''UPDATE urls SET status='scraped', title=?, saved_file=?, content_hash=?,
+           last_crawled_at=? WHERE task_id=? AND url=?''',
+        (title, saved_file, content_hash, ts, task_id, url)
     )
     conn.execute(
-        'UPDATE tasks SET total_scraped = total_scraped + 1 WHERE task_id = ?',
-        (task_id,)
+        'UPDATE tasks SET total_scraped=total_scraped+1 WHERE task_id=?', (task_id,)
     )
     conn.commit()
     conn.close()
@@ -184,28 +189,26 @@ def mark_url_scraped(task_id: str, url: str, title: str = None, saved_folder: st
 def mark_url_failed(task_id: str, url: str, error_msg: str):
     conn = get_db_connection()
     conn.execute(
-        'UPDATE urls SET status = ?, error_msg = ? WHERE task_id = ? AND url = ?',
-        ('failed', error_msg, task_id, url)
+        "UPDATE urls SET status='failed', error_msg=? WHERE task_id=? AND url=?",
+        (error_msg, task_id, url)
     )
     conn.commit()
     conn.close()
 
 def mark_url_filtered(task_id: str, url: str, reason: str):
-    """Mark a URL as skipped due to content filtering (e.g., date out of window)."""
     conn = get_db_connection()
     conn.execute(
-        'UPDATE urls SET status = ?, error_msg = ? WHERE task_id = ? AND url = ?',
-        ('filtered', reason, task_id, url)
+        "UPDATE urls SET status='filtered', error_msg=? WHERE task_id=? AND url=?",
+        (reason, task_id, url)
     )
     conn.commit()
     conn.close()
 
 def get_url_content_hash(task_id: str, url: str) -> Optional[str]:
-    """Return stored content hash for a URL, or None if not previously scraped."""
     conn = get_db_connection()
     row = conn.execute(
-        'SELECT content_hash FROM urls WHERE task_id = ? AND url = ? AND status = ?',
-        (task_id, url, 'scraped')
+        "SELECT content_hash FROM urls WHERE task_id=? AND url=? AND status='scraped'",
+        (task_id, url)
     ).fetchone()
     conn.close()
     return row['content_hash'] if row else None
@@ -213,10 +216,10 @@ def get_url_content_hash(task_id: str, url: str) -> Optional[str]:
 def add_discovered_urls(task_id: str, parent_url: str, new_urls: List[str]):
     conn = get_db_connection()
     cursor = conn.cursor()
-    for new_url in new_urls:
+    for u in new_urls:
         cursor.execute(
-            'INSERT OR IGNORE INTO urls (task_id, url, parent_url, status) VALUES (?, ?, ?, ?)',
-            (task_id, new_url, parent_url, 'pending')
+            'INSERT OR IGNORE INTO urls (task_id, url, parent_url, status) VALUES (?,?,?,?)',
+            (task_id, u, parent_url, 'pending')
         )
     conn.commit()
     conn.close()
@@ -224,23 +227,49 @@ def add_discovered_urls(task_id: str, parent_url: str, new_urls: List[str]):
 def get_url_tree(task_id: str) -> List[Dict[str, Any]]:
     conn = get_db_connection()
     rows = conn.execute(
-        'SELECT url, parent_url, status, title, content_type FROM urls WHERE task_id = ?',
-        (task_id,)
+        'SELECT url, parent_url, status, title FROM urls WHERE task_id=?', (task_id,)
     ).fetchall()
     conn.close()
-    return [dict(row) for row in rows]
+    return [dict(r) for r in rows]
 
 def clear_task_data(task_id: str):
     conn = get_db_connection()
-    conn.execute('DELETE FROM tasks WHERE task_id = ?', (task_id,))
-    conn.execute('DELETE FROM urls WHERE task_id = ?', (task_id,))
+    conn.execute('DELETE FROM tasks WHERE task_id=?', (task_id,))
+    conn.execute('DELETE FROM urls WHERE task_id=?', (task_id,))
     conn.commit()
     conn.close()
+
+# ── Site Analysis ─────────────────────────────────────────────────────────────
+
+def get_site_analysis(domain: str) -> Optional[dict]:
+    conn = get_db_connection()
+    row = conn.execute(
+        'SELECT selectors_json FROM site_analysis WHERE domain=?', (domain,)
+    ).fetchone()
+    conn.close()
+    if row:
+        try:
+            return json.loads(row['selectors_json'])
+        except Exception:
+            return None
+    return None
+
+def save_site_analysis(domain: str, selectors: dict):
+    conn = get_db_connection()
+    conn.execute(
+        '''INSERT OR REPLACE INTO site_analysis (domain, selectors_json, analyzed_at)
+           VALUES (?,?,?)''',
+        (domain, json.dumps(selectors, ensure_ascii=False), datetime.utcnow().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+# ── Wiki ──────────────────────────────────────────────────────────────────────
 
 def log_wiki_operation(domain: str, operation: str, detail: dict):
     conn = get_db_connection()
     conn.execute(
-        'INSERT INTO wiki_log (domain, operation, detail, created_at) VALUES (?, ?, ?, ?)',
+        'INSERT INTO wiki_log (domain, operation, detail, created_at) VALUES (?,?,?,?)',
         (domain, operation, json.dumps(detail, ensure_ascii=False), datetime.utcnow().isoformat())
     )
     conn.commit()
