@@ -3,253 +3,365 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Reptile — 智能知识库系统</title>
+<title>Reptile — 智能知识库</title>
 <style>
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-  :root {
-    --bg: #0d1117;
-    --surface: #161b22;
-    --border: #30363d;
-    --text: #c9d1d9;
-    --muted: #8b949e;
-    --accent: #388bfd;
-    --green: #3fb950;
-    --red: #f85149;
-    --orange: #d29922;
-  }
+html, body {
+  height: 100%;
+  overflow: hidden;
+}
 
-  body {
-    font-family: 'Segoe UI', system-ui, sans-serif;
-    background: var(--bg);
-    color: var(--text);
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-  }
+body {
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  background: #0d1117;
+  color: #c9d1d9;
+  display: flex;
+  flex-direction: column;
+}
 
-  /* ── Header ── */
-  header {
-    background: var(--surface);
-    border-bottom: 1px solid var(--border);
-    padding: 0 24px;
-    height: 52px;
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    flex-shrink: 0;
-  }
-  header .logo { font-size: 20px; }
-  header h1   { font-size: 16px; font-weight: 600; color: #f0f6fc; }
-  header nav  { margin-left: auto; display: flex; gap: 4px; }
-  header nav a {
-    color: var(--muted); font-size: 13px; text-decoration: none;
-    padding: 5px 12px; border-radius: 6px; transition: all .15s;
-    border: 1px solid transparent;
-  }
-  header nav a:hover { color: var(--text); border-color: var(--border); background: #21262d; }
-  header nav a.active { color: #f0f6fc; background: #21262d; border-color: var(--border); }
+:root {
+  --bg:      #0d1117;
+  --surface: #161b22;
+  --border:  #30363d;
+  --text:    #c9d1d9;
+  --muted:   #8b949e;
+  --accent:  #388bfd;
+  --green:   #3fb950;
+  --red:     #f85149;
+  --orange:  #d29922;
+}
 
-  /* ── Main layout ── */
-  .main {
-    flex: 1;
-    display: grid;
-    grid-template-columns: 380px 1fr;
-    gap: 0;
-    overflow: hidden;
-    height: calc(100vh - 52px);
-  }
+/* ── Header ── */
+header {
+  height: 48px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  padding: 0 18px;
+  gap: 10px;
+  flex-shrink: 0;
+  z-index: 10;
+}
+header .brand { font-size: 20px; line-height: 1; }
+header h1 { font-size: 15px; font-weight: 700; color: #f0f6fc; }
+.header-sep { flex: 1; }
+.status-badge {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 11px; font-weight: 600; border-radius: 20px;
+  padding: 3px 10px; letter-spacing: .04em;
+}
+.badge-idle     { background: #21262d; color: var(--muted);   border: 1px solid var(--border); }
+.badge-running  { background: #16302b; color: var(--green);   border: 1px solid #196c2e; }
+.badge-analyzing{ background: #2d2200; color: #e3b341;        border: 1px solid #6e4e00; }
+.badge-paused   { background: #2d2200; color: var(--orange);  border: 1px solid #6e4e00; }
+.badge-stopped  { background: #2d1317; color: var(--red);     border: 1px solid #6e211f; }
+.badge-done     { background: #1b3a6b; color: #79c0ff;        border: 1px solid #1f6feb; }
+.pulse {
+  width: 6px; height: 6px; border-radius: 50%; background: currentColor;
+  animation: blink 1.4s ease-in-out infinite;
+}
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:.2} }
 
-  /* ── Left panel ── */
-  .left {
-    border-right: 1px solid var(--border);
-    display: flex;
-    flex-direction: column;
-    overflow-y: auto;
-  }
+/* ── Main ── */
+.main {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 290px 1fr;
+  min-height: 0;
+  overflow: hidden;
+}
 
-  .panel { padding: 20px; border-bottom: 1px solid var(--border); }
-  .panel-title {
-    font-size: 11px; font-weight: 600; color: var(--muted);
-    text-transform: uppercase; letter-spacing: .07em; margin-bottom: 14px;
-  }
+/* ── Left ── */
+.left {
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: var(--surface);
+}
 
-  label.field-label { font-size: 12px; color: var(--muted); display: block; margin-bottom: 6px; }
+.panel {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.panel-title {
+  font-size: 10px; font-weight: 700; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .08em; margin-bottom: 10px;
+}
+.field-lbl {
+  font-size: 11px; color: var(--muted); display: block; margin-bottom: 5px;
+}
+input[type=url], input[type=text], select {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 7px 10px;
+  font-size: 12.5px;
+  outline: none;
+  transition: border-color .15s;
+  font-family: inherit;
+}
+input:focus, select:focus { border-color: var(--accent); }
 
-  input[type=url], input[type=text], select {
-    width: 100%; background: var(--bg); border: 1px solid var(--border);
-    border-radius: 8px; color: var(--text); padding: 9px 12px; font-size: 13px;
-    outline: none; transition: border-color .15s;
-  }
-  input:focus, select:focus { border-color: var(--accent); }
+.chk-row { display: flex; align-items: center; gap: 7px; margin-top: 8px; }
+.chk-row input[type=checkbox] { width: auto; accent-color: var(--accent); cursor: pointer; }
+.chk-row label { font-size: 11.5px; color: var(--muted); cursor: pointer; user-select: none; }
 
-  .checkbox-row {
-    display: flex; align-items: center; gap: 8px; margin-top: 10px;
-  }
-  .checkbox-row input[type=checkbox] { width: auto; }
-  .checkbox-row label { font-size: 12px; color: var(--muted); margin-bottom: 0; cursor: pointer; }
+.btn-row { display: flex; gap: 6px; margin-top: 10px; }
+.btn {
+  flex: 1; padding: 7px 10px; border: none; border-radius: 6px;
+  font-size: 12px; font-weight: 600; cursor: pointer; transition: opacity .15s;
+}
+.btn:hover:not(:disabled) { opacity: .82; }
+.btn:disabled { opacity: .28; cursor: not-allowed; }
+.btn-primary { background: #238636; color: #fff; }
+.btn-danger  { background: #b62324; color: #fff; }
+.btn-warn    { background: #9e6a03; color: #fff; }
+.btn-ghost   { background: transparent; color: var(--muted); border: 1px solid var(--border); }
 
-  .btn-row { display: flex; gap: 8px; margin-top: 14px; }
+/* Domains */
+.domain-list { display: flex; flex-direction: column; gap: 4px; }
+.domain-item {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  padding: 7px 10px; display: flex; align-items: center; gap: 7px;
+  cursor: pointer; transition: border-color .15s;
+}
+.domain-item:hover { border-color: var(--accent); }
+.domain-item .di-name { font-size: 12px; color: var(--text); font-weight: 500; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.domain-item .di-cnt  { font-size: 11px; color: var(--muted); flex-shrink: 0; }
 
-  .btn {
-    flex: 1; padding: 9px 12px; border: none; border-radius: 8px;
-    font-size: 13px; font-weight: 600; cursor: pointer; transition: opacity .15s;
-  }
-  .btn:hover:not(:disabled) { opacity: .85; }
-  .btn:disabled { opacity: .35; cursor: not-allowed; }
-  .btn-primary  { background: #238636; color: #fff; }
-  .btn-danger   { background: #b62324; color: #fff; }
-  .btn-warn     { background: #9e6a03; color: #fff; }
-  .btn-neutral  { background: #21262d; color: var(--text); border: 1px solid var(--border); }
+/* ── Right ── */
+.right {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
 
-  /* Stats row */
-  .stats-row {
-    display: flex; gap: 12px; margin-top: 12px; flex-wrap: wrap;
-  }
-  .stat-chip {
-    background: #21262d; border: 1px solid var(--border); border-radius: 20px;
-    padding: 4px 12px; font-size: 12px; color: var(--muted);
-  }
-  .stat-chip b { color: var(--text); }
+/* Tabs */
+.tab-bar {
+  display: flex;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  flex-shrink: 0;
+  padding: 0 16px;
+  align-items: flex-end;
+}
+.tab {
+  padding: 12px 18px;
+  font-size: 13px; font-weight: 500; color: var(--muted);
+  cursor: pointer; border-bottom: 2px solid transparent;
+  transition: color .15s; user-select: none; margin-bottom: -1px;
+}
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
 
-  /* Domain list */
-  .domain-list { display: flex; flex-direction: column; gap: 6px; }
-  .domain-item {
-    background: #21262d; border: 1px solid var(--border); border-radius: 8px;
-    padding: 10px 14px; display: flex; align-items: center; gap: 10px;
-    cursor: pointer; transition: border-color .15s;
-  }
-  .domain-item:hover { border-color: var(--accent); }
-  .domain-item.selected { border-color: var(--accent); background: #1f2d3d; }
-  .domain-item .di-name { font-size: 13px; color: var(--text); font-weight: 500; }
-  .domain-item .di-count { font-size: 11px; color: var(--muted); margin-left: auto; }
+.tab-pane {
+  flex: 1; min-height: 0;
+  display: none;
+  flex-direction: column;
+  overflow: hidden;
+}
+.tab-pane.active { display: flex; }
 
-  /* ── Right panel: status log ── */
-  .right { display: flex; flex-direction: column; overflow: hidden; }
+/* ── Log tab ── */
+.log-toolbar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  flex-shrink: 0;
+}
+.log-toolbar .lbl { font-size: 12px; color: var(--muted); flex: 1; }
+.log-toolbar .lbl b { color: var(--text); }
 
-  .status-header {
-    padding: 12px 20px;
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    background: var(--surface);
-    flex-shrink: 0;
-  }
-  .status-header h2 { font-size: 14px; font-weight: 600; color: #f0f6fc; }
-  .status-badge {
-    display: inline-flex; align-items: center; gap: 5px;
-    font-size: 11px; font-weight: 600; border-radius: 12px;
-    padding: 3px 10px; letter-spacing: .04em;
-  }
-  .badge-idle     { background: #21262d; color: var(--muted); border: 1px solid var(--border); }
-  .badge-running  { background: #16302b; color: var(--green); border: 1px solid #196c2e; }
-  .badge-paused   { background: #2d2200; color: var(--orange); border: 1px solid #6e4e00; }
-  .badge-stopped  { background: #2d1317; color: var(--red); border: 1px solid #6e211f; }
-  .badge-done     { background: #1b3a6b; color: #79c0ff; border: 1px solid #1f6feb; }
-  .badge-analyzing { background: #2d2200; color: #e3b341; border: 1px solid #6e4e00; }
+.log-area {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 10px 14px;
+  font-family: 'Consolas', 'Courier New', monospace;
+  font-size: 12px;
+  line-height: 1.8;
+  min-height: 0;
+  background: var(--bg);
+}
+.log-entry { display: flex; gap: 8px; align-items: flex-start; }
+.log-ts  { color: #484f58; flex-shrink: 0; min-width: 52px; }
+.log-msg { flex: 1; word-break: break-word; }
+.log-msg.success { color: var(--green); }
+.log-msg.warn    { color: var(--orange); }
+.log-msg.error   { color: var(--red); }
+.log-msg.info    { color: #79c0ff; }
+.log-msg.done    { color: var(--green); font-weight: 700; }
+.log-msg.log     { color: var(--text); }
+.log-empty { color: var(--muted); font-style: italic; padding: 16px 0; }
 
-  .pulse {
-    width: 7px; height: 7px; border-radius: 50%; background: var(--green);
-    animation: pulse 1.4s ease-in-out infinite;
-  }
-  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .25 } }
+.log-footer {
+  display: flex; align-items: center; gap: 10px;
+  padding: 7px 14px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+  flex-shrink: 0;
+}
+.pages-count { font-size: 12px; color: var(--muted); flex: 1; }
+.pages-count b { color: var(--text); }
 
-  .progress-bar-wrap {
-    height: 3px; background: var(--border); margin-top: 6px; border-radius: 2px;
-    overflow: hidden;
-  }
-  .progress-bar {
-    height: 100%; background: var(--accent); width: 0%;
-    transition: width .3s; border-radius: 2px;
-  }
+/* ── Chat tab ── */
+.chat-toolbar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  flex-shrink: 0;
+}
+.chat-toolbar label { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.chat-toolbar select { flex: 1; max-width: 260px; font-size: 12px; padding: 5px 8px; }
+.chat-mode-lbl { font-size: 11px; }
 
-  .log-area {
-    flex: 1;
-    overflow-y: auto;
-    padding: 16px 20px;
-    font-family: 'Consolas', 'Courier New', monospace;
-    font-size: 12.5px;
-    line-height: 1.8;
-    background: var(--bg);
-  }
+.chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 18px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  min-height: 0;
+  background: var(--bg);
+}
 
-  .log-entry { display: flex; gap: 10px; align-items: flex-start; }
-  .log-ts { color: #484f58; flex-shrink: 0; padding-top: 1px; }
-  .log-msg { flex: 1; word-break: break-all; }
-  .log-msg.success { color: var(--green); }
-  .log-msg.warn    { color: var(--orange); }
-  .log-msg.error   { color: var(--red); }
-  .log-msg.info    { color: #79c0ff; }
-  .log-msg.done    { color: var(--green); font-weight: 600; }
-  .log-msg.log     { color: var(--text); }
+.msg-row { display: flex; gap: 10px; align-items: flex-start; }
+.msg-row.user { flex-direction: row-reverse; }
 
-  .log-empty { color: var(--muted); font-style: italic; text-align: center; margin-top: 40px; }
+.msg-avatar {
+  width: 30px; height: 30px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; flex-shrink: 0;
+  background: #21262d; border: 1px solid var(--border);
+}
 
-  /* Ctrl bar below log */
-  .ctrl-bar {
-    border-top: 1px solid var(--border);
-    padding: 10px 20px;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    background: var(--surface);
-    flex-shrink: 0;
-  }
-  .ctrl-bar .pages-count { font-size: 12px; color: var(--muted); flex: 1; }
-  .ctrl-bar .pages-count b { color: var(--text); }
+.msg-bubble {
+  max-width: 74%;
+  padding: 10px 14px;
+  border-radius: 12px;
+  font-size: 13.5px; line-height: 1.65;
+  white-space: pre-wrap; word-break: break-word;
+}
+.msg-row.user .msg-bubble {
+  background: #1c3a6b;
+  border: 1px solid #1f6feb66;
+  color: #ddeeff;
+  border-radius: 12px 4px 12px 12px;
+}
+.msg-row.assistant .msg-bubble {
+  background: #21262d;
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 4px 12px 12px 12px;
+}
 
-  /* ── Wiki section ── */
-  .wiki-section {
-    border-top: 1px solid var(--border);
-    padding: 16px 20px;
-    background: var(--bg);
-  }
-  .wiki-section .panel-title { margin-bottom: 12px; }
-  .wiki-domain-row { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
-  .wiki-domain-row select { flex: 1; }
-  .wiki-status-text { font-size: 12px; color: var(--muted); }
+/* Typing animation */
+.typing-dots { display: inline-flex; gap: 4px; align-items: center; padding: 2px 0; }
+.typing-dot {
+  width: 5px; height: 5px; border-radius: 50%; background: var(--muted);
+  animation: tdot 1.4s ease-in-out infinite;
+}
+.typing-dot:nth-child(2) { animation-delay: .2s; }
+.typing-dot:nth-child(3) { animation-delay: .4s; }
+@keyframes tdot { 0%,80%,100%{opacity:.25} 40%{opacity:1} }
+
+.chat-empty {
+  display: flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: 8px; height: 100%;
+  color: var(--muted); font-size: 14px;
+  text-align: center;
+}
+.chat-empty .icon { font-size: 42px; }
+.chat-empty .sub  { font-size: 12px; color: #484f58; margin-top: 2px; }
+
+.chat-input-area {
+  border-top: 1px solid var(--border);
+  padding: 10px 14px;
+  background: var(--surface);
+  flex-shrink: 0;
+}
+.chat-input-row { display: flex; gap: 8px; align-items: flex-end; }
+.chat-input-row textarea {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 9px 12px;
+  font-size: 13.5px;
+  font-family: inherit;
+  line-height: 1.5;
+  resize: none;
+  outline: none;
+  min-height: 42px;
+  max-height: 150px;
+  transition: border-color .15s;
+}
+.chat-input-row textarea:focus { border-color: var(--accent); }
+.send-btn {
+  width: 42px; height: 42px; border-radius: 8px; border: none;
+  background: #238636; color: #fff;
+  font-size: 18px; font-weight: 700;
+  cursor: pointer; display: flex; align-items: center; justify-content: center;
+  transition: opacity .15s; flex-shrink: 0;
+}
+.send-btn:hover:not(:disabled) { opacity: .82; }
+.send-btn:disabled { opacity: .28; cursor: not-allowed; }
+.chat-hint { font-size: 11px; color: #484f58; margin-top: 5px; }
+
+/* Scrollbars */
+::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #484f58; }
 </style>
 </head>
 <body>
 
-<!-- ── Header ── -->
+<!-- Header -->
 <header>
-  <span class="logo">🦎</span>
+  <span class="brand">🦎</span>
   <h1>Reptile 智能知识库</h1>
-  <nav>
-    <a href="/app" class="active">爬虫采集</a>
-    <a href="/wiki">知识库问答</a>
-  </nav>
+  <div class="header-sep"></div>
+  <span class="status-badge badge-idle" id="status-badge">空闲</span>
+  <span id="hdr-domain" style="font-size:12px;color:var(--muted);margin-left:6px;"></span>
 </header>
 
 <div class="main">
 
-  <!-- ── Left panel ── -->
+  <!-- ── Left Panel ── -->
   <div class="left">
 
-    <!-- URL input -->
+    <!-- Crawl config -->
     <div class="panel">
-      <div class="panel-title">目标网址</div>
-      <label class="field-label">输入要采集的网址（系统会自动分析并向下递归爬取）</label>
-      <input type="url" id="url-input"
-             placeholder="https://example.com/docs/"
-             onkeydown="if(event.key==='Enter') startTask(false)">
-      <div class="checkbox-row">
-        <input type="checkbox" id="chk-update-mode">
-        <label for="chk-update-mode">迭代更新（只下载新增/变化内容）</label>
+      <div class="panel-title">网页采集</div>
+      <label class="field-lbl">目标网址</label>
+      <input type="url" id="url-input" placeholder="https://example.com/docs/"
+             onkeydown="if(event.key==='Enter') startTask()">
+      <div class="chk-row">
+        <input type="checkbox" id="chk-update">
+        <label for="chk-update">迭代更新（跳过已下载内容）</label>
       </div>
-      <div class="checkbox-row">
+      <div class="chk-row">
         <input type="checkbox" id="chk-rebuild">
-        <label for="chk-rebuild">重新初始化（清空历史，从头采集）</label>
+        <label for="chk-rebuild">重新初始化（清空历史数据）</label>
       </div>
       <div class="btn-row">
-        <button class="btn btn-primary" id="btn-start" onclick="startTask(false)">
-          ▶ 开始 / 继续
-        </button>
-        <button class="btn btn-danger" id="btn-stop" onclick="stopTask()" disabled>
-          ⏹ 停止
-        </button>
+        <button class="btn btn-primary" id="btn-start" onclick="startTask()">▶ 开始</button>
+        <button class="btn btn-ghost" id="btn-pause" onclick="togglePause()" disabled
+                style="flex:none;padding:7px 11px;">⏸</button>
+        <button class="btn btn-danger" id="btn-stop" onclick="stopTask()" disabled>⏹ 停止</button>
       </div>
     </div>
 
@@ -257,147 +369,205 @@
     <div class="panel">
       <div class="panel-title">已采集域名</div>
       <div class="domain-list" id="domain-list">
-        <div style="font-size:12px;color:var(--muted);">暂无数据</div>
+        <div style="font-size:12px;color:var(--muted);">暂无已采集域名</div>
       </div>
     </div>
 
     <!-- Wiki build -->
-    <div class="wiki-section">
+    <div class="panel" style="border-bottom:none;flex:1;">
       <div class="panel-title">🧠 知识库建设</div>
-      <label class="field-label">选择要建设知识库的域名</label>
-      <div class="wiki-domain-row">
-        <select id="wiki-domain-sel">
-          <option value="">— 请选择 —</option>
-        </select>
-        <button class="btn btn-warn" id="btn-wiki-build" onclick="buildWiki()" disabled
-                style="flex:none;padding:8px 14px;">开始建设</button>
+      <label class="field-lbl">选择要建设的域名</label>
+      <select id="wiki-sel" onchange="onWikiSelChange()">
+        <option value="">— 请先选择域名 —</option>
+      </select>
+      <div class="btn-row">
+        <button class="btn btn-warn" id="btn-wiki" onclick="buildWiki()" disabled>⚙ 开始建设</button>
       </div>
-      <div class="wiki-status-text" id="wiki-status-text">知识库建设完成后可在「知识库问答」页面查询</div>
+      <div id="wiki-status" style="font-size:11.5px;color:var(--muted);margin-top:8px;line-height:1.5;">
+        建设完成后可在「知识问答」中查询
+      </div>
     </div>
 
   </div>
 
-  <!-- ── Right panel: live log ── -->
+  <!-- ── Right Panel ── -->
   <div class="right">
 
-    <div class="status-header">
-      <h2>运行状态</h2>
-      <span class="status-badge badge-idle" id="status-badge">空闲</span>
-      <span style="font-size:12px;color:var(--muted);margin-left:auto;" id="current-domain"></span>
+    <div class="tab-bar">
+      <div class="tab active" id="tab-log"  onclick="switchTab('log')">状态日志</div>
+      <div class="tab"        id="tab-chat" onclick="switchTab('chat')">知识问答</div>
     </div>
 
-    <div class="log-area" id="log-area">
-      <div class="log-empty">等待任务开始...</div>
+    <!-- Log pane -->
+    <div class="tab-pane active" id="pane-log">
+      <div class="log-toolbar">
+        <div class="lbl" id="log-lbl">等待任务...</div>
+        <button class="btn btn-ghost" onclick="clearLog()"
+                style="flex:none;padding:4px 10px;font-size:11px;">清空</button>
+      </div>
+      <div class="log-area" id="log-area">
+        <div class="log-empty">任务开始后日志将在此实时显示</div>
+      </div>
+      <div class="log-footer">
+        <div class="pages-count" id="pages-count">已保存 <b>0</b> 篇 · 队列 <b>0</b></div>
+      </div>
     </div>
 
-    <div class="ctrl-bar">
-      <div class="pages-count" id="pages-count">已保存 <b>0</b> 篇 · 队列 <b>0</b></div>
-      <button class="btn btn-neutral" id="btn-pause" onclick="togglePause()" disabled
-              style="padding:6px 14px;font-size:12px;">⏸ 暂停</button>
-      <button class="btn btn-neutral" onclick="clearLog()"
-              style="padding:6px 14px;font-size:12px;">清空日志</button>
+    <!-- Chat pane -->
+    <div class="tab-pane" id="pane-chat">
+      <div class="chat-toolbar">
+        <label>知识库</label>
+        <select id="chat-sel" onchange="onChatSelChange()">
+          <option value="">通用对话 (DeepSeek)</option>
+        </select>
+        <span class="chat-mode-lbl" id="chat-mode" style="color:var(--muted);">· 通用模式</span>
+      </div>
+      <div class="chat-messages" id="chat-msgs">
+        <div class="chat-empty" id="chat-empty">
+          <div class="icon">🤖</div>
+          <div>输入问题开始对话</div>
+          <div class="sub">选择左侧知识库域名可获得知识库增强回答</div>
+        </div>
+      </div>
+      <div class="chat-input-area">
+        <div class="chat-input-row">
+          <textarea id="chat-ta" rows="1"
+                    placeholder="输入问题，Enter 发送，Shift+Enter 换行..."
+                    onkeydown="onChatKey(event)" oninput="autoResize(this)"></textarea>
+          <button class="send-btn" id="send-btn" onclick="sendChat()">↑</button>
+        </div>
+        <div class="chat-hint">Enter 发送 · Shift+Enter 换行</div>
+      </div>
     </div>
 
   </div>
 </div>
 
 <script>
-// ── State ────────────────────────────────────────────────────────────────────
-
-let API_KEY = sessionStorage.getItem('api_key') || '';
-let currentTaskId = null;
-let eventSource = null;
+// ── State ──────────────────────────────────────────────────────────────────────
+const API_KEY = sessionStorage.getItem('api_key') || '';
+let taskId = null;
+let evtSrc = null;
 let isRunning = false;
 let isPaused = false;
 let pagesDone = 0;
-let pagesQueued = 0;
+let pagesQueue = 0;
+let chatHistory = [];   // [{role, content}]
+let isChatBusy = false;
 
-// ── Boot ─────────────────────────────────────────────────────────────────────
-
-function boot() {
-  if (!API_KEY) {
-    window.location.href = '/';
-    return;
-  }
+// ── Boot ───────────────────────────────────────────────────────────────────────
+(function boot() {
+  if (!API_KEY) { window.location.href = '/'; return; }
   loadDomains();
-  setInterval(loadDomains, 10000);
+  setInterval(loadDomains, 15000);
+})();
+
+// ── Tabs ───────────────────────────────────────────────────────────────────────
+function switchTab(name) {
+  ['log', 'chat'].forEach(n => {
+    document.getElementById('tab-' + n).classList.toggle('active', n === name);
+    document.getElementById('pane-' + n).classList.toggle('active', n === name);
+  });
 }
 
-// ── Domain list ──────────────────────────────────────────────────────────────
-
+// ── Domains ────────────────────────────────────────────────────────────────────
 async function loadDomains() {
   try {
-    const r = await fetch('/api/scrape/domains');
-    const d = await r.json();
+    const d = await (await fetch('/api/scrape/domains')).json();
     renderDomains(d.domains);
-    populateWikiDomainSel(d.domains);
-  } catch(e) {}
+    fillSelects(d.domains);
+  } catch(_) {}
 }
 
-function renderDomains(domains) {
+function renderDomains(doms) {
   const el = document.getElementById('domain-list');
-  if (!domains.length) {
-    el.innerHTML = '<div style="font-size:12px;color:var(--muted);">暂无数据</div>';
+  if (!doms.length) {
+    el.innerHTML = '<div style="font-size:12px;color:var(--muted);">暂无已采集域名</div>';
     return;
   }
-  el.innerHTML = domains.map(d => `
-    <div class="domain-item">
-      <span style="font-size:16px;">🌐</span>
-      <span class="di-name">${d.name}</span>
-      <span class="di-count">${d.file_count} 篇</span>
-    </div>
-  `).join('');
+  el.innerHTML = doms.map(d =>
+    `<div class="domain-item" onclick="pickChatDomain('${esc(d.name)}')">
+       <span style="font-size:14px;">🌐</span>
+       <span class="di-name">${esc(d.name)}</span>
+       <span class="di-cnt">${d.file_count}篇</span>
+     </div>`
+  ).join('');
 }
 
-function populateWikiDomainSel(domains) {
-  const sel = document.getElementById('wiki-domain-sel');
-  const cur = sel.value;
-  sel.innerHTML = '<option value="">— 请选择 —</option>' +
-    domains.map(d => `<option value="${d.name}">${d.name} (${d.file_count} 篇)</option>`).join('');
-  if (cur) sel.value = cur;
-  updateWikiBuildBtn();
+function fillSelects(doms) {
+  const opts = doms.map(d =>
+    `<option value="${esc(d.name)}">${esc(d.name)} (${d.file_count}篇)</option>`
+  ).join('');
+
+  // Wiki select
+  const ws = document.getElementById('wiki-sel');
+  const wc = ws.value;
+  ws.innerHTML = '<option value="">— 请先选择域名 —</option>' + opts;
+  if (wc) ws.value = wc;
+
+  // Chat select
+  const cs = document.getElementById('chat-sel');
+  const cc = cs.value;
+  cs.innerHTML = '<option value="">通用对话 (DeepSeek)</option>' +
+    doms.map(d => `<option value="${esc(d.name)}">📚 ${esc(d.name)}</option>`).join('');
+  if (cc) cs.value = cc;
+
+  onWikiSelChange();
+  onChatSelChange();
 }
 
-function updateWikiBuildBtn() {
-  const sel = document.getElementById('wiki-domain-sel').value;
-  document.getElementById('btn-wiki-build').disabled = !sel || isRunning;
+function onWikiSelChange() {
+  const v = document.getElementById('wiki-sel').value;
+  document.getElementById('btn-wiki').disabled = !v || isRunning;
 }
 
-// ── Task control ─────────────────────────────────────────────────────────────
+function onChatSelChange() {
+  const v = document.getElementById('chat-sel').value;
+  const lbl = document.getElementById('chat-mode');
+  lbl.textContent = v ? `· 知识库: ${v}` : '· 通用模式';
+  lbl.style.color = v ? 'var(--green)' : 'var(--muted)';
+}
 
-async function startTask(forceUpdate) {
+function pickChatDomain(domain) {
+  document.getElementById('chat-sel').value = domain;
+  onChatSelChange();
+  switchTab('chat');
+}
+
+// ── Task control ───────────────────────────────────────────────────────────────
+async function startTask() {
   const url = document.getElementById('url-input').value.trim();
   if (!url) { alert('请输入目标网址'); return; }
 
-  const updateMode = document.getElementById('chk-update-mode').checked;
-  const rebuild    = document.getElementById('chk-rebuild').checked || forceUpdate;
-
   clearLog();
   setStatus('running');
+  switchTab('log');
 
   try {
     const r = await fetch('/api/scrape/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        url, api_key: API_KEY,
-        update_data: rebuild,
-        update_mode: updateMode,
+        url,
+        api_key: API_KEY,
+        update_data: document.getElementById('chk-rebuild').checked,
+        update_mode: document.getElementById('chk-update').checked,
       }),
     });
     const d = await r.json();
     if (!r.ok) { alert(d.detail || '启动失败'); setStatus('idle'); return; }
 
-    currentTaskId = d.task_id;
-    document.getElementById('current-domain').textContent = new URL(url).hostname;
+    taskId = d.task_id;
+    const host = new URL(url).hostname;
+    document.getElementById('hdr-domain').textContent = host;
+    document.getElementById('log-lbl').innerHTML = `采集中: <b>${esc(host)}</b>`;
 
-    subscribeEvents(currentTaskId);
-
+    subscribeSSE(taskId);
+    isRunning = true;
     document.getElementById('btn-start').disabled = true;
     document.getElementById('btn-stop').disabled = false;
     document.getElementById('btn-pause').disabled = false;
-    isRunning = true;
-    updateWikiBuildBtn();
+    onWikiSelChange();
   } catch(e) {
     alert(`请求错误: ${e.message}`);
     setStatus('idle');
@@ -405,150 +575,117 @@ async function startTask(forceUpdate) {
 }
 
 async function stopTask() {
-  if (!currentTaskId) return;
-  await fetch(`/api/scrape/stop/${currentTaskId}`, { method: 'POST' });
+  if (!taskId) return;
+  await fetch(`/api/scrape/stop/${taskId}`, { method: 'POST' });
   finishTask('stopped');
 }
 
 async function togglePause() {
-  if (!currentTaskId) return;
+  if (!taskId) return;
+  const btn = document.getElementById('btn-pause');
   if (isPaused) {
-    await fetch(`/api/scrape/resume/${currentTaskId}`, { method: 'POST' });
-    isPaused = false;
-    document.getElementById('btn-pause').textContent = '⏸ 暂停';
-    setStatus('running');
+    await fetch(`/api/scrape/resume/${taskId}`, { method: 'POST' });
+    isPaused = false; btn.textContent = '⏸'; setStatus('running');
   } else {
-    await fetch(`/api/scrape/pause/${currentTaskId}`, { method: 'POST' });
-    isPaused = true;
-    document.getElementById('btn-pause').textContent = '▶ 继续';
-    setStatus('paused');
+    await fetch(`/api/scrape/pause/${taskId}`, { method: 'POST' });
+    isPaused = true; btn.textContent = '▶'; setStatus('paused');
   }
 }
 
-function finishTask(finalStatus) {
+function finishTask(status) {
   isRunning = false;
-  if (eventSource) { eventSource.close(); eventSource = null; }
-  setStatus(finalStatus);
+  if (evtSrc) { evtSrc.close(); evtSrc = null; }
+  setStatus(status);
   document.getElementById('btn-start').disabled = false;
   document.getElementById('btn-stop').disabled = true;
   document.getElementById('btn-pause').disabled = true;
   isPaused = false;
-  document.getElementById('btn-pause').textContent = '⏸ 暂停';
-  updateWikiBuildBtn();
+  document.getElementById('btn-pause').textContent = '⏸';
+  document.getElementById('hdr-domain').textContent = '';
+  onWikiSelChange();
   loadDomains();
 }
 
-// ── SSE event subscription ───────────────────────────────────────────────────
+// ── SSE ────────────────────────────────────────────────────────────────────────
+function subscribeSSE(id) {
+  if (evtSrc) evtSrc.close();
+  evtSrc = new EventSource(`/api/scrape/events/${id}`);
 
-function subscribeEvents(taskId) {
-  if (eventSource) { eventSource.close(); }
-  eventSource = new EventSource(`/api/scrape/events/${taskId}`);
-
-  eventSource.onmessage = (e) => {
-    if (e.data === 'null' || !e.data) {
-      finishTask('done');
-      return;
-    }
+  evtSrc.onmessage = (e) => {
+    if (!e.data || e.data === 'null') { finishTask('done'); return; }
     try {
       const item = JSON.parse(e.data);
       if (item.type === 'ping') return;
-
       if (item.type === 'progress') {
         pagesDone = item.pages_done || 0;
-        pagesQueued = item.pages_queue || 0;
-        updatePageCount();
-        return;
+        pagesQueue = item.pages_queue || 0;
+        updateCount(); return;
       }
-
       if (item.type === 'done') {
         appendLog(item.ts, item.msg, 'done');
         pagesDone = item.pages_done || pagesDone;
-        updatePageCount();
-        finishTask('done');
-        return;
+        updateCount(); finishTask('done'); return;
       }
-
       appendLog(item.ts, item.msg, item.type);
-
-      // Detect analysis phase
-      if (item.msg && item.msg.includes('DeepSeek')) setStatus('analyzing');
-      else if (item.msg && item.msg.includes('开始爬取')) setStatus('running');
-
-    } catch(err) {}
+      if (item.msg?.includes('DeepSeek')) setStatus('analyzing');
+      else if (item.msg?.includes('爬取')) setStatus('running');
+    } catch(_) {}
   };
 
-  eventSource.onerror = () => {
-    // Connection dropped — task may be done or server restarting
-    if (isRunning) {
-      setTimeout(() => { if (isRunning) finishTask('stopped'); }, 3000);
-    }
+  evtSrc.onerror = () => {
+    if (isRunning) setTimeout(() => { if (isRunning) finishTask('stopped'); }, 3000);
   };
 }
 
-// ── Log helpers ──────────────────────────────────────────────────────────────
-
+// ── Log helpers ────────────────────────────────────────────────────────────────
 function appendLog(ts, msg, type) {
   if (!msg) return;
   const area = document.getElementById('log-area');
   const empty = area.querySelector('.log-empty');
   if (empty) empty.remove();
-
-  const div = document.createElement('div');
-  div.className = 'log-entry';
-  div.innerHTML = `
-    <span class="log-ts">${ts || ''}</span>
-    <span class="log-msg ${type || 'log'}">${escHtml(msg)}</span>
-  `;
-  area.appendChild(div);
+  const d = document.createElement('div');
+  d.className = 'log-entry';
+  d.innerHTML = `<span class="log-ts">${ts||''}</span><span class="log-msg ${type||'log'}">${esc(msg)}</span>`;
+  area.appendChild(d);
   area.scrollTop = area.scrollHeight;
 }
 
 function clearLog() {
-  const area = document.getElementById('log-area');
-  area.innerHTML = '<div class="log-empty">等待任务开始...</div>';
-  pagesDone = 0; pagesQueued = 0;
-  updatePageCount();
+  document.getElementById('log-area').innerHTML = '<div class="log-empty">等待任务开始...</div>';
+  pagesDone = 0; pagesQueue = 0; updateCount();
+  document.getElementById('log-lbl').textContent = '等待任务...';
 }
 
-function updatePageCount() {
+function updateCount() {
   document.getElementById('pages-count').innerHTML =
-    `已保存 <b>${pagesDone}</b> 篇 · 队列 <b>${pagesQueued}</b>`;
+    `已保存 <b>${pagesDone}</b> 篇 · 队列 <b>${pagesQueue}</b>`;
 }
 
-function escHtml(str) {
-  return String(str)
-    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
-
-// ── Status badge ─────────────────────────────────────────────────────────────
-
+// ── Status ─────────────────────────────────────────────────────────────────────
 function setStatus(s) {
   const el = document.getElementById('status-badge');
-  const MAP = {
-    idle:      ['badge-idle',      '空闲',       false],
-    running:   ['badge-running',   '爬取中',     true],
-    analyzing: ['badge-analyzing', '分析中',     true],
-    paused:    ['badge-paused',    '已暂停',     false],
-    stopped:   ['badge-stopped',   '已停止',     false],
-    done:      ['badge-done',      '已完成',     false],
+  const M = {
+    idle:      ['badge-idle',      '空闲',   false],
+    running:   ['badge-running',   '爬取中', true],
+    analyzing: ['badge-analyzing', '分析中', true],
+    paused:    ['badge-paused',    '已暂停', false],
+    stopped:   ['badge-stopped',   '已停止', false],
+    done:      ['badge-done',      '完成',   false],
   };
-  const [cls, label, pulse] = MAP[s] || MAP['idle'];
+  const [cls, lbl, pulse] = M[s] || M.idle;
   el.className = `status-badge ${cls}`;
-  el.innerHTML = (pulse ? '<span class="pulse"></span>' : '') + label;
+  el.innerHTML = (pulse ? '<span class="pulse"></span>' : '') + lbl;
 }
 
-// ── Wiki build ───────────────────────────────────────────────────────────────
-
+// ── Wiki build ─────────────────────────────────────────────────────────────────
 async function buildWiki() {
-  const domain = document.getElementById('wiki-domain-sel').value;
+  const domain = document.getElementById('wiki-sel').value;
   if (!domain) return;
-
-  const btn = document.getElementById('btn-wiki-build');
-  const statusEl = document.getElementById('wiki-status-text');
+  const btn = document.getElementById('btn-wiki');
+  const statusEl = document.getElementById('wiki-status');
   btn.disabled = true;
   statusEl.textContent = '⏳ 正在建设知识库，请耐心等待...';
   statusEl.style.color = 'var(--orange)';
-
   try {
     const r = await fetch('/api/wiki/build', {
       method: 'POST',
@@ -559,36 +696,181 @@ async function buildWiki() {
     if (!r.ok) {
       statusEl.textContent = `❌ ${d.detail || '建设失败'}`;
       statusEl.style.color = 'var(--red)';
+      btn.disabled = false;
     } else {
-      statusEl.textContent = `✅ 知识库建设任务已启动 (${domain})`;
+      statusEl.textContent = `✅ 知识库建设已启动 (${domain})`;
       statusEl.style.color = 'var(--green)';
       pollWikiStatus(domain, statusEl);
     }
   } catch(e) {
     statusEl.textContent = `网络错误: ${e.message}`;
     statusEl.style.color = 'var(--red)';
-  } finally {
-    btn.disabled = !document.getElementById('wiki-domain-sel').value || isRunning;
+    btn.disabled = false;
   }
 }
 
-async function pollWikiStatus(domain, el, attempts = 0) {
-  if (attempts > 40) return;
-  await new Promise(r => setTimeout(r, 5000));
+async function pollWikiStatus(domain, el, n=0) {
+  if (n > 30) { onWikiSelChange(); return; }
+  await sleep(6000);
   try {
-    const r = await fetch(`/api/wiki/status/${domain}`);
-    const d = await r.json();
-    if (d.exists) {
-      el.textContent = `✅ 知识库已建设 ${d.page_count} 个页面 (${domain})`;
+    const d = await (await fetch(`/api/wiki/status/${domain}`)).json();
+    if (d.exists && d.page_count > 0) {
+      el.textContent = `✅ 知识库已建设 ${d.page_count} 个页面`;
       el.style.color = 'var(--green)';
+      onWikiSelChange(); loadDomains(); return;
     }
-  } catch(e) {}
-  if (attempts < 8) pollWikiStatus(domain, el, attempts + 1);
+  } catch(_) {}
+  pollWikiStatus(domain, el, n+1);
 }
 
-// ── Boot ─────────────────────────────────────────────────────────────────────
+// ── Chat ───────────────────────────────────────────────────────────────────────
+function onChatKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); }
+}
 
-boot();
+function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 150) + 'px';
+}
+
+async function sendChat() {
+  if (isChatBusy) return;
+  const ta = document.getElementById('chat-ta');
+  const msg = ta.value.trim();
+  if (!msg) return;
+
+  ta.value = ''; ta.style.height = 'auto';
+
+  const empty = document.getElementById('chat-empty');
+  if (empty) empty.remove();
+
+  addChatBubble('user', msg);
+  chatHistory.push({ role: 'user', content: msg });
+
+  const domain = document.getElementById('chat-sel').value;
+  isChatBusy = true;
+  document.getElementById('send-btn').disabled = true;
+
+  const typingId = addTypingIndicator();
+
+  try {
+    if (domain) {
+      await streamWikiQuery(domain, msg, typingId);
+    } else {
+      await streamDirect(typingId);
+    }
+  } catch(e) {
+    removeEl(typingId);
+    addChatBubble('assistant', `❌ 错误: ${e.message}`);
+  } finally {
+    isChatBusy = false;
+    document.getElementById('send-btn').disabled = false;
+  }
+}
+
+async function streamDirect(typingId) {
+  const messages = [
+    { role: 'system', content: '你是一个专业的AI知识助手，由DeepSeek驱动。请用中文清晰、准确、详细地回答问题。' },
+    ...chatHistory,
+  ];
+  const resp = await fetch('/api/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ messages, api_key: API_KEY, stream: true }),
+  });
+  if (!resp.ok) throw new Error((await resp.json().catch(()=>({}))).detail || '请求失败');
+  await consumeStream(resp, typingId);
+}
+
+async function streamWikiQuery(domain, question, typingId) {
+  const resp = await fetch('/api/wiki/query', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ question, domain, api_key: API_KEY, stream: true }),
+  });
+  if (!resp.ok) {
+    if (resp.status === 404) return streamDirect(typingId);
+    throw new Error((await resp.json().catch(()=>({}))).detail || '知识库查询失败');
+  }
+  await consumeStream(resp, typingId);
+}
+
+async function consumeStream(resp, typingId) {
+  removeEl(typingId);
+  const bubbleId = 'b' + Date.now();
+  addChatBubble('assistant', '', bubbleId);
+  const bubble = document.getElementById(bubbleId);
+
+  const reader = resp.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '', full = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const lines = buf.split('\n');
+    buf = lines.pop();
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const raw = line.slice(6).trim();
+      if (raw === '[DONE]') break;
+      try {
+        const delta = JSON.parse(raw).delta || '';
+        if (delta) { full += delta; bubble.textContent = full; scrollChat(); }
+      } catch(_) {}
+    }
+  }
+
+  chatHistory.push({ role: 'assistant', content: full });
+  scrollChat();
+}
+
+function addChatBubble(role, text, id) {
+  const c = document.getElementById('chat-msgs');
+  const div = document.createElement('div');
+  div.className = `msg-row ${role}`;
+  const avatar = role === 'user' ? '👤' : '🤖';
+  div.innerHTML =
+    `<div class="msg-avatar">${avatar}</div>` +
+    `<div class="msg-bubble"${id ? ` id="${id}"` : ''}>${esc(text)}</div>`;
+  c.appendChild(div);
+  scrollChat();
+}
+
+function addTypingIndicator() {
+  const id = 'ty' + Date.now();
+  const c = document.getElementById('chat-msgs');
+  const div = document.createElement('div');
+  div.id = id;
+  div.className = 'msg-row assistant';
+  div.innerHTML =
+    `<div class="msg-avatar">🤖</div>` +
+    `<div class="msg-bubble"><span class="typing-dots">` +
+    `<span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span>` +
+    `</span></div>`;
+  c.appendChild(div);
+  scrollChat();
+  return id;
+}
+
+function removeEl(id) {
+  const el = document.getElementById(id);
+  if (el) el.remove();
+}
+
+function scrollChat() {
+  const c = document.getElementById('chat-msgs');
+  c.scrollTop = c.scrollHeight;
+}
+
+// ── Utils ──────────────────────────────────────────────────────────────────────
+function esc(s) {
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;');
+}
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 </script>
 </body>
 </html>
