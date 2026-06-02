@@ -1,152 +1,594 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>网页全量信息智能提取客户端</title>
-    <style>
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background-color: #f5f7fa;
-            color: #333;
-            max-width: 800px;
-            margin: 0 auto;
-            padding: 20px;
-        }
-        .container {
-            background-color: white;
-            padding: 30px;
-            border-radius: 10px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-        }
-        h1 {
-            color: #2c3e50;
-            text-align: center;
-            margin-bottom: 30px;
-        }
-        .form-group {
-            margin-bottom: 20px;
-        }
-        label {
-            display: block;
-            margin-bottom: 8px;
-            font-weight: bold;
-        }
-        input[type="url"] {
-            width: 100%;
-            padding: 12px;
-            border: 1px solid #ddd;
-            border-radius: 5px;
-            font-size: 16px;
-            box-sizing: border-box;
-        }
-        .checkbox-group {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        .btn-group {
-            display: flex;
-            gap: 10px;
-            margin-top: 20px;
-        }
-        button {
-            flex: 1;
-            background-color: #3498db;
-            color: white;
-            border: none;
-            padding: 12px 20px;
-            border-radius: 5px;
-            font-size: 16px;
-            cursor: pointer;
-            transition: background-color 0.3s;
-        }
-        button:hover {
-            background-color: #2980b9;
-        }
-        button.update-btn {
-            background-color: #e67e22;
-        }
-        button.update-btn:hover {
-            background-color: #d35400;
-        }
-        .notice {
-            margin-top: 15px;
-            font-size: 14px;
-            color: #666;
-            background: #eef2f5;
-            padding: 10px;
-            border-radius: 5px;
-            border-left: 4px solid #3498db;
-        }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reptile — 智能知识库系统</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --muted: #8b949e;
+    --accent: #388bfd;
+    --green: #3fb950;
+    --red: #f85149;
+    --orange: #d29922;
+  }
+
+  body {
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* ── Header ── */
+  header {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 0 24px;
+    height: 52px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-shrink: 0;
+  }
+  header .logo { font-size: 20px; }
+  header h1   { font-size: 16px; font-weight: 600; color: #f0f6fc; }
+  header nav  { margin-left: auto; display: flex; gap: 4px; }
+  header nav a {
+    color: var(--muted); font-size: 13px; text-decoration: none;
+    padding: 5px 12px; border-radius: 6px; transition: all .15s;
+    border: 1px solid transparent;
+  }
+  header nav a:hover { color: var(--text); border-color: var(--border); background: #21262d; }
+  header nav a.active { color: #f0f6fc; background: #21262d; border-color: var(--border); }
+
+  /* ── Main layout ── */
+  .main {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 380px 1fr;
+    gap: 0;
+    overflow: hidden;
+    height: calc(100vh - 52px);
+  }
+
+  /* ── Left panel ── */
+  .left {
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+  }
+
+  .panel { padding: 20px; border-bottom: 1px solid var(--border); }
+  .panel-title {
+    font-size: 11px; font-weight: 600; color: var(--muted);
+    text-transform: uppercase; letter-spacing: .07em; margin-bottom: 14px;
+  }
+
+  label.field-label { font-size: 12px; color: var(--muted); display: block; margin-bottom: 6px; }
+
+  input[type=url], input[type=text], select {
+    width: 100%; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 8px; color: var(--text); padding: 9px 12px; font-size: 13px;
+    outline: none; transition: border-color .15s;
+  }
+  input:focus, select:focus { border-color: var(--accent); }
+
+  .checkbox-row {
+    display: flex; align-items: center; gap: 8px; margin-top: 10px;
+  }
+  .checkbox-row input[type=checkbox] { width: auto; }
+  .checkbox-row label { font-size: 12px; color: var(--muted); margin-bottom: 0; cursor: pointer; }
+
+  .btn-row { display: flex; gap: 8px; margin-top: 14px; }
+
+  .btn {
+    flex: 1; padding: 9px 12px; border: none; border-radius: 8px;
+    font-size: 13px; font-weight: 600; cursor: pointer; transition: opacity .15s;
+  }
+  .btn:hover:not(:disabled) { opacity: .85; }
+  .btn:disabled { opacity: .35; cursor: not-allowed; }
+  .btn-primary  { background: #238636; color: #fff; }
+  .btn-danger   { background: #b62324; color: #fff; }
+  .btn-warn     { background: #9e6a03; color: #fff; }
+  .btn-neutral  { background: #21262d; color: var(--text); border: 1px solid var(--border); }
+
+  /* Stats row */
+  .stats-row {
+    display: flex; gap: 12px; margin-top: 12px; flex-wrap: wrap;
+  }
+  .stat-chip {
+    background: #21262d; border: 1px solid var(--border); border-radius: 20px;
+    padding: 4px 12px; font-size: 12px; color: var(--muted);
+  }
+  .stat-chip b { color: var(--text); }
+
+  /* Domain list */
+  .domain-list { display: flex; flex-direction: column; gap: 6px; }
+  .domain-item {
+    background: #21262d; border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 14px; display: flex; align-items: center; gap: 10px;
+    cursor: pointer; transition: border-color .15s;
+  }
+  .domain-item:hover { border-color: var(--accent); }
+  .domain-item.selected { border-color: var(--accent); background: #1f2d3d; }
+  .domain-item .di-name { font-size: 13px; color: var(--text); font-weight: 500; }
+  .domain-item .di-count { font-size: 11px; color: var(--muted); margin-left: auto; }
+
+  /* ── Right panel: status log ── */
+  .right { display: flex; flex-direction: column; overflow: hidden; }
+
+  .status-header {
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--surface);
+    flex-shrink: 0;
+  }
+  .status-header h2 { font-size: 14px; font-weight: 600; color: #f0f6fc; }
+  .status-badge {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 11px; font-weight: 600; border-radius: 12px;
+    padding: 3px 10px; letter-spacing: .04em;
+  }
+  .badge-idle     { background: #21262d; color: var(--muted); border: 1px solid var(--border); }
+  .badge-running  { background: #16302b; color: var(--green); border: 1px solid #196c2e; }
+  .badge-paused   { background: #2d2200; color: var(--orange); border: 1px solid #6e4e00; }
+  .badge-stopped  { background: #2d1317; color: var(--red); border: 1px solid #6e211f; }
+  .badge-done     { background: #1b3a6b; color: #79c0ff; border: 1px solid #1f6feb; }
+  .badge-analyzing { background: #2d2200; color: #e3b341; border: 1px solid #6e4e00; }
+
+  .pulse {
+    width: 7px; height: 7px; border-radius: 50%; background: var(--green);
+    animation: pulse 1.4s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .25 } }
+
+  .progress-bar-wrap {
+    height: 3px; background: var(--border); margin-top: 6px; border-radius: 2px;
+    overflow: hidden;
+  }
+  .progress-bar {
+    height: 100%; background: var(--accent); width: 0%;
+    transition: width .3s; border-radius: 2px;
+  }
+
+  .log-area {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px 20px;
+    font-family: 'Consolas', 'Courier New', monospace;
+    font-size: 12.5px;
+    line-height: 1.8;
+    background: var(--bg);
+  }
+
+  .log-entry { display: flex; gap: 10px; align-items: flex-start; }
+  .log-ts { color: #484f58; flex-shrink: 0; padding-top: 1px; }
+  .log-msg { flex: 1; word-break: break-all; }
+  .log-msg.success { color: var(--green); }
+  .log-msg.warn    { color: var(--orange); }
+  .log-msg.error   { color: var(--red); }
+  .log-msg.info    { color: #79c0ff; }
+  .log-msg.done    { color: var(--green); font-weight: 600; }
+  .log-msg.log     { color: var(--text); }
+
+  .log-empty { color: var(--muted); font-style: italic; text-align: center; margin-top: 40px; }
+
+  /* Ctrl bar below log */
+  .ctrl-bar {
+    border-top: 1px solid var(--border);
+    padding: 10px 20px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--surface);
+    flex-shrink: 0;
+  }
+  .ctrl-bar .pages-count { font-size: 12px; color: var(--muted); flex: 1; }
+  .ctrl-bar .pages-count b { color: var(--text); }
+
+  /* ── Wiki section ── */
+  .wiki-section {
+    border-top: 1px solid var(--border);
+    padding: 16px 20px;
+    background: var(--bg);
+  }
+  .wiki-section .panel-title { margin-bottom: 12px; }
+  .wiki-domain-row { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
+  .wiki-domain-row select { flex: 1; }
+  .wiki-status-text { font-size: 12px; color: var(--muted); }
+</style>
 </head>
 <body>
 
-<div class="container">
-    <h1>网页全量信息智能提取客户端</h1>
+<!-- ── Header ── -->
+<header>
+  <span class="logo">🦎</span>
+  <h1>Reptile 智能知识库</h1>
+  <nav>
+    <a href="/app" class="active">爬虫采集</a>
+    <a href="/wiki">知识库问答</a>
+  </nav>
+</header>
 
-    <div class="form-group">
-        <label for="url">目标网址 (URL) - 将自动递归抓取该目录下的所有页面</label>
-        <input type="url" id="url" placeholder="https://example.com/docs/" required>
+<div class="main">
+
+  <!-- ── Left panel ── -->
+  <div class="left">
+
+    <!-- URL input -->
+    <div class="panel">
+      <div class="panel-title">目标网址</div>
+      <label class="field-label">输入要采集的网址（系统会自动分析并向下递归爬取）</label>
+      <input type="url" id="url-input"
+             placeholder="https://example.com/docs/"
+             onkeydown="if(event.key==='Enter') startTask(false)">
+      <div class="checkbox-row">
+        <input type="checkbox" id="chk-update-mode">
+        <label for="chk-update-mode">迭代更新（只下载新增/变化内容）</label>
+      </div>
+      <div class="checkbox-row">
+        <input type="checkbox" id="chk-rebuild">
+        <label for="chk-rebuild">重新初始化（清空历史，从头采集）</label>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary" id="btn-start" onclick="startTask(false)">
+          ▶ 开始 / 继续
+        </button>
+        <button class="btn btn-danger" id="btn-stop" onclick="stopTask()" disabled>
+          ⏹ 停止
+        </button>
+      </div>
     </div>
 
-    <div class="form-group checkbox-group">
-        <input type="checkbox" id="show-browser" checked>
-        <label for="show-browser" style="margin-bottom: 0; font-weight: normal;">显示浏览器界面 (取消勾选可后台静默爬取)</label>
+    <!-- Domains -->
+    <div class="panel">
+      <div class="panel-title">已采集域名</div>
+      <div class="domain-list" id="domain-list">
+        <div style="font-size:12px;color:var(--muted);">暂无数据</div>
+      </div>
     </div>
 
-    <div class="notice">
-        <b>工作流说明：</b><br>
-        1. 系统会自动构建数据链并防止重复爬取。<br>
-        2. 点击开始后将打开一个独立的控制台窗口，用于显示数据树状地图并提供断点续传控制。<br>
-        3. <b>续传/抓取</b>：自动接续之前的进度进行抓取。<br>
-        4. <b>重新初始化(更新)</b>：清空该网址的历史记录，从头开始全量抓取。
+    <!-- Wiki build -->
+    <div class="wiki-section">
+      <div class="panel-title">🧠 知识库建设</div>
+      <label class="field-label">选择要建设知识库的域名</label>
+      <div class="wiki-domain-row">
+        <select id="wiki-domain-sel">
+          <option value="">— 请选择 —</option>
+        </select>
+        <button class="btn btn-warn" id="btn-wiki-build" onclick="buildWiki()" disabled
+                style="flex:none;padding:8px 14px;">开始建设</button>
+      </div>
+      <div class="wiki-status-text" id="wiki-status-text">知识库建设完成后可在「知识库问答」页面查询</div>
     </div>
 
-    <div class="btn-group">
-        <button onclick="startTask(false)">开始/继续抓取</button>
-        <button class="update-btn" onclick="startTask(true)">重新初始化(更新数据)</button>
+  </div>
+
+  <!-- ── Right panel: live log ── -->
+  <div class="right">
+
+    <div class="status-header">
+      <h2>运行状态</h2>
+      <span class="status-badge badge-idle" id="status-badge">空闲</span>
+      <span style="font-size:12px;color:var(--muted);margin-left:auto;" id="current-domain"></span>
     </div>
+
+    <div class="log-area" id="log-area">
+      <div class="log-empty">等待任务开始...</div>
+    </div>
+
+    <div class="ctrl-bar">
+      <div class="pages-count" id="pages-count">已保存 <b>0</b> 篇 · 队列 <b>0</b></div>
+      <button class="btn btn-neutral" id="btn-pause" onclick="togglePause()" disabled
+              style="padding:6px 14px;font-size:12px;">⏸ 暂停</button>
+      <button class="btn btn-neutral" onclick="clearLog()"
+              style="padding:6px 14px;font-size:12px;">清空日志</button>
+    </div>
+
+  </div>
 </div>
 
 <script>
-    async function startTask(isUpdate) {
-        const urlInput = document.getElementById('url').value;
-        const showBrowser = document.getElementById('show-browser').checked;
+// ── State ────────────────────────────────────────────────────────────────────
 
-        if (!urlInput) {
-            alert('请输入有效的网址！');
-            return;
-        }
+let API_KEY = sessionStorage.getItem('api_key') || '';
+let currentTaskId = null;
+let eventSource = null;
+let isRunning = false;
+let isPaused = false;
+let pagesDone = 0;
+let pagesQueued = 0;
 
-        try {
-            const response = await fetch('/api/scrape/start', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    url: urlInput,
-                    show_browser: showBrowser,
-                    update_data: isUpdate
-                })
-            });
+// ── Boot ─────────────────────────────────────────────────────────────────────
 
-            const data = await response.json();
+function boot() {
+  if (!API_KEY) {
+    window.location.href = '/';
+    return;
+  }
+  loadDomains();
+  setInterval(loadDomains, 10000);
+}
 
-            if (response.ok && data.task_id) {
-                // Open console in a new independent window
-                const consoleUrl = `/console?taskId=${data.task_id}`;
-                window.open(consoleUrl, 'ScraperConsole_' + data.task_id, 'width=1000,height=800,menubar=no,toolbar=no,location=no,status=no');
-            } else {
-                alert('启动任务失败: ' + (data.detail || JSON.stringify(data)));
-            }
-        } catch (error) {
-            alert(`请求错误：${error.message}`);
-        }
+// ── Domain list ──────────────────────────────────────────────────────────────
+
+async function loadDomains() {
+  try {
+    const r = await fetch('/api/scrape/domains');
+    const d = await r.json();
+    renderDomains(d.domains);
+    populateWikiDomainSel(d.domains);
+  } catch(e) {}
+}
+
+function renderDomains(domains) {
+  const el = document.getElementById('domain-list');
+  if (!domains.length) {
+    el.innerHTML = '<div style="font-size:12px;color:var(--muted);">暂无数据</div>';
+    return;
+  }
+  el.innerHTML = domains.map(d => `
+    <div class="domain-item">
+      <span style="font-size:16px;">🌐</span>
+      <span class="di-name">${d.name}</span>
+      <span class="di-count">${d.file_count} 篇</span>
+    </div>
+  `).join('');
+}
+
+function populateWikiDomainSel(domains) {
+  const sel = document.getElementById('wiki-domain-sel');
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">— 请选择 —</option>' +
+    domains.map(d => `<option value="${d.name}">${d.name} (${d.file_count} 篇)</option>`).join('');
+  if (cur) sel.value = cur;
+  updateWikiBuildBtn();
+}
+
+function updateWikiBuildBtn() {
+  const sel = document.getElementById('wiki-domain-sel').value;
+  document.getElementById('btn-wiki-build').disabled = !sel || isRunning;
+}
+
+// ── Task control ─────────────────────────────────────────────────────────────
+
+async function startTask(forceUpdate) {
+  const url = document.getElementById('url-input').value.trim();
+  if (!url) { alert('请输入目标网址'); return; }
+
+  const updateMode = document.getElementById('chk-update-mode').checked;
+  const rebuild    = document.getElementById('chk-rebuild').checked || forceUpdate;
+
+  clearLog();
+  setStatus('running');
+
+  try {
+    const r = await fetch('/api/scrape/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        url, api_key: API_KEY,
+        update_data: rebuild,
+        update_mode: updateMode,
+      }),
+    });
+    const d = await r.json();
+    if (!r.ok) { alert(d.detail || '启动失败'); setStatus('idle'); return; }
+
+    currentTaskId = d.task_id;
+    document.getElementById('current-domain').textContent = new URL(url).hostname;
+
+    subscribeEvents(currentTaskId);
+
+    document.getElementById('btn-start').disabled = true;
+    document.getElementById('btn-stop').disabled = false;
+    document.getElementById('btn-pause').disabled = false;
+    isRunning = true;
+    updateWikiBuildBtn();
+  } catch(e) {
+    alert(`请求错误: ${e.message}`);
+    setStatus('idle');
+  }
+}
+
+async function stopTask() {
+  if (!currentTaskId) return;
+  await fetch(`/api/scrape/stop/${currentTaskId}`, { method: 'POST' });
+  finishTask('stopped');
+}
+
+async function togglePause() {
+  if (!currentTaskId) return;
+  if (isPaused) {
+    await fetch(`/api/scrape/resume/${currentTaskId}`, { method: 'POST' });
+    isPaused = false;
+    document.getElementById('btn-pause').textContent = '⏸ 暂停';
+    setStatus('running');
+  } else {
+    await fetch(`/api/scrape/pause/${currentTaskId}`, { method: 'POST' });
+    isPaused = true;
+    document.getElementById('btn-pause').textContent = '▶ 继续';
+    setStatus('paused');
+  }
+}
+
+function finishTask(finalStatus) {
+  isRunning = false;
+  if (eventSource) { eventSource.close(); eventSource = null; }
+  setStatus(finalStatus);
+  document.getElementById('btn-start').disabled = false;
+  document.getElementById('btn-stop').disabled = true;
+  document.getElementById('btn-pause').disabled = true;
+  isPaused = false;
+  document.getElementById('btn-pause').textContent = '⏸ 暂停';
+  updateWikiBuildBtn();
+  loadDomains();
+}
+
+// ── SSE event subscription ───────────────────────────────────────────────────
+
+function subscribeEvents(taskId) {
+  if (eventSource) { eventSource.close(); }
+  eventSource = new EventSource(`/api/scrape/events/${taskId}`);
+
+  eventSource.onmessage = (e) => {
+    if (e.data === 'null' || !e.data) {
+      finishTask('done');
+      return;
     }
-</script>
+    try {
+      const item = JSON.parse(e.data);
+      if (item.type === 'ping') return;
 
+      if (item.type === 'progress') {
+        pagesDone = item.pages_done || 0;
+        pagesQueued = item.pages_queue || 0;
+        updatePageCount();
+        return;
+      }
+
+      if (item.type === 'done') {
+        appendLog(item.ts, item.msg, 'done');
+        pagesDone = item.pages_done || pagesDone;
+        updatePageCount();
+        finishTask('done');
+        return;
+      }
+
+      appendLog(item.ts, item.msg, item.type);
+
+      // Detect analysis phase
+      if (item.msg && item.msg.includes('DeepSeek')) setStatus('analyzing');
+      else if (item.msg && item.msg.includes('开始爬取')) setStatus('running');
+
+    } catch(err) {}
+  };
+
+  eventSource.onerror = () => {
+    // Connection dropped — task may be done or server restarting
+    if (isRunning) {
+      setTimeout(() => { if (isRunning) finishTask('stopped'); }, 3000);
+    }
+  };
+}
+
+// ── Log helpers ──────────────────────────────────────────────────────────────
+
+function appendLog(ts, msg, type) {
+  if (!msg) return;
+  const area = document.getElementById('log-area');
+  const empty = area.querySelector('.log-empty');
+  if (empty) empty.remove();
+
+  const div = document.createElement('div');
+  div.className = 'log-entry';
+  div.innerHTML = `
+    <span class="log-ts">${ts || ''}</span>
+    <span class="log-msg ${type || 'log'}">${escHtml(msg)}</span>
+  `;
+  area.appendChild(div);
+  area.scrollTop = area.scrollHeight;
+}
+
+function clearLog() {
+  const area = document.getElementById('log-area');
+  area.innerHTML = '<div class="log-empty">等待任务开始...</div>';
+  pagesDone = 0; pagesQueued = 0;
+  updatePageCount();
+}
+
+function updatePageCount() {
+  document.getElementById('pages-count').innerHTML =
+    `已保存 <b>${pagesDone}</b> 篇 · 队列 <b>${pagesQueued}</b>`;
+}
+
+function escHtml(str) {
+  return String(str)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ── Status badge ─────────────────────────────────────────────────────────────
+
+function setStatus(s) {
+  const el = document.getElementById('status-badge');
+  const MAP = {
+    idle:      ['badge-idle',      '空闲',       false],
+    running:   ['badge-running',   '爬取中',     true],
+    analyzing: ['badge-analyzing', '分析中',     true],
+    paused:    ['badge-paused',    '已暂停',     false],
+    stopped:   ['badge-stopped',   '已停止',     false],
+    done:      ['badge-done',      '已完成',     false],
+  };
+  const [cls, label, pulse] = MAP[s] || MAP['idle'];
+  el.className = `status-badge ${cls}`;
+  el.innerHTML = (pulse ? '<span class="pulse"></span>' : '') + label;
+}
+
+// ── Wiki build ───────────────────────────────────────────────────────────────
+
+async function buildWiki() {
+  const domain = document.getElementById('wiki-domain-sel').value;
+  if (!domain) return;
+
+  const btn = document.getElementById('btn-wiki-build');
+  const statusEl = document.getElementById('wiki-status-text');
+  btn.disabled = true;
+  statusEl.textContent = '⏳ 正在建设知识库，请耐心等待...';
+  statusEl.style.color = 'var(--orange)';
+
+  try {
+    const r = await fetch('/api/wiki/build', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ domain, api_key: API_KEY, batch_size: 5 }),
+    });
+    const d = await r.json();
+    if (!r.ok) {
+      statusEl.textContent = `❌ ${d.detail || '建设失败'}`;
+      statusEl.style.color = 'var(--red)';
+    } else {
+      statusEl.textContent = `✅ 知识库建设任务已启动 (${domain})`;
+      statusEl.style.color = 'var(--green)';
+      pollWikiStatus(domain, statusEl);
+    }
+  } catch(e) {
+    statusEl.textContent = `网络错误: ${e.message}`;
+    statusEl.style.color = 'var(--red)';
+  } finally {
+    btn.disabled = !document.getElementById('wiki-domain-sel').value || isRunning;
+  }
+}
+
+async function pollWikiStatus(domain, el, attempts = 0) {
+  if (attempts > 40) return;
+  await new Promise(r => setTimeout(r, 5000));
+  try {
+    const r = await fetch(`/api/wiki/status/${domain}`);
+    const d = await r.json();
+    if (d.exists) {
+      el.textContent = `✅ 知识库已建设 ${d.page_count} 个页面 (${domain})`;
+      el.style.color = 'var(--green)';
+    }
+  } catch(e) {}
+  if (attempts < 8) pollWikiStatus(domain, el, attempts + 1);
+}
+
+// ── Boot ─────────────────────────────────────────────────────────────────────
+
+boot();
+</script>
 </body>
 </html>
