@@ -1,7 +1,7 @@
 import os
 import re
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import asyncio
 import random
 import pandas as pd
@@ -13,60 +13,116 @@ import aiohttp
 from readability import Document
 import io
 import hashlib
+import time
 
 import db_manager
 
-# Global dictionary to hold asyncio.Event objects for each task
-# task_id -> {'pause': Event, 'stop': Event}
-task_events = {}
-task_root_prefixes = {} # task_id -> dynamic root prefix
+# ---------------------------------------------------------------------------
+# Global state
+# ---------------------------------------------------------------------------
+
+task_events = {}          # task_id -> {'pause': Event, 'stop': Event}
+task_root_prefixes = {}   # task_id -> dynamic root prefix
+
+# Per-domain circuit breaker: domain -> {'fail_count': int, 'open_until': float}
+_domain_circuit: dict = {}
+CIRCUIT_THRESHOLD = 5
+CIRCUIT_COOLDOWN = 300  # seconds
+
+# Per-domain rate limiting: domain -> last request timestamp (epoch float)
+_domain_last_request: dict = {}
+DOMAIN_MIN_INTERVAL = 1.0  # seconds
 
 def init_task_events(task_id: str):
     task_events[task_id] = {
         'pause': asyncio.Event(),
         'stop': asyncio.Event()
     }
-    # Initially NOT paused
     task_events[task_id]['pause'].set()
-    # Initially NOT stopped
     task_events[task_id]['stop'].clear()
 
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
+
 def sanitize_filename(name):
-    """Sanitize string to create a safe file/folder name."""
     if not name:
         return "Untitled_" + datetime.now().strftime("%H%M%S")
     safe_name = re.sub(r'[\\/*?:"<>|]', "", str(name))
     safe_name = re.sub(r'\s+', "_", safe_name)
-
-    # Strictly limit length to prevent WinError 206 (Path too long)
     if len(safe_name) > 30:
         hash_suffix = hashlib.md5(safe_name.encode('utf-8')).hexdigest()[:6]
         safe_name = safe_name[:23] + "_" + hash_suffix
-
     return safe_name
 
-def setup_base_directory(start_url):
-    """Create the root directory for this crawl session."""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+def compute_content_hash(content: str) -> str:
+    return hashlib.md5(content.encode('utf-8')).hexdigest()
+
+def backoff_delay(attempt: int, base: float = 1.0, cap: float = 30.0) -> float:
+    """Exponential backoff with full jitter."""
+    return random.uniform(0, min(cap, base * (2 ** attempt)))
+
+# ---------------------------------------------------------------------------
+# Circuit breaker
+# ---------------------------------------------------------------------------
+
+def _get_domain(url: str) -> str:
+    return urllib.parse.urlparse(url).netloc
+
+def check_circuit(domain: str) -> bool:
+    """Returns True if circuit is open (domain should be skipped)."""
+    entry = _domain_circuit.get(domain)
+    if not entry:
+        return False
+    if entry['fail_count'] >= CIRCUIT_THRESHOLD:
+        if time.monotonic() < entry['open_until']:
+            return True
+        # Cooldown expired — half-open: reset
+        _domain_circuit[domain] = {'fail_count': 0, 'open_until': 0}
+    return False
+
+def record_domain_failure(domain: str):
+    entry = _domain_circuit.setdefault(domain, {'fail_count': 0, 'open_until': 0})
+    entry['fail_count'] += 1
+    if entry['fail_count'] >= CIRCUIT_THRESHOLD:
+        entry['open_until'] = time.monotonic() + CIRCUIT_COOLDOWN
+        print(f"[circuit] {domain} circuit opened for {CIRCUIT_COOLDOWN}s after {entry['fail_count']} failures")
+
+def record_domain_success(domain: str):
+    if domain in _domain_circuit:
+        _domain_circuit[domain]['fail_count'] = 0
+
+# ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+
+async def acquire_rate_limit(domain: str):
+    """Sleep if needed to enforce per-domain minimum interval."""
+    last = _domain_last_request.get(domain, 0)
+    wait = DOMAIN_MIN_INTERVAL - (time.monotonic() - last)
+    if wait > 0:
+        await asyncio.sleep(wait)
+    _domain_last_request[domain] = time.monotonic()
+
+# ---------------------------------------------------------------------------
+# Directory setup
+# ---------------------------------------------------------------------------
+
+def setup_base_directory(start_url: str):
+    """Stable output dir: scraped_data/{safe_domain}/ — no timestamp prefix."""
     parsed = urllib.parse.urlparse(start_url)
     domain = parsed.netloc.replace("www.", "")
-    safe_domain = re.sub(r'[^a-zA-Z0-9]', '_', domain)
-    if len(safe_domain) > 20:
-        safe_domain = safe_domain[:20]
-
-    folder_name = f"{timestamp}_{safe_domain}"
-    base_path = os.path.join(os.getcwd(), "scraped_data", folder_name)
+    safe_domain = re.sub(r'[^a-zA-Z0-9_\-]', '_', domain)[:50]
+    base_path = os.path.join(os.getcwd(), "scraped_data", safe_domain)
     os.makedirs(base_path, exist_ok=True)
     return base_path, domain
 
-def setup_page_directory(base_path, title):
-    """Create a sub-directory for a specific page."""
+def setup_page_directory(base_path: str, title: str, text_only: bool = False):
     safe_title = sanitize_filename(title)
     if not safe_title:
         safe_title = "Untitled_" + datetime.now().strftime("%H%M%S")
 
     page_path = os.path.join(base_path, safe_title)
-    # Ensure unique directory, use atomic creation to prevent TOCTOU race condition
     counter = 1
     original_path = page_path
     while True:
@@ -77,57 +133,102 @@ def setup_page_directory(base_path, title):
             page_path = f"{original_path}_{counter}"
             counter += 1
 
-    tables_path = os.path.join(page_path, "tables")
-    images_path = os.path.join(page_path, "images")
-
-    os.makedirs(tables_path, exist_ok=True)
-    os.makedirs(images_path, exist_ok=True)
+    tables_path = None
+    images_path = None
+    if not text_only:
+        tables_path = os.path.join(page_path, "tables")
+        images_path = os.path.join(page_path, "images")
+        os.makedirs(tables_path, exist_ok=True)
+        os.makedirs(images_path, exist_ok=True)
 
     return page_path, tables_path, images_path
 
-async def download_image(session, img_url, save_path):
-    """Download an image asynchronously with retries and headers."""
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Referer': img_url # Some CDNs require referer
-    }
+# ---------------------------------------------------------------------------
+# Date filtering
+# ---------------------------------------------------------------------------
 
-    for attempt in range(3):
-        try:
-            # We use verify_ssl=False in case of self-signed certs
-            async with session.get(img_url, headers=headers, timeout=15, ssl=False) as response:
-                if response.status == 200:
-                    content = await response.read()
-                    with open(save_path, 'wb') as f:
-                        f.write(content)
-                    return True
-                elif response.status in [301, 302, 303, 307, 308]:
-                    # Follow redirect manually if aiohttp doesn't handle it
-                    redirect_url = response.headers.get('Location')
-                    if redirect_url:
-                        if not redirect_url.startswith('http'):
-                            import urllib.parse
-                            redirect_url = urllib.parse.urljoin(img_url, redirect_url)
-                        img_url = redirect_url
-                        continue
-                else:
-                    print(f"Failed to download {img_url}: HTTP {response.status}")
-                    break # Don't retry 404s etc.
-        except Exception as e:
-            if attempt == 2:
-                print(f"Error downloading {img_url} after 3 attempts: {e}")
-            import asyncio
-            await asyncio.sleep(1)
+_DATE_PATTERNS = [
+    # 2023-05-12 or 2023/05/12 with optional time
+    re.compile(r'(\d{4})[-/](\d{1,2})[-/](\d{1,2})'),
+    # 2023年5月12日
+    re.compile(r'(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日?'),
+]
 
-    return False
+def parse_publish_date(date_str: str) -> datetime | None:
+    """Parse a date string (Chinese or ISO) into an aware UTC datetime. Returns None on failure."""
+    if not date_str:
+        return None
+    for pat in _DATE_PATTERNS:
+        m = pat.search(date_str)
+        if m:
+            try:
+                y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                return datetime(y, mo, d, tzinfo=timezone.utc)
+            except (ValueError, IndexError):
+                continue
+    return None
 
-def determine_static_boundary(start_url):
+def is_within_date_window(date_str: str | None, years: int = 3) -> bool:
     """
-    Determines the strict physical generic boundary.
-    Extracts the parent directory of the current directory to include siblings and their children.
+    True if the date is within `years` of today, or if no date can be parsed
+    (safe default: include unknown-date content).
     """
+    if not date_str:
+        return True
+    dt = parse_publish_date(date_str)
+    if dt is None:
+        return True
+    cutoff = datetime.now(timezone.utc) - timedelta(days=years * 365)
+    return dt >= cutoff
+
+# ---------------------------------------------------------------------------
+# Publish info extraction
+# ---------------------------------------------------------------------------
+
+_PUBLISH_PATTERNS = [
+    re.compile(r'(?:发布|创建)时间\s*[:：]\s*(\d{4}[-/年]\d{1,2}[-/月]\d{1,2}[日]?[\s\d:]*)'),
+    re.compile(r'来源\s*[:：]\s*([^\s]+)'),
+    re.compile(r'作者\s*[:：]\s*([^\s]+)'),
+]
+
+def extract_publish_info(soup) -> dict:
+    """
+    Extract publish date, source, and author.
+    Returns a dict with keys: publish_date, source, author (all optional).
+    """
+    result = {}
+
+    meta_date = soup.find('meta', attrs={'name': re.compile(r'pubdate', re.I)})
+    if meta_date and meta_date.get('content'):
+        result['publish_date'] = meta_date['content'].strip()
+
+    meta_source = soup.find('meta', attrs={'name': re.compile(r'source', re.I)})
+    if meta_source and meta_source.get('content'):
+        result['source'] = meta_source['content'].strip()
+
+    full_text = soup.get_text(separator=' ', strip=True)
+
+    if 'publish_date' not in result:
+        m = _PUBLISH_PATTERNS[0].search(full_text)
+        if m:
+            result['publish_date'] = m.group(1).strip()
+
+    if 'source' not in result:
+        m = _PUBLISH_PATTERNS[1].search(full_text)
+        if m:
+            result['source'] = m.group(1).strip()
+
+    m = _PUBLISH_PATTERNS[2].search(full_text)
+    if m:
+        result['author'] = m.group(1).strip()
+
+    return result
+
+# ---------------------------------------------------------------------------
+# Link discovery
+# ---------------------------------------------------------------------------
+
+def determine_static_boundary(start_url: str) -> str:
     parsed = urllib.parse.urlparse(start_url)
     ext = os.path.splitext(parsed.path)[1].lower()
     is_file = ext in ['.html', '.htm', '.php', '.jsp', '.asp', '.aspx']
@@ -148,34 +249,37 @@ def determine_static_boundary(start_url):
 
     return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, base_path, '', '', ''))
 
-def get_sub_domain_links(html, current_url, base_url, dynamic_root_prefix=None):
-    """Extract links that are downward paths from the pre-calculated root prefix."""
+def get_sub_domain_links(html: str, current_url: str, base_url: str, dynamic_root_prefix=None) -> list:
     soup = BeautifulSoup(html, 'lxml')
     links = []
 
-    # Use the pre-computed static root prefix if available, otherwise fallback to base_url
-    base_prefix = dynamic_root_prefix if dynamic_root_prefix else (base_url if base_url.endswith('/') else base_url + '/')
+    base_prefix = dynamic_root_prefix if dynamic_root_prefix else (
+        base_url if base_url.endswith('/') else base_url + '/'
+    )
 
-    # Ignore purely media/executable files, but ALLOW documents we want to download
-    ignored_extensions = {'.zip', '.rar', '.exe', '.mp3', '.mp4', '.avi', '.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg'}
+    ignored_extensions = {
+        '.zip', '.rar', '.exe', '.mp3', '.mp4', '.avi',
+        '.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg'
+    }
 
     for a_tag in soup.find_all('a', href=True):
         href = a_tag['href']
         full_url = urllib.parse.urljoin(current_url, href)
-        # Remove fragment
         full_url = urllib.parse.urldefrag(full_url)[0]
 
         parsed_url = urllib.parse.urlparse(full_url)
         ext = os.path.splitext(parsed_url.path)[1].lower()
 
         if parsed_url.scheme in ['http', 'https'] and ext not in ignored_extensions:
-            # Check if it is the base_url itself, or a child path of the base_prefix (case-insensitive)
             if full_url.lower() == base_url.lower() or full_url.lower().startswith(base_prefix.lower()):
                 links.append(full_url)
     return list(set(links))
 
+# ---------------------------------------------------------------------------
+# Page interaction
+# ---------------------------------------------------------------------------
+
 async def scroll_page(page):
-    """Scroll down the page slowly to load dynamic content."""
     try:
         for _ in range(5):
             await page.evaluate("window.scrollBy(0, document.body.scrollHeight / 5)")
@@ -183,30 +287,135 @@ async def scroll_page(page):
         await page.evaluate("window.scrollTo(0, 0)")
         await page.wait_for_timeout(1000)
     except Exception as e:
-        print(f"Warning: Failed to scroll page fully: {e}")
+        print(f"Warning: scroll failed: {e}")
 
-def process_tables(soup, tables_path):
-    """Extract tables and save as CSV."""
+async def intercept_route(route):
+    if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
+        await route.abort()
+    else:
+        await route.continue_()
+
+# ---------------------------------------------------------------------------
+# Content extraction
+# ---------------------------------------------------------------------------
+
+def extract_main_content(html: str, fallback_soup) -> tuple:
+    """
+    Returns (main_html: str, title: str).
+    Priority: trafilatura → readability-lxml → body fallback.
+    """
+    try:
+        import trafilatura
+        text = trafilatura.extract(html, include_tables=True, include_links=False,
+                                   output_format='html', with_metadata=False)
+        if text and len(BeautifulSoup(text, 'lxml').get_text(strip=True)) >= 50:
+            return text, ""
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    try:
+        doc = Document(html)
+        title = doc.title() or ""
+        summary = doc.summary()
+        if len(BeautifulSoup(summary, 'lxml').get_text(strip=True)) >= 50:
+            return summary, title
+    except Exception:
+        pass
+
+    body = fallback_soup.find('body') or fallback_soup
+    return str(body), ""
+
+def clean_html_structure(soup):
+    for tag in ['nav', 'footer', 'header', 'aside', 'script', 'style', 'noscript', 'iframe']:
+        for match in soup.find_all(tag):
+            match.decompose()
+
+    bad = re.compile(r'menu|nav|footer|sidebar|header|banner|ad|advert|breadcrumb|share|comment', re.I)
+    for tag in soup.find_all(['div', 'ul', 'ol', 'section']):
+        if not hasattr(tag, 'attrs'):
+            continue
+        class_list = tag.attrs.get('class') if tag.attrs else None
+        class_str = " ".join(class_list) if isinstance(class_list, list) else (class_list or "")
+        id_str = tag.attrs.get('id', '') if tag.attrs else ''
+        if bad.search(class_str) or bad.search(id_str):
+            tag.decompose()
+
+    return soup
+
+def convert_to_markdown(html: str) -> str:
+    h = html2text.HTML2Text()
+    h.ignore_links = True
+    h.ignore_images = True
+    h.body_width = 0
+    return h.handle(html)
+
+def table_to_markdown_text(soup) -> str:
+    """Convert all <table> elements in soup to inline markdown text."""
+    parts = []
+    for i, table in enumerate(soup.find_all('table')):
+        try:
+            dfs = pd.read_html(io.StringIO(str(table)))
+            if dfs:
+                parts.append(dfs[0].to_markdown(index=False))
+        except Exception:
+            parts.append(table.get_text(separator=' | ', strip=True))
+        table.decompose()
+    return "\n\n".join(parts)
+
+# ---------------------------------------------------------------------------
+# Table / image processing
+# ---------------------------------------------------------------------------
+
+def process_tables(soup, tables_path: str):
     tables = soup.find_all('table')
     for i, table in enumerate(tables):
         try:
             dfs = pd.read_html(io.StringIO(str(table)))
             if dfs:
-                df = dfs[0]
                 csv_path = os.path.join(tables_path, f"table_{i+1}.csv")
-                df.to_csv(csv_path, index=False, encoding='utf-8-sig')
+                dfs[0].to_csv(csv_path, index=False, encoding='utf-8-sig')
         except Exception as e:
             print(f"Error processing table {i+1}: {e}")
 
-async def process_images(soup, base_url, images_path, session):
-    """Extract image URLs from various sources, download them, and update HTML."""
+async def download_image(session, img_url: str, save_path: str) -> bool:
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Referer': img_url,
+    }
+    for attempt in range(3):
+        try:
+            async with session.get(img_url, headers=headers, timeout=15, ssl=False) as response:
+                if response.status == 200:
+                    content = await response.read()
+                    with open(save_path, 'wb') as f:
+                        f.write(content)
+                    return True
+                elif response.status in [301, 302, 303, 307, 308]:
+                    redirect_url = response.headers.get('Location')
+                    if redirect_url:
+                        if not redirect_url.startswith('http'):
+                            redirect_url = urllib.parse.urljoin(img_url, redirect_url)
+                        img_url = redirect_url
+                        continue
+                else:
+                    print(f"Failed to download {img_url}: HTTP {response.status}")
+                    break
+        except Exception as e:
+            if attempt == 2:
+                print(f"Error downloading {img_url} after 3 attempts: {e}")
+            await asyncio.sleep(backoff_delay(attempt))
+    return False
+
+async def process_images(soup, base_url: str, images_path: str, session):
     download_tasks = []
     image_count = 0
 
-    # Process <img> tags
     for img in soup.find_all('img'):
         src = None
-        # Try a variety of common attributes for lazy-loaded images, prioritizing real image over placeholder
         for attr in ['data-src', 'data-original', 'data-url', 'data-echo', 'data-lazy-src', 'src']:
             val = img.get(attr)
             if val and isinstance(val, str) and val.strip():
@@ -229,39 +438,29 @@ async def process_images(soup, base_url, images_path, session):
             filename = f"image_{image_count}{ext}"
             save_path = os.path.join(images_path, filename)
 
-            # Unify all sources to 'src' pointing to local file
             img['src'] = f"./images/{filename}"
-            # Remove other data attributes to prevent lazy-loaders from overriding it
             for attr in ['data-src', 'data-original', 'data-url', 'data-echo', 'data-lazy-src']:
                 if img.get(attr):
                     del img[attr]
 
             download_tasks.append(download_image(session, img_url, save_path))
 
-    # Process <video> poster attributes
     for video in soup.find_all('video'):
         poster = video.get('poster')
         if poster and isinstance(poster, str) and poster.strip():
             img_url = urllib.parse.urljoin(base_url, poster.strip())
-            if img_url.startswith('data:'):
-                continue
+            if not img_url.startswith('data:'):
+                parsed_img_url = urllib.parse.urlparse(img_url)
+                ext = os.path.splitext(parsed_img_url.path)[1]
+                if not ext or ext.lower() not in ['.jpg', '.jpeg', '.png', '.gif', '.webp']:
+                    ext = '.jpg'
+                image_count += 1
+                filename = f"image_{image_count}{ext}"
+                save_path = os.path.join(images_path, filename)
+                video['poster'] = f"./images/{filename}"
+                download_tasks.append(download_image(session, img_url, save_path))
 
-            parsed_img_url = urllib.parse.urlparse(img_url)
-            ext = os.path.splitext(parsed_img_url.path)[1]
-            if not ext or ext.lower() not in ['.jpg', '.jpeg', '.png', '.gif', '.webp']:
-                ext = '.jpg'
-
-            image_count += 1
-            filename = f"image_{image_count}{ext}"
-            save_path = os.path.join(images_path, filename)
-
-            video['poster'] = f"./images/{filename}"
-            download_tasks.append(download_image(session, img_url, save_path))
-
-    # Process inline background-image styles and custom elements like <xg-poster>
-    import re
     url_pattern = re.compile(r'url\(\s*[\'\"]?(.*?)[\'\"]?\s*\)')
-
     for tag in soup.find_all(style=True):
         style_content = tag['style']
         if 'background' in style_content:
@@ -275,94 +474,24 @@ async def process_images(soup, base_url, images_path, session):
                 ext = os.path.splitext(parsed_img_url.path)[1]
                 if not ext or ext.lower() not in ['.jpg', '.jpeg', '.png', '.gif', '.webp']:
                     ext = '.jpg'
-
                 image_count += 1
                 filename = f"image_{image_count}{ext}"
                 save_path = os.path.join(images_path, filename)
-
-                # Replace the URL in the style attribute
                 new_style = new_style.replace(match, f"./images/{filename}")
                 download_tasks.append(download_image(session, img_url, save_path))
-
-                # If it's a specific poster tag, also insert an img tag so markdown captures it
                 if tag.name in ['xg-poster', 'div', 'span'] and 'poster' in tag.get('class', []):
                     new_img = soup.new_tag('img', src=f"./images/{filename}")
                     tag.append(new_img)
-
             tag['style'] = new_style
 
     if download_tasks:
         await asyncio.gather(*download_tasks)
 
-import re
+# ---------------------------------------------------------------------------
+# File download helpers
+# ---------------------------------------------------------------------------
 
-def extract_publish_info(soup):
-    """Extract publish date, source, and author information."""
-    info_text = []
-
-    # Common text patterns in government websites
-    patterns = [
-        re.compile(r'(?:发布|创建)时间\s*[:：]\s*(\d{4}[-/年]\d{1,2}[-/月]\d{1,2}[日]?[\s\d:]*)'),
-        re.compile(r'来源\s*[:：]\s*([^\s]+)'),
-        re.compile(r'作者\s*[:：]\s*([^\s]+)')
-    ]
-
-    # Check meta tags first
-    meta_date = soup.find('meta', attrs={'name': re.compile(r'pubdate', re.I)})
-    if meta_date and meta_date.get('content'):
-        info_text.append(f"**发布时间:** {meta_date['content']}")
-
-    meta_source = soup.find('meta', attrs={'name': re.compile(r'source', re.I)})
-    if meta_source and meta_source.get('content'):
-        info_text.append(f"**来源:** {meta_source['content']}")
-
-    # Search in text nodes if we don't have them
-    full_text = soup.get_text(separator=' ', strip=True)
-    if not any("发布时间" in t for t in info_text):
-        match = patterns[0].search(full_text)
-        if match:
-            info_text.append(f"**发布时间:** {match.group(1)}")
-
-    if not any("来源" in t for t in info_text):
-        match = patterns[1].search(full_text)
-        if match:
-            info_text.append(f"**来源:** {match.group(1)}")
-
-    match = patterns[2].search(full_text)
-    if match:
-        info_text.append(f"**作者:** {match.group(1)}")
-
-    return "\n".join(info_text)
-
-def clean_html_structure(soup):
-    """Remove boilerplate tags (nav, footer, sidebar) to extract clean core content."""
-    # Tags to remove entirely
-    tags_to_decompose = [
-        'nav', 'footer', 'header', 'aside', 'script', 'style', 'noscript', 'iframe'
-    ]
-    for tag in tags_to_decompose:
-        for match in soup.find_all(tag):
-            match.decompose()
-
-    # Classes/IDs commonly used for non-content wrappers
-    bad_classes_ids = re.compile(r'menu|nav|footer|sidebar|header|banner|ad|advert|breadcrumb|share|comment', re.I)
-
-    for tag in soup.find_all(['div', 'ul', 'ol', 'section']):
-        # Some tags might not have attributes dict if they are malformed or a NavigableString (though find_all filters)
-        if not hasattr(tag, 'attrs'):
-            continue
-
-        class_list = tag.attrs.get('class') if tag.attrs else None
-        class_str = " ".join(class_list) if isinstance(class_list, list) else (class_list if isinstance(class_list, str) else "")
-        id_str = tag.attrs.get('id', '') if tag.attrs else ''
-
-        if bad_classes_ids.search(class_str) or bad_classes_ids.search(id_str):
-            tag.decompose()
-
-    return soup
-
-def get_cookies_for_url(pw_cookies, url):
-    """Filter Playwright cookies for the given URL to avoid cross-origin cookie leaks."""
+def get_cookies_for_url(pw_cookies, url: str) -> dict | None:
     if not pw_cookies:
         return None
     parsed_url = urllib.parse.urlparse(url)
@@ -372,18 +501,18 @@ def get_cookies_for_url(pw_cookies, url):
     valid_cookies = {}
     for cookie in pw_cookies:
         c_domain = cookie['domain']
-        if c_domain == domain or (c_domain.startswith('.') and domain.endswith(c_domain[1:])) or domain == c_domain.lstrip('.'):
+        if (c_domain == domain or
+                (c_domain.startswith('.') and domain.endswith(c_domain[1:])) or
+                domain == c_domain.lstrip('.')):
             valid_cookies[cookie['name']] = cookie['value']
     return valid_cookies if valid_cookies else None
 
-async def download_file(url, save_path, user_agent, cookies=None):
-    """Download arbitrary files (PDF, Word, Excel, etc.) via aiohttp."""
+async def download_file(url: str, save_path: str, user_agent: str, cookies=None) -> bool:
     headers = {
         'User-Agent': user_agent,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Upgrade-Insecure-Requests': '1',
     }
-    # Optional Sec-Fetch headers can be problematic for cross-origin downloads, so we omit them here for broad compatibility.
     for attempt in range(3):
         try:
             connector = aiohttp.TCPConnector(ssl=False)
@@ -395,22 +524,101 @@ async def download_file(url, save_path, user_agent, cookies=None):
                                 f.write(chunk)
                         return True
                     else:
-                        print(f"Download {url} failed with status {response.status}, attempt {attempt+1}")
+                        print(f"Download {url} failed: HTTP {response.status} (attempt {attempt+1})")
         except Exception as e:
-            print(f"Error downloading file {url} (attempt {attempt+1}): {e}")
-            await asyncio.sleep(2) # Backoff before retry
+            print(f"Error downloading {url} (attempt {attempt+1}): {e}")
+            await asyncio.sleep(backoff_delay(attempt))
     return False
 
-def convert_to_markdown(html):
-    """Convert HTML to clean Markdown text."""
-    h = html2text.HTML2Text()
-    h.ignore_links = True
-    h.ignore_images = True
-    h.body_width = 0
-    return h.handle(html)
+async def extract_text_from_pdf(file_path: str) -> str | None:
+    """Extract text from a PDF file using pdfplumber (runs in thread)."""
+    def _extract():
+        try:
+            import pdfplumber
+            with pdfplumber.open(file_path) as pdf:
+                pages = []
+                for page in pdf.pages:
+                    text = page.extract_text()
+                    if text:
+                        pages.append(text)
+            return "\n\n".join(pages) if pages else None
+        except ImportError:
+            print("pdfplumber not installed — PDF text extraction skipped")
+            return None
+        except Exception as e:
+            print(f"PDF extraction error: {e}")
+            return None
+
+    return await asyncio.to_thread(_extract)
+
+async def extract_text_from_docx(file_path: str) -> str | None:
+    """Extract text from .docx (or attempt LibreOffice conversion for .doc)."""
+    def _extract():
+        path = file_path
+        converted = False
+
+        if path.lower().endswith('.doc') and not path.lower().endswith('.docx'):
+            try:
+                import subprocess, tempfile, shutil
+                tmpdir = tempfile.mkdtemp()
+                result = subprocess.run(
+                    ['libreoffice', '--headless', '--convert-to', 'docx', '--outdir', tmpdir, path],
+                    capture_output=True, timeout=60
+                )
+                if result.returncode == 0:
+                    base = os.path.splitext(os.path.basename(path))[0]
+                    converted_path = os.path.join(tmpdir, base + '.docx')
+                    if os.path.exists(converted_path):
+                        path = converted_path
+                        converted = True
+            except Exception as e:
+                print(f".doc conversion warning: {e}")
+
+        try:
+            from docx import Document as DocxDocument
+            doc = DocxDocument(path)
+            paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+            text = "\n\n".join(paragraphs)
+            if converted:
+                import shutil
+                shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+            return text if text else None
+        except ImportError:
+            print("python-docx not installed — Word text extraction skipped")
+            return None
+        except Exception as e:
+            print(f"Docx extraction error: {e}")
+            return None
+
+    return await asyncio.to_thread(_extract)
+
+def save_as_markdown_from_text(text: str, title: str, source_url: str,
+                                page_path: str, publish_info: dict | None = None) -> str:
+    """Write extracted document text as content.md with YAML frontmatter."""
+    header = "---\n"
+    header += f'title: "{title}"\n'
+    header += f'source_url: "{source_url}"\n'
+    if publish_info:
+        if publish_info.get('publish_date'):
+            header += f'publish_date: "{publish_info["publish_date"]}"\n'
+        if publish_info.get('source'):
+            header += f'source: "{publish_info["source"]}"\n'
+        if publish_info.get('author'):
+            header += f'author: "{publish_info["author"]}"\n'
+    header += "---\n\n"
+    header += f"# {title}\n\n"
+
+    content = header + text
+    md_path = os.path.join(page_path, "content.md")
+    with open(md_path, 'w', encoding='utf-8') as f:
+        f.write(content)
+    return content
+
+# ---------------------------------------------------------------------------
+# Pause / stop
+# ---------------------------------------------------------------------------
 
 async def check_pause_stop(task_id: str) -> bool:
-    """Returns True if the task should stop, False otherwise. Handles pausing."""
     events = task_events.get(task_id)
     if not events:
         return False
@@ -421,9 +629,8 @@ async def check_pause_stop(task_id: str) -> bool:
 
     if not events['pause'].is_set():
         await asyncio.to_thread(db_manager.update_task_status, task_id, 'paused')
-        await events['pause'].wait() # Wait until unpaused
+        await events['pause'].wait()
 
-        # Check if stopped while paused
         if events['stop'].is_set():
             await asyncio.to_thread(db_manager.update_task_status, task_id, 'stopped')
             return True
@@ -431,6 +638,10 @@ async def check_pause_stop(task_id: str) -> bool:
         await asyncio.to_thread(db_manager.update_task_status, task_id, 'running')
 
     return False
+
+# ---------------------------------------------------------------------------
+# Browser config
+# ---------------------------------------------------------------------------
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -446,34 +657,45 @@ VIEWPORTS = [
     {"width": 1366, "height": 768},
 ]
 
-async def intercept_route(route):
-    """Intercept and block irrelevant resources to speed up loading and save bandwidth."""
-    if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
-        await route.abort()
-    else:
-        await route.continue_()
+# ---------------------------------------------------------------------------
+# Core URL processor
+# ---------------------------------------------------------------------------
 
-async def process_single_url(task_id: str, current_url: str, start_url: str, base_path: str, browser) -> None:
-    """Processes a single URL within a worker context."""
+async def process_single_url(task_id: str, current_url: str, start_url: str,
+                              base_path: str, browser,
+                              text_only: bool = False,
+                              date_filter: bool = False,
+                              update_mode: bool = False) -> None:
+    """Process one URL: download, extract text, save markdown."""
 
-    # Check if task is paused (will block here if paused) or stopped (returns True)
     if await check_pause_stop(task_id):
         return
 
-    # Check for direct file downloads
+    domain = _get_domain(current_url)
+
+    # Circuit breaker check
+    if check_circuit(domain):
+        print(f"[circuit] Skipping {current_url} — {domain} circuit open")
+        await asyncio.to_thread(db_manager.mark_url_filtered, task_id, current_url, "circuit_open")
+        return
+
+    # Rate limiting
+    await acquire_rate_limit(domain)
+
+    # -----------------------------------------------------------------------
+    # Document file branch (PDF / Word / Excel / PPT)
+    # -----------------------------------------------------------------------
     parsed_url = urllib.parse.urlparse(current_url)
     ext = os.path.splitext(parsed_url.path)[1].lower()
+
     if ext in ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx']:
         filename = os.path.basename(parsed_url.path) or f"download_{random.randint(1000,9999)}{ext}"
         safe_title = re.sub(r'[\\/*?:"<>|]', "", filename)
 
-        # Directory creation is I/O blocking, offload to thread, atomic generation to prevent override
-        page_path, _, _ = await asyncio.to_thread(setup_page_directory, base_path, safe_title)
+        page_path, _, _ = await asyncio.to_thread(setup_page_directory, base_path, safe_title, True)
         save_path = os.path.join(page_path, filename)
 
         ua = random.choice(USER_AGENTS)
-
-        # Try to get cookies if browser has existing contexts
         cookie_dict = None
         try:
             if browser.contexts:
@@ -483,19 +705,48 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
             pass
 
         success = await download_file(current_url, save_path, ua, cookies=cookie_dict)
-        if success:
-            await asyncio.to_thread(db_manager.mark_url_scraped, task_id, current_url, filename, page_path, 'article')
-        else:
+        if not success:
+            record_domain_failure(domain)
             await asyncio.to_thread(db_manager.mark_url_failed, task_id, current_url, "File download failed")
+            return
+
+        # Convert text-extractable formats to markdown
+        extracted_text = None
+        if ext == '.pdf':
+            extracted_text = await extract_text_from_pdf(save_path)
+        elif ext in ['.doc', '.docx']:
+            extracted_text = await extract_text_from_docx(save_path)
+
+        if extracted_text:
+            content = save_as_markdown_from_text(extracted_text, filename, current_url, page_path)
+            # Remove binary file after successful text extraction
+            try:
+                os.remove(save_path)
+            except Exception:
+                pass
+            content_hash = compute_content_hash(content)
+            record_domain_success(domain)
+            await asyncio.to_thread(
+                db_manager.mark_url_scraped, task_id, current_url, filename, page_path, 'article',
+                content_hash
+            )
+        else:
+            # Keep binary for non-text-extractable formats
+            record_domain_success(domain)
+            await asyncio.to_thread(
+                db_manager.mark_url_scraped, task_id, current_url, filename, page_path, 'article'
+            )
         return
 
+    # -----------------------------------------------------------------------
     # Normal HTML processing
+    # -----------------------------------------------------------------------
     context = None
     page = None
     try:
         ua = random.choice(USER_AGENTS)
         vp = random.choice(VIEWPORTS)
-        # Check if browser already has a warmed-up shared context
+
         if browser.contexts:
             context = browser.contexts[0]
         else:
@@ -506,40 +757,31 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
             )
 
         page = await context.new_page()
-
-        # Apply stealth
         await Stealth().apply_stealth_async(page)
-
-        # Intercept and block unnecessary resources
         await page.route("**/*", intercept_route)
 
-        # Use domcontentloaded to ensure SPA and dynamic frameworks generate the DOM
-        # Implement retry logic for Playwright page loading (handles transient network errors/timeouts)
         for attempt in range(3):
             try:
                 await page.goto(current_url, wait_until="domcontentloaded", timeout=60000)
                 await page.wait_for_selector('body', state='attached', timeout=30000)
-
-                # Let asyncio natively handle CancellationError if stopped during sleep,
-                # but we can check pause state just in case it was paused immediately after loading.
                 if await check_pause_stop(task_id):
                     return
                 await page.wait_for_timeout(3000)
-                break  # Success, exit retry loop
+                break
             except asyncio.CancelledError:
                 raise
             except Exception as goto_e:
-                print(f"Warning: page.goto error for {current_url} (attempt {attempt+1}): {goto_e}")
+                print(f"Warning: goto error for {current_url} (attempt {attempt+1}): {goto_e}")
                 if attempt == 2:
-                    print(f"Attempting to proceed with loaded content after {attempt+1} failures.")
+                    record_domain_failure(domain)
+                    print(f"Proceeding with loaded content after {attempt+1} failures.")
                 else:
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(backoff_delay(attempt))
 
         await scroll_page(page)
         html_content = await page.content()
 
-        # Ensure we have the root boundary prefix. If it's the start URL, calculate and save it.
-        # If it's a child worker picking up a task after a restart, try to load it from the DB.
+        # Determine crawl boundary
         dynamic_root = task_root_prefixes.get(task_id)
         if not dynamic_root:
             task_data = await asyncio.to_thread(db_manager.get_task, task_id)
@@ -552,149 +794,178 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
             task_root_prefixes[task_id] = dynamic_root
             await asyncio.to_thread(db_manager.update_task_dynamic_root, task_id, dynamic_root)
 
-        # Extract new links under the determined generic root boundary
         new_links = get_sub_domain_links(html_content, current_url, start_url, dynamic_root)
         if new_links:
             await asyncio.to_thread(db_manager.add_discovered_urls, task_id, current_url, new_links)
 
-        # Extract robust content
         full_soup = BeautifulSoup(html_content, 'lxml')
 
-        # 1. Try to get title from document or fallback to <title> tag
+        # Extract title
         title = full_soup.title.string if full_soup.title and full_soup.title.string else "Untitled Page"
-        # Directory creation is I/O blocking, offload to thread
-        page_path, tables_path, images_path = await asyncio.to_thread(setup_page_directory, base_path, title)
 
-        # Process images on the ENTIRE page FIRST to mutate src tags to local relative paths
-        body_soup = full_soup.find('body') or full_soup
-
-        # Sync cookies from Playwright to aiohttp (wait to filter per image inside process_images)
-        pw_cookies = await context.cookies()
-
-        connector = aiohttp.TCPConnector(ssl=False)
-        headers = {'User-Agent': ua}
-        async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
-            # We pass pw_cookies to process_images to filter cookies per image URL
-            session._pw_cookies = pw_cookies
-            await process_images(body_soup, current_url, images_path, session)
-
-        # Extract publish info BEFORE structural cleaning
+        # === DATE FILTER (must happen before creating directories) ===
         publish_info = extract_publish_info(full_soup)
 
-        # Now create a cleaned copy from the mutated full_soup (so local image src is preserved)
-        try:
-            cleaned_soup = clean_html_structure(BeautifulSoup(str(full_soup), 'lxml'))
-            cleaned_html = str(cleaned_soup)
+        if date_filter and not is_within_date_window(publish_info.get('publish_date'), years=3):
+            print(f"[date-filter] Skipping {current_url} — date: {publish_info.get('publish_date')}")
+            await asyncio.to_thread(
+                db_manager.mark_url_filtered, task_id, current_url,
+                f"date_out_of_window:{publish_info.get('publish_date')}"
+            )
+            return
 
-            doc = Document(cleaned_html)
-            title = doc.title() or title
-            main_html = doc.summary()
-            main_soup = BeautifulSoup(main_html, 'lxml')
+        # Create page directory
+        page_path, tables_path, images_path = await asyncio.to_thread(
+            setup_page_directory, base_path, title, text_only
+        )
 
-            if len(main_soup.get_text(strip=True)) < 50:
-                main_soup = cleaned_soup.find('body') or cleaned_soup
-        except Exception:
-            cleaned_soup = clean_html_structure(BeautifulSoup(str(full_soup), 'lxml'))
-            main_soup = cleaned_soup.find('body') or cleaned_soup
+        body_soup = full_soup.find('body') or full_soup
 
-        # 2. Extract tables from the MAIN content area
-        process_tables(main_soup, tables_path)
+        # Process images only when not in text-only mode
+        if not text_only:
+            pw_cookies = await context.cookies()
+            connector = aiohttp.TCPConnector(ssl=False)
+            headers = {'User-Agent': ua}
+            async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
+                session._pw_cookies = pw_cookies
+                await process_images(body_soup, current_url, images_path, session)
 
-        # 3. Generate Markdown from the main_soup (which now contains local image src attributes)
+        # Extract main content via trafilatura → readability → body fallback
+        cleaned_soup = clean_html_structure(BeautifulSoup(str(full_soup), 'lxml'))
+        cleaned_html = str(cleaned_soup)
+        main_html, extracted_title = extract_main_content(cleaned_html, cleaned_soup)
+        if extracted_title:
+            title = extracted_title
+        main_soup = BeautifulSoup(main_html, 'lxml')
+
+        # Tables: CSV in normal mode, inline markdown in text-only mode
+        table_extra = ""
+        if text_only:
+            table_extra = table_to_markdown_text(main_soup)
+        elif tables_path:
+            process_tables(main_soup, tables_path)
+
+        # Generate markdown
         markdown_content = convert_to_markdown(str(main_soup))
+        if table_extra:
+            markdown_content = table_extra + "\n\n" + markdown_content
 
-        # Build YAML Frontmatter for Vector DB / LLM Embedding
-        markdown_header = "---\n"
-        markdown_header += f"title: \"{title}\"\n"
-        markdown_header += f"source_url: \"{current_url}\"\n"
+        # Build YAML frontmatter
+        header = "---\n"
+        header += f'title: "{title}"\n'
+        header += f'source_url: "{current_url}"\n'
+        if publish_info.get('publish_date'):
+            header += f'publish_date: "{publish_info["publish_date"]}"\n'
+        if publish_info.get('source'):
+            header += f'source: "{publish_info["source"]}"\n'
+        if publish_info.get('author'):
+            header += f'author: "{publish_info["author"]}"\n'
+        header += "---\n\n"
+        header += f"# {title}\n\n"
 
-        # Parse publish_info to extract YAML fields if present
-        if publish_info:
-            for line in publish_info.split('\n'):
-                if line.startswith("**发布时间:**"):
-                    markdown_header += f"publish_date: \"{line.replace('**发布时间:**', '').strip()}\"\n"
-                elif line.startswith("**来源:**"):
-                    markdown_header += f"source: \"{line.replace('**来源:**', '').strip()}\"\n"
-                elif line.startswith("**作者:**"):
-                    markdown_header += f"author: \"{line.replace('**作者:**', '').strip()}\"\n"
+        markdown_content = header + markdown_content
 
-        markdown_header += "---\n\n"
-        markdown_header += f"# {title}\n\n"
-
-        markdown_content = markdown_header + markdown_content
-
-        # Content heuristic
+        # Content type heuristic
         content_type = 'node'
-        text_blocks = full_soup.find_all(['p', 'div', 'span', 'article', 'section'])
-        for block in text_blocks:
+        for block in full_soup.find_all(['p', 'div', 'span', 'article', 'section']):
             if not hasattr(block, 'attrs'):
                 continue
             temp_block = BeautifulSoup(str(block), 'lxml')
             for a in temp_block.find_all('a'):
                 a.decompose()
-            text_content = temp_block.get_text(strip=True)
-            if len(text_content) > 30:
+            if len(temp_block.get_text(strip=True)) > 30:
                 content_type = 'article'
                 break
+
+        new_hash = compute_content_hash(markdown_content)
+
+        # Iterative update: skip file write if content unchanged
+        if update_mode:
+            old_hash = await asyncio.to_thread(db_manager.get_url_content_hash, task_id, current_url)
+            if old_hash and old_hash == new_hash:
+                print(f"[update] Unchanged: {current_url}")
+                await asyncio.to_thread(
+                    db_manager.mark_url_scraped, task_id, current_url, title, page_path, content_type, new_hash
+                )
+                record_domain_success(domain)
+                return
 
         md_path = os.path.join(page_path, "content.md")
         with open(md_path, 'w', encoding='utf-8') as f:
             f.write(markdown_content)
 
-        await asyncio.to_thread(db_manager.mark_url_scraped, task_id, current_url, title, page_path, content_type)
+        record_domain_success(domain)
+        await asyncio.to_thread(
+            db_manager.mark_url_scraped, task_id, current_url, title, page_path, content_type, new_hash
+        )
 
     except Exception as page_e:
         import traceback
         traceback.print_exc()
         print(f"Error scraping {current_url}: {page_e}")
+        record_domain_failure(domain)
         await asyncio.to_thread(db_manager.mark_url_failed, task_id, current_url, str(page_e))
     finally:
         if page:
             await page.close()
-        if context:
+        if context and not browser.contexts:
             await context.close()
 
-async def worker_task(task_id: str, start_url: str, base_path: str, browser, semaphore: asyncio.Semaphore):
-    """A worker task that runs under a semaphore to limit concurrency."""
+# ---------------------------------------------------------------------------
+# Worker task
+# ---------------------------------------------------------------------------
+
+async def worker_task(task_id: str, start_url: str, base_path: str, browser,
+                      semaphore: asyncio.Semaphore,
+                      text_only: bool = False,
+                      date_filter: bool = False,
+                      update_mode: bool = False):
     async with semaphore:
         try:
             should_stop = await check_pause_stop(task_id)
             if should_stop:
-                return False # Indicate stopping
+                return False
 
             current_url = await asyncio.to_thread(db_manager.get_and_lock_pending_url, task_id)
             if not current_url:
-                return True # Queue empty for now
+                return True
 
-            # Add random delay to simulate human behavior and avoid WAF rate limiting
             delay = random.uniform(1.0, 3.0)
-            # Let asyncio natively handle CancellationErrors during sleep if the stop button is pressed
             await asyncio.sleep(delay)
 
-            await process_single_url(task_id, current_url, start_url, base_path, browser)
+            await process_single_url(
+                task_id, current_url, start_url, base_path, browser,
+                text_only=text_only, date_filter=date_filter, update_mode=update_mode
+            )
             return True
         except asyncio.CancelledError:
-            print(f"Worker task cancelled natively for task {task_id}.")
+            print(f"Worker task cancelled for task {task_id}.")
             raise
         except Exception as e:
             import traceback
             traceback.print_exc()
-            print(f"Worker task crashed unexpectedly: {e}")
-            return True # Don't stop the whole crawl, just this worker cycle
+            print(f"Worker task crashed: {e}")
+            return True
 
-async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
+# ---------------------------------------------------------------------------
+# Crawl worker (main background task)
+# ---------------------------------------------------------------------------
+
+async def crawl_worker(task_id: str, start_url: str, headless: bool = True,
+                       text_only: bool = False, date_filter: bool = False,
+                       update_mode: bool = False):
     """Background manager that schedules concurrent workers."""
 
     init_task_events(task_id)
     await asyncio.to_thread(db_manager.reset_processing_urls, task_id)
 
     base_path, base_domain = setup_base_directory(start_url)
+
+    # Persist stable base_path to DB
     await asyncio.to_thread(db_manager.create_task, task_id, start_url, start_url)
+    await asyncio.to_thread(db_manager.update_task_base_path, task_id, base_path)
 
-    # Strictly limit concurrency to 5 to prevent memory overload and aggressive IP blocks
     semaphore = asyncio.Semaphore(5)
-
-    # Force PLAYWRIGHT_BROWSERS_PATH to 0 here as well so the worker picks it up
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
 
     try:
@@ -704,10 +975,7 @@ async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
                 args=["--disable-blink-features=AutomationControlled"]
             )
 
-            # Session Warm-up Mechanism & Global Context Setup:
-            # Pre-visit the start URL to solve initial WAF challenges and set global cookies
-            # inside a shared context before unleashing high-concurrency workers.
-            print(f"[{task_id}] Initiating session warm-up on {start_url}...")
+            print(f"[{task_id}] Session warm-up on {start_url}...")
             shared_context = await browser.new_context(
                 user_agent=random.choice(USER_AGENTS),
                 viewport=random.choice(VIEWPORTS),
@@ -717,34 +985,29 @@ async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
                 warmup_page = await shared_context.new_page()
                 await Stealth().apply_stealth_async(warmup_page)
                 await warmup_page.route("**/*", intercept_route)
-
-                # We use a shorter timeout for warm-up, and don't fail the whole task if it fails
                 await warmup_page.goto(start_url, wait_until="domcontentloaded", timeout=45000)
                 await scroll_page(warmup_page)
                 await warmup_page.wait_for_timeout(2000)
-                print(f"[{task_id}] Session warm-up completed successfully.")
-                await warmup_page.close() # Close page, but KEEP context alive for workers
+                print(f"[{task_id}] Warm-up completed.")
+                await warmup_page.close()
             except Exception as e:
-                print(f"[{task_id}] Session warm-up encountered an error (continuing anyway): {e}")
+                print(f"[{task_id}] Warm-up error (continuing): {e}")
 
             active_tasks = set()
             while True:
-                # Check global stop/pause
                 should_stop = await check_pause_stop(task_id)
                 if should_stop:
                     break
 
-                # Clean up completed tasks
                 done = {t for t in active_tasks if t.done()}
                 active_tasks.difference_update(done)
 
-                # Check if any completed task signaled to stop or failed
                 stop_signal = False
                 for t in done:
                     if t.cancelled():
                         continue
                     if t.exception() is not None:
-                        print(f"Task exception caught in manager: {t.exception()}")
+                        print(f"Task exception: {t.exception()}")
                         continue
                     if t.result() is False:
                         stop_signal = True
@@ -753,45 +1016,43 @@ async def crawl_worker(task_id: str, start_url: str, headless: bool = True):
                 if stop_signal:
                     break
 
-                # If active count (pending + processing) is 0 and no tasks are running, we are done
                 active_count = await asyncio.to_thread(db_manager.get_active_count, task_id)
                 if active_count == 0 and len(active_tasks) == 0:
                     await asyncio.to_thread(db_manager.update_task_status, task_id, 'completed')
                     break
 
-                # Replenish workers up to the concurrency limit (5)
                 while len(active_tasks) < 5 and active_count > 0:
-                    task = asyncio.create_task(worker_task(task_id, start_url, base_path, browser, semaphore))
+                    task = asyncio.create_task(
+                        worker_task(
+                            task_id, start_url, base_path, browser, semaphore,
+                            text_only=text_only, date_filter=date_filter, update_mode=update_mode
+                        )
+                    )
                     active_tasks.add(task)
-                    active_count -= 1 # Optimistically decrement to avoid over-spawning if DB hasn't caught up
+                    active_count -= 1
 
                 if active_tasks:
-                    # Wait for either a worker to complete OR the global stop event to be triggered
                     stop_event_task = asyncio.create_task(task_events[task_id]['stop'].wait())
                     wait_tasks = list(active_tasks) + [stop_event_task]
 
-                    done, pending = await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_COMPLETED)
+                    done, _ = await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_COMPLETED)
 
-                    # If the stop event was triggered, cancel the stop_event_task to clean up, and break
                     if stop_event_task in done:
                         await asyncio.to_thread(db_manager.update_task_status, task_id, 'stopped')
                         break
                     else:
                         stop_event_task.cancel()
                 else:
-                    # Brief pause if nothing to do but DB says there should be (rare race condition)
                     await asyncio.sleep(1)
 
     except Exception as e:
-        print(f"Crawl fatally failed: {str(e)}")
+        print(f"Crawl fatally failed: {e}")
         await asyncio.to_thread(db_manager.update_task_status, task_id, 'failed')
     finally:
-        # Cancel any remaining active tasks to prevent them from running in the background
         if 'active_tasks' in locals() and active_tasks:
             for t in active_tasks:
                 if not t.done():
                     t.cancel()
-            # Wait briefly for tasks to acknowledge cancellation
             await asyncio.wait(active_tasks, timeout=2.0)
 
         await asyncio.to_thread(db_manager.reset_processing_urls, task_id)

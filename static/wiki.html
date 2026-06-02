@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>LLM Wiki — Knowledge Base</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    background: #0d1117;
+    color: #c9d1d9;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  header {
+    background: #161b22;
+    border-bottom: 1px solid #30363d;
+    padding: 12px 24px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex-shrink: 0;
+  }
+
+  header h1 { font-size: 18px; font-weight: 600; color: #f0f6fc; }
+  header .badge { font-size: 11px; background: #388bfd33; color: #58a6ff; border: 1px solid #388bfd66; border-radius: 12px; padding: 2px 8px; }
+
+  .tabs { display: flex; gap: 4px; margin-left: auto; }
+  .tab-btn {
+    background: none; border: 1px solid transparent; border-radius: 6px;
+    color: #8b949e; cursor: pointer; padding: 6px 14px; font-size: 13px;
+    transition: all .15s;
+  }
+  .tab-btn:hover { color: #c9d1d9; border-color: #30363d; }
+  .tab-btn.active { background: #21262d; color: #f0f6fc; border-color: #30363d; }
+
+  .main { display: flex; flex: 1; overflow: hidden; }
+
+  /* Left panel */
+  .left-panel {
+    width: 260px;
+    flex-shrink: 0;
+    background: #161b22;
+    border-right: 1px solid #30363d;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .panel-section {
+    padding: 12px;
+    border-bottom: 1px solid #30363d;
+  }
+  .panel-section label { font-size: 11px; color: #8b949e; text-transform: uppercase; letter-spacing: .05em; display: block; margin-bottom: 6px; }
+
+  select, input[type=text] {
+    width: 100%; background: #0d1117; border: 1px solid #30363d;
+    border-radius: 6px; color: #c9d1d9; padding: 6px 10px; font-size: 13px;
+    outline: none;
+  }
+  select:focus, input:focus { border-color: #388bfd; }
+
+  .btn {
+    width: 100%; padding: 7px 12px; border: none; border-radius: 6px;
+    cursor: pointer; font-size: 13px; font-weight: 500; transition: opacity .15s;
+    margin-top: 6px;
+  }
+  .btn:hover { opacity: .85; }
+  .btn-primary { background: #238636; color: #fff; }
+  .btn-secondary { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; }
+  .btn-warning { background: #9e6a03; color: #fff; }
+
+  .status-chip {
+    display: inline-block; font-size: 11px; border-radius: 10px; padding: 2px 8px;
+    margin-top: 6px;
+  }
+  .status-chip.ok { background: #16302b; color: #3fb950; }
+  .status-chip.loading { background: #1f2d3d; color: #58a6ff; }
+  .status-chip.error { background: #2d1317; color: #f85149; }
+
+  .page-tree { flex: 1; overflow-y: auto; padding: 8px; }
+  .page-item {
+    padding: 5px 8px; border-radius: 4px; font-size: 12px; cursor: pointer;
+    color: #8b949e; transition: all .1s; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .page-item:hover { background: #21262d; color: #c9d1d9; }
+  .page-item.active { background: #1f6feb33; color: #58a6ff; }
+
+  /* Tab panes */
+  .tab-pane { display: none; flex: 1; flex-direction: column; overflow: hidden; }
+  .tab-pane.active { display: flex; }
+
+  /* Chat pane */
+  #chat-pane { flex-direction: column; }
+
+  .chat-messages { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 16px; }
+
+  .msg { max-width: 780px; }
+  .msg.user { align-self: flex-end; }
+  .msg.assistant { align-self: flex-start; }
+
+  .msg-bubble {
+    padding: 12px 16px; border-radius: 12px; line-height: 1.6; font-size: 14px;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .msg.user .msg-bubble { background: #1f6feb; color: #fff; border-radius: 12px 12px 0 12px; }
+  .msg.assistant .msg-bubble { background: #161b22; border: 1px solid #30363d; border-radius: 12px 12px 12px 0; }
+
+  .msg-meta { font-size: 11px; color: #8b949e; margin-top: 4px; }
+
+  .chat-input-bar {
+    border-top: 1px solid #30363d;
+    padding: 12px 20px;
+    display: flex;
+    gap: 10px;
+    flex-shrink: 0;
+    background: #0d1117;
+  }
+  .chat-input-bar textarea {
+    flex: 1; background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+    color: #c9d1d9; padding: 10px 14px; font-size: 14px; outline: none; resize: none;
+    font-family: inherit; line-height: 1.5; max-height: 120px;
+  }
+  .chat-input-bar textarea:focus { border-color: #388bfd; }
+  .send-btn {
+    background: #238636; border: none; border-radius: 8px; color: #fff;
+    padding: 0 18px; cursor: pointer; font-size: 14px; font-weight: 500;
+    transition: opacity .15s; flex-shrink: 0;
+  }
+  .send-btn:disabled { opacity: .4; cursor: not-allowed; }
+  .send-btn:not(:disabled):hover { opacity: .85; }
+
+  /* Wiki browser pane */
+  #browser-pane { padding: 20px; overflow-y: auto; }
+  #page-content {
+    background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+    padding: 20px; font-size: 14px; line-height: 1.7; max-width: 800px;
+    white-space: pre-wrap; font-family: monospace;
+  }
+  #page-content.empty { color: #8b949e; font-style: italic; font-family: inherit; }
+
+  /* Thinking indicator */
+  .thinking { display: flex; gap: 5px; padding: 4px 0; }
+  .thinking span { width: 7px; height: 7px; border-radius: 50%; background: #58a6ff; animation: bounce .9s infinite; }
+  .thinking span:nth-child(2) { animation-delay: .15s; }
+  .thinking span:nth-child(3) { animation-delay: .3s; }
+  @keyframes bounce { 0%,100% { opacity: .3 } 50% { opacity: 1 } }
+
+  .empty-state { flex: 1; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 8px; color: #8b949e; }
+  .empty-state .icon { font-size: 40px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>LLM Wiki</h1>
+  <span class="badge">Powered by DeepSeek</span>
+  <div class="tabs">
+    <button class="tab-btn active" onclick="switchTab('chat')">Chat</button>
+    <button class="tab-btn" onclick="switchTab('browser')">Wiki Browser</button>
+  </div>
+</header>
+
+<div class="main">
+  <!-- Left panel -->
+  <div class="left-panel">
+    <div class="panel-section">
+      <label>Domain</label>
+      <select id="domain-select" onchange="onDomainChange()">
+        <option value="">All domains</option>
+      </select>
+    </div>
+
+    <div class="panel-section">
+      <label>Operations</label>
+      <button class="btn btn-primary" onclick="runIngest()" id="ingest-btn">Ingest New Docs</button>
+      <button class="btn btn-warning" onclick="runLint()" id="lint-btn">Lint Wiki</button>
+      <div id="op-status"></div>
+    </div>
+
+    <div class="panel-section">
+      <label>Wiki Stats</label>
+      <div id="wiki-stats" style="font-size:12px;color:#8b949e;">Select a domain</div>
+    </div>
+
+    <div class="page-tree" id="page-tree">
+      <div style="font-size:12px;color:#8b949e;padding:4px 8px;">Wiki pages appear here</div>
+    </div>
+  </div>
+
+  <!-- Chat pane -->
+  <div class="tab-pane active" id="chat-pane">
+    <div class="chat-messages" id="chat-messages">
+      <div class="empty-state">
+        <div class="icon">📚</div>
+        <div>Ask anything about your knowledge base</div>
+        <div style="font-size:12px;">Select a domain and start chatting</div>
+      </div>
+    </div>
+    <div class="chat-input-bar">
+      <textarea id="question-input" rows="2" placeholder="Ask a question about your knowledge base... (Enter to send, Shift+Enter for newline)"
+        onkeydown="onInputKeydown(event)"></textarea>
+      <button class="send-btn" id="send-btn" onclick="sendQuery()">Send</button>
+    </div>
+  </div>
+
+  <!-- Wiki browser pane -->
+  <div class="tab-pane" id="browser-pane">
+    <div id="page-content" class="empty">Select a page from the left panel to read it.</div>
+  </div>
+</div>
+
+<script>
+let currentDomain = '';
+let isLoading = false;
+let chatHistory = JSON.parse(sessionStorage.getItem('wiki_chat') || '[]');
+
+// -------------------------
+// Initialisation
+// -------------------------
+
+async function init() {
+  await loadDomains();
+  renderChatHistory();
+}
+
+async function loadDomains() {
+  try {
+    const r = await fetch('/api/wiki/domains');
+    const data = await r.json();
+    const sel = document.getElementById('domain-select');
+    sel.innerHTML = '<option value="">All domains</option>';
+    for (const d of data.domains) {
+      const opt = document.createElement('option');
+      opt.value = d; opt.textContent = d;
+      sel.appendChild(opt);
+    }
+  } catch(e) { console.error('loadDomains', e); }
+}
+
+async function onDomainChange() {
+  currentDomain = document.getElementById('domain-select').value;
+  if (currentDomain) {
+    await loadStats(currentDomain);
+    await loadPageTree(currentDomain);
+  } else {
+    document.getElementById('wiki-stats').textContent = 'Select a domain';
+    document.getElementById('page-tree').innerHTML =
+      '<div style="font-size:12px;color:#8b949e;padding:4px 8px;">Wiki pages appear here</div>';
+  }
+}
+
+async function loadStats(domain) {
+  try {
+    const r = await fetch(`/api/wiki/status/${domain}`);
+    const d = await r.json();
+    const el = document.getElementById('wiki-stats');
+    if (!d.exists) {
+      el.innerHTML = '<span style="color:#f85149">No wiki yet — run Ingest</span>';
+    } else {
+      el.innerHTML = `<b>${d.page_count}</b> pages<br><span style="color:#8b949e;font-size:11px">${d.last_operation || 'No operations yet'}</span>`;
+    }
+  } catch(e) { console.error('loadStats', e); }
+}
+
+async function loadPageTree(domain) {
+  try {
+    const r = await fetch(`/api/wiki/pages/${domain}`);
+    const d = await r.json();
+    const tree = document.getElementById('page-tree');
+    tree.innerHTML = '';
+    if (!d.pages.length) {
+      tree.innerHTML = '<div style="font-size:12px;color:#8b949e;padding:4px 8px;">No pages yet</div>';
+      return;
+    }
+    for (const page of d.pages) {
+      const div = document.createElement('div');
+      div.className = 'page-item';
+      div.textContent = page;
+      div.title = page;
+      div.onclick = () => openPage(domain, page, div);
+      tree.appendChild(div);
+    }
+  } catch(e) { console.error('loadPageTree', e); }
+}
+
+// -------------------------
+// Wiki browser
+// -------------------------
+
+async function openPage(domain, path, el) {
+  document.querySelectorAll('.page-item').forEach(e => e.classList.remove('active'));
+  el.classList.add('active');
+  switchTab('browser');
+
+  const content = document.getElementById('page-content');
+  content.textContent = 'Loading...';
+  content.classList.remove('empty');
+
+  try {
+    const r = await fetch(`/api/wiki/page/${domain}/${encodeURIComponent(path)}`);
+    const d = await r.json();
+    content.textContent = d.content;
+  } catch(e) {
+    content.textContent = `Error loading page: ${e}`;
+  }
+}
+
+// -------------------------
+// Chat
+// -------------------------
+
+function renderChatHistory() {
+  const container = document.getElementById('chat-messages');
+  if (!chatHistory.length) return;
+  container.innerHTML = '';
+  for (const msg of chatHistory) {
+    appendMessage(msg.role, msg.content, false);
+  }
+}
+
+function appendMessage(role, content, save = true) {
+  const container = document.getElementById('chat-messages');
+  // Remove empty state
+  const empty = container.querySelector('.empty-state');
+  if (empty) empty.remove();
+
+  const div = document.createElement('div');
+  div.className = `msg ${role}`;
+
+  const bubble = document.createElement('div');
+  bubble.className = 'msg-bubble';
+  bubble.textContent = content;
+
+  div.appendChild(bubble);
+  container.appendChild(div);
+  container.scrollTop = container.scrollHeight;
+
+  if (save) {
+    chatHistory.push({ role, content });
+    sessionStorage.setItem('wiki_chat', JSON.stringify(chatHistory.slice(-50)));
+  }
+
+  return bubble;
+}
+
+function appendThinking() {
+  const container = document.getElementById('chat-messages');
+  const div = document.createElement('div');
+  div.className = 'msg assistant';
+  div.id = 'thinking-msg';
+  div.innerHTML = '<div class="msg-bubble"><div class="thinking"><span></span><span></span><span></span></div></div>';
+  container.appendChild(div);
+  container.scrollTop = container.scrollHeight;
+  return div;
+}
+
+async function sendQuery() {
+  const input = document.getElementById('question-input');
+  const question = input.value.trim();
+  if (!question || isLoading) return;
+
+  input.value = '';
+  input.style.height = 'auto';
+  isLoading = true;
+  document.getElementById('send-btn').disabled = true;
+
+  appendMessage('user', question);
+  const thinking = appendThinking();
+
+  try {
+    const payload = { question, stream: true };
+    if (currentDomain) payload.domain = currentDomain;
+
+    const response = await fetch('/api/wiki/query', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+      const err = await response.json();
+      throw new Error(err.detail || response.statusText);
+    }
+
+    thinking.remove();
+
+    // Create answer bubble
+    const answerDiv = document.createElement('div');
+    answerDiv.className = 'msg assistant';
+    const bubble = document.createElement('div');
+    bubble.className = 'msg-bubble';
+    answerDiv.appendChild(bubble);
+    document.getElementById('chat-messages').appendChild(answerDiv);
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let fullText = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const text = decoder.decode(value, { stream: true });
+      const lines = text.split('\n');
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const data = line.slice(6);
+        if (data === '[DONE]') break;
+        fullText += data;
+        bubble.textContent = fullText;
+        document.getElementById('chat-messages').scrollTop = 999999;
+      }
+    }
+
+    chatHistory.push({ role: 'assistant', content: fullText });
+    sessionStorage.setItem('wiki_chat', JSON.stringify(chatHistory.slice(-50)));
+
+  } catch(e) {
+    thinking.remove();
+    appendMessage('assistant', `Error: ${e.message}`, false);
+  } finally {
+    isLoading = false;
+    document.getElementById('send-btn').disabled = false;
+  }
+}
+
+function onInputKeydown(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendQuery();
+  }
+  // Auto-resize textarea
+  const ta = e.target;
+  ta.style.height = 'auto';
+  ta.style.height = Math.min(ta.scrollHeight, 120) + 'px';
+}
+
+// -------------------------
+// Operations
+// -------------------------
+
+async function runIngest() {
+  const domain = document.getElementById('domain-select').value;
+  if (!domain) { alert('Please select a specific domain first'); return; }
+
+  setOpStatus('loading', 'Ingesting...');
+  document.getElementById('ingest-btn').disabled = true;
+
+  try {
+    const r = await fetch('/api/wiki/ingest', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ domain, batch_size: 5 }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || r.statusText);
+    setOpStatus('ok', d.status);
+    pollStatus(domain);
+  } catch(e) {
+    setOpStatus('error', `Error: ${e.message}`);
+  } finally {
+    document.getElementById('ingest-btn').disabled = false;
+  }
+}
+
+async function runLint() {
+  const domain = document.getElementById('domain-select').value;
+  if (!domain) { alert('Please select a specific domain first'); return; }
+
+  setOpStatus('loading', 'Linting...');
+  document.getElementById('lint-btn').disabled = true;
+
+  try {
+    const r = await fetch(`/api/wiki/lint?domain=${encodeURIComponent(domain)}`, { method: 'POST' });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || r.statusText);
+    setOpStatus('ok', d.status);
+    pollStatus(domain);
+  } catch(e) {
+    setOpStatus('error', `Error: ${e.message}`);
+  } finally {
+    document.getElementById('lint-btn').disabled = false;
+  }
+}
+
+function setOpStatus(type, msg) {
+  const el = document.getElementById('op-status');
+  el.innerHTML = `<span class="status-chip ${type}">${msg}</span>`;
+}
+
+async function pollStatus(domain, attempts = 0) {
+  if (attempts > 30) return;
+  await new Promise(r => setTimeout(r, 3000));
+  await loadStats(domain);
+  await loadPageTree(domain);
+  // Continue polling if still running (simple: just reload once more)
+  if (attempts < 5) pollStatus(domain, attempts + 1);
+}
+
+// -------------------------
+// Tabs
+// -------------------------
+
+function switchTab(name) {
+  document.querySelectorAll('.tab-btn').forEach((btn, i) => {
+    const names = ['chat', 'browser'];
+    btn.classList.toggle('active', names[i] === name);
+  });
+  document.querySelectorAll('.tab-pane').forEach(pane => {
+    pane.classList.toggle('active', pane.id === name + '-pane');
+  });
+}
+
+// -------------------------
+// Boot
+// -------------------------
+
+init();
+</script>
+</body>
+</html>

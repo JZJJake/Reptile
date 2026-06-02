@@ -4,9 +4,14 @@ playwright
 beautifulsoup4
 html2text
 pandas
+tabulate
 lxml
 aiohttp
 pyinstaller
 jinja2
 readability-lxml
 playwright-stealth
+trafilatura
+pdfplumber
+python-docx
+httpx
