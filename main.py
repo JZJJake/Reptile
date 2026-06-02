@@ -272,9 +272,10 @@ async def wiki_query(req: WikiQueryRequest):
             for mgr in managers:
                 gen = await mgr.query(req.question, stream=True)
                 async for chunk in gen:
-                    yield f"data: {chunk}\n\n"
+                    yield f"data: {json.dumps({'delta': chunk}, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
-        return StreamingResponse(event_stream(), media_type="text/event-stream")
+        return StreamingResponse(event_stream(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
     else:
         parts = []
         for mgr in managers:
@@ -292,6 +293,33 @@ async def wiki_lint(domain: str, api_key: str, background_tasks: BackgroundTasks
     return {"status": "lint started", "domain": domain}
 
 app.include_router(wiki_router)
+
+# ── Direct chat (no wiki required) ───────────────────────────────────────────
+
+class ChatRequest(BaseModel):
+    messages: list[dict]
+    api_key: str
+    stream: bool = True
+
+@app.post("/api/chat")
+async def direct_chat(req: ChatRequest):
+    """Direct DeepSeek chat — works without any pre-built wiki."""
+    from wiki.deepseek_client import chat_completion
+
+    if req.stream:
+        async def event_stream():
+            gen = await chat_completion(req.messages, stream=True, api_key=req.api_key)
+            async for chunk in gen:
+                yield f"data: {json.dumps({'delta': chunk}, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+    else:
+        response = await chat_completion(req.messages, stream=False, api_key=req.api_key)
+        return {"answer": response}
 
 # ── Playwright install ────────────────────────────────────────────────────────
 

@@ -87,13 +87,13 @@ class WikiManager:
         return set(re.findall(r'ingest:.*?source=([^\s|]+)', text))
 
     def _get_unprocessed_sources(self) -> list[Path]:
-        """Source content.md files not yet ingested."""
+        """Source .md files not yet ingested (flat scraped_data/{domain}/*.md)."""
         if not self.raw_path.is_dir():
             return []
         ingested = self._get_ingested_sources()
         sources = []
-        for md_file in sorted(self.raw_path.rglob("content.md")):
-            key = str(md_file.relative_to(self.raw_path))
+        for md_file in sorted(self.raw_path.glob("*.md")):
+            key = md_file.name
             if key not in ingested:
                 sources.append(md_file)
         return sources
@@ -184,9 +184,9 @@ class WikiManager:
                 total_docs += len(batch)
                 batches += 1
 
-                # Log processed source filenames
+                # Log processed source filenames (flat: just the filename)
                 source_keys = "|".join(
-                    f"source={sf.relative_to(self.raw_path)}" for sf in batch
+                    f"source={sf.name}" for sf in batch
                 )
                 await asyncio.to_thread(
                     self.append_log, "ingest",
