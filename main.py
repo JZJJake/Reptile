@@ -211,24 +211,71 @@ class WikiQueryRequest(BaseModel):
     api_key: str
     stream: bool = True
 
+def _wiki_queue_id(domain: str) -> str:
+    return f"wiki::{domain}"
+
 @wiki_router.post("/build")
 async def wiki_build(req: WikiBuildRequest, background_tasks: BackgroundTasks):
-    """Build or update the wiki for a domain. Only processes new files."""
+    """Build or update the wiki for a domain. Streams progress via /api/wiki/events."""
     # Check no crawl is running
     active = await asyncio.to_thread(db_manager.get_active_tasks)
     if active:
         raise HTTPException(status_code=409,
                             detail="爬虫正在运行，请等待爬取完成后再建设知识库")
 
+    from scraper import push_status, create_log_queue
     from wiki.wiki_manager import WikiManager
 
+    qid = _wiki_queue_id(req.domain)
+    q = create_log_queue(qid)   # create BEFORE returning so SSE can attach
+
     async def run_build():
-        mgr = WikiManager(req.domain, req.api_key)
-        result = await mgr.ingest(batch_size=req.batch_size)
-        db_manager.log_wiki_operation(req.domain, "build", result)
+        def progress(msg, mtype="log"):
+            push_status(qid, msg, mtype)
+        try:
+            push_status(qid, f"开始建设知识库：{req.domain}", "info")
+            mgr = WikiManager(req.domain, req.api_key)
+            result = await mgr.ingest(batch_size=req.batch_size, progress=progress)
+            db_manager.log_wiki_operation(req.domain, "build", result)
+        except Exception as e:
+            push_status(qid, f"知识库建设失败：{e}", "error")
+            db_manager.log_wiki_operation(req.domain, "build_error", {"error": str(e)})
+        finally:
+            # sentinel: tell SSE stream to close
+            try:
+                q.put_nowait(None)
+            except Exception:
+                pass
 
     background_tasks.add_task(run_build)
     return {"status": "building", "domain": req.domain}
+
+@wiki_router.get("/events/{domain}")
+async def wiki_events(domain: str):
+    """SSE stream of wiki-build progress for a domain."""
+    from scraper import task_log_queues, create_log_queue
+    qid = _wiki_queue_id(domain)
+    q = task_log_queues.get(qid) or create_log_queue(qid)
+
+    async def generator():
+        try:
+            while True:
+                try:
+                    item = await asyncio.wait_for(q.get(), timeout=25.0)
+                    if item is None:
+                        yield "data: null\n\n"
+                        break
+                    yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+                except asyncio.TimeoutError:
+                    yield "data: {\"type\":\"ping\"}\n\n"
+        except asyncio.CancelledError:
+            pass
+
+    return StreamingResponse(
+        generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 @wiki_router.get("/status/{domain}")
 async def wiki_status(domain: str):
@@ -305,6 +352,13 @@ class ChatRequest(BaseModel):
 async def direct_chat(req: ChatRequest):
     """Direct DeepSeek chat — works without any pre-built wiki."""
     from wiki.deepseek_client import chat_completion
+    from wiki.schema import GENERAL_CHAT_SYSTEM
+
+    # Ensure a project-scoped system prompt so replies stay focused.
+    messages = req.messages or []
+    if not messages or messages[0].get("role") != "system":
+        messages = [{"role": "system", "content": GENERAL_CHAT_SYSTEM}] + messages
+    req.messages = messages
 
     if req.stream:
         async def event_stream():

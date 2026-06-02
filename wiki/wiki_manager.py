@@ -141,25 +141,43 @@ class WikiManager:
     # ------------------------------------------------------------------
 
     async def ingest(self, source_files: Optional[list[str]] = None,
-                     batch_size: int = 5) -> dict:
+                     batch_size: int = 5, progress=None) -> dict:
         """
         Process unprocessed crawled docs in batches.
+        `progress(msg, type)` is an optional callback for live status reporting.
         Returns stats dict: {pages_created, pages_updated, docs_processed, batches}.
         """
+        def report(msg, mtype="log"):
+            if progress:
+                try:
+                    progress(msg, mtype)
+                except Exception:
+                    pass
+
         if source_files:
             sources = [self.raw_path / sf for sf in source_files]
         else:
             sources = await asyncio.to_thread(self._get_unprocessed_sources)
 
         if not sources:
-            return {"pages_created": 0, "pages_updated": 0, "docs_processed": 0, "batches": 0}
+            report(f"未发现待处理的新文档（目录 scraped_data/{self.domain}/ 为空或已全部入库）", "warn")
+            return {"pages_created": 0, "pages_updated": 0, "docs_processed": 0,
+                    "batches": 0, "no_sources": True}
+
+        total = len(sources)
+        n_batches = (total + batch_size - 1) // batch_size
+        report(f"发现 {total} 篇待处理文档，分 {n_batches} 个批次提交给 DeepSeek 整合", "info")
 
         total_created = total_updated = total_docs = batches = 0
 
         for i in range(0, len(sources), batch_size):
             batch = sources[i: i + batch_size]
+            batch_no = i // batch_size + 1
+            report(f"批次 {batch_no}/{n_batches}：正在读取 {len(batch)} 篇文档...", "log")
+
             docs_text = await asyncio.to_thread(self._read_source_docs, batch)
             if not docs_text:
+                report(f"批次 {batch_no}：文档内容为空，跳过", "warn")
                 continue
 
             index_content = await asyncio.to_thread(self.read_index)
@@ -174,6 +192,7 @@ class WikiManager:
             ]
 
             try:
+                report(f"批次 {batch_no}/{n_batches}：调用 DeepSeek 分析整合中...", "info")
                 response = await deepseek_client.chat_completion(
                     messages, model=self.model, stream=False, api_key=self.api_key
                 )
@@ -193,10 +212,13 @@ class WikiManager:
                     f"batch={batches} docs={len(batch)} pages_created={created} pages_updated={updated} {source_keys}"
                 )
 
+                report(f"批次 {batch_no}/{n_batches} 完成：新建 {created} 页 / 更新 {updated} 页", "success")
                 print(f"[wiki/{self.domain}] Batch {batches}: {len(batch)} docs → {created} created, {updated} updated")
             except Exception as e:
-                print(f"[wiki/{self.domain}] Ingest batch {i // batch_size + 1} error: {e}")
+                report(f"批次 {batch_no} 出错：{e}", "error")
+                print(f"[wiki/{self.domain}] Ingest batch {batch_no} error: {e}")
 
+        report(f"知识库建设完成：共处理 {total_docs} 篇文档，新建 {total_created} 页 / 更新 {total_updated} 页", "done")
         return {
             "pages_created": total_created,
             "pages_updated": total_updated,
