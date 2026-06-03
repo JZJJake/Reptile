@@ -678,14 +678,26 @@ function setStatus(s) {
 }
 
 // ── Wiki build ─────────────────────────────────────────────────────────────────
+let wikiEvtSrc = null;
+
 async function buildWiki() {
   const domain = document.getElementById('wiki-sel').value;
   if (!domain) return;
   const btn = document.getElementById('btn-wiki');
   const statusEl = document.getElementById('wiki-status');
   btn.disabled = true;
-  statusEl.textContent = '⏳ 正在建设知识库，请耐心等待...';
+  statusEl.textContent = '⏳ 正在启动知识库建设...';
   statusEl.style.color = 'var(--orange)';
+
+  // Surface progress in the log tab so the user can watch it live.
+  switchTab('log');
+  clearLog();
+  document.getElementById('log-lbl').innerHTML = `知识库建设: <b>${esc(domain)}</b>`;
+  setStatus('analyzing');
+
+  // Attach SSE BEFORE firing the build so we don't miss early events.
+  subscribeWikiEvents(domain, statusEl, btn);
+
   try {
     const r = await fetch('/api/wiki/build', {
       method: 'POST',
@@ -694,33 +706,71 @@ async function buildWiki() {
     });
     const d = await r.json();
     if (!r.ok) {
+      if (wikiEvtSrc) { wikiEvtSrc.close(); wikiEvtSrc = null; }
       statusEl.textContent = `❌ ${d.detail || '建设失败'}`;
       statusEl.style.color = 'var(--red)';
+      appendLog('', d.detail || '建设失败', 'error');
+      setStatus('stopped');
       btn.disabled = false;
     } else {
-      statusEl.textContent = `✅ 知识库建设已启动 (${domain})`;
-      statusEl.style.color = 'var(--green)';
-      pollWikiStatus(domain, statusEl);
+      statusEl.textContent = `⏳ 知识库建设进行中 (${domain})...`;
+      statusEl.style.color = 'var(--orange)';
     }
   } catch(e) {
+    if (wikiEvtSrc) { wikiEvtSrc.close(); wikiEvtSrc = null; }
     statusEl.textContent = `网络错误: ${e.message}`;
     statusEl.style.color = 'var(--red)';
+    setStatus('stopped');
     btn.disabled = false;
   }
 }
 
-async function pollWikiStatus(domain, el, n=0) {
-  if (n > 30) { onWikiSelChange(); return; }
-  await sleep(6000);
+function subscribeWikiEvents(domain, statusEl, btn) {
+  if (wikiEvtSrc) wikiEvtSrc.close();
+  wikiEvtSrc = new EventSource(`/api/wiki/events/${encodeURIComponent(domain)}`);
+
+  wikiEvtSrc.onmessage = (e) => {
+    if (!e.data || e.data === 'null') {
+      // build finished
+      wikiEvtSrc.close(); wikiEvtSrc = null;
+      setStatus('done');
+      btn.disabled = !document.getElementById('wiki-sel').value || isRunning;
+      refreshWikiStatus(domain, statusEl);
+      loadDomains();
+      return;
+    }
+    try {
+      const item = JSON.parse(e.data);
+      if (item.type === 'ping') return;
+      appendLog(item.ts, item.msg, item.type);
+      if (item.type === 'done') {
+        statusEl.textContent = `✅ ${item.msg}`;
+        statusEl.style.color = 'var(--green)';
+      } else if (item.type === 'error') {
+        statusEl.textContent = `❌ ${item.msg}`;
+        statusEl.style.color = 'var(--red)';
+      } else if (item.type === 'warn') {
+        statusEl.textContent = `⚠ ${item.msg}`;
+        statusEl.style.color = 'var(--orange)';
+      }
+    } catch(_) {}
+  };
+
+  wikiEvtSrc.onerror = () => {
+    if (wikiEvtSrc) { wikiEvtSrc.close(); wikiEvtSrc = null; }
+    btn.disabled = !document.getElementById('wiki-sel').value || isRunning;
+    refreshWikiStatus(domain, statusEl);
+  };
+}
+
+async function refreshWikiStatus(domain, el) {
   try {
     const d = await (await fetch(`/api/wiki/status/${domain}`)).json();
     if (d.exists && d.page_count > 0) {
       el.textContent = `✅ 知识库已建设 ${d.page_count} 个页面`;
       el.style.color = 'var(--green)';
-      onWikiSelChange(); loadDomains(); return;
     }
   } catch(_) {}
-  pollWikiStatus(domain, el, n+1);
 }
 
 // ── Chat ───────────────────────────────────────────────────────────────────────
@@ -769,14 +819,11 @@ async function sendChat() {
 }
 
 async function streamDirect(typingId) {
-  const messages = [
-    { role: 'system', content: '你是一个专业的AI知识助手，由DeepSeek驱动。请用中文清晰、准确、详细地回答问题。' },
-    ...chatHistory,
-  ];
+  // System prompt is injected server-side (GENERAL_CHAT_SYSTEM) so replies stay focused.
   const resp = await fetch('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ messages, api_key: API_KEY, stream: true }),
+    body: JSON.stringify({ messages: chatHistory, api_key: API_KEY, stream: true }),
   });
   if (!resp.ok) throw new Error((await resp.json().catch(()=>({}))).detail || '请求失败');
   await consumeStream(resp, typingId);
