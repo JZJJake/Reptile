@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Reptile — 智能知识库</title>
+<script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -430,6 +431,57 @@ input:focus, select:focus { border-color: var(--accent); }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: #484f58; }
+
+/* ── Knowledge Graph pane ── */
+.graph-toolbar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 7px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface); flex-shrink: 0;
+}
+.graph-toolbar select { font-size: 12px; padding: 4px 7px; max-width: 200px; }
+.graph-stats  { font-size: 11.5px; color: var(--muted); flex: 1; }
+.graph-auto-row { display: flex; align-items: center; gap: 5px;
+  font-size: 11.5px; color: var(--muted); }
+.graph-auto-row input[type=checkbox] { width: auto; accent-color: var(--accent); }
+.graph-canvas {
+  flex: 1; position: relative; min-height: 0;
+  background: #080c11; overflow: hidden;
+}
+#wiki-graph-svg { display: block; }
+.graph-empty {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: 8px;
+  color: var(--muted); font-size: 14px; text-align: center;
+  pointer-events: none;
+}
+.graph-empty .icon { font-size: 40px; }
+.graph-tooltip {
+  position: absolute; display: none;
+  background: #1c2128; border: 1px solid var(--border); border-radius: 6px;
+  padding: 7px 10px; font-size: 12px; color: var(--text);
+  pointer-events: none; z-index: 20; max-width: 220px; line-height: 1.5;
+  box-shadow: 0 4px 12px rgba(0,0,0,.5);
+}
+.graph-legend {
+  display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+  padding: 6px 14px; border-top: 1px solid var(--border);
+  background: var(--surface); flex-shrink: 0; font-size: 11px; color: var(--muted);
+}
+.legend-dot {
+  display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+  margin-right: 3px; vertical-align: middle;
+}
+/* Save-to-wiki button below chat bubbles */
+.save-wiki-btn {
+  margin-top: 5px; margin-left: 40px;
+  background: none; border: 1px solid var(--border); cursor: pointer;
+  color: var(--muted); font-size: 11px; padding: 3px 9px; border-radius: 4px;
+  transition: all .15s;
+}
+.save-wiki-btn:hover { background: #1c3a6b; color: #79c0ff; border-color: #1f6feb; }
+.save-wiki-btn:disabled { opacity: .4; cursor: default; }
 </style>
 </head>
 <body>
@@ -499,8 +551,9 @@ input:focus, select:focus { border-color: var(--accent); }
   <div class="right">
 
     <div class="tab-bar">
-      <div class="tab active" id="tab-log"  onclick="switchTab('log')">状态日志</div>
-      <div class="tab"        id="tab-chat" onclick="switchTab('chat')">知识问答</div>
+      <div class="tab active" id="tab-log"   onclick="switchTab('log')">状态日志</div>
+      <div class="tab"        id="tab-chat"  onclick="switchTab('chat')">知识问答</div>
+      <div class="tab"        id="tab-graph" onclick="switchTab('graph')">🗺 知识图谱</div>
     </div>
 
     <!-- Log pane -->
@@ -542,6 +595,41 @@ input:focus, select:focus { border-color: var(--accent); }
           <button class="send-btn" id="send-btn" onclick="sendChat()">↑</button>
         </div>
         <div class="chat-hint">Enter 发送 · Shift+Enter 换行</div>
+      </div>
+    </div>
+
+    <!-- Graph pane -->
+    <div class="tab-pane" id="pane-graph">
+      <div class="graph-toolbar">
+        <label style="font-size:12px;color:var(--muted);white-space:nowrap">知识库</label>
+        <select id="graph-sel" onchange="onGraphSelChange()">
+          <option value="">— 选择域名 —</option>
+        </select>
+        <span id="graph-stats" class="graph-stats">尚无数据</span>
+        <div class="graph-auto-row">
+          <input type="checkbox" id="graph-auto" onchange="toggleGraphAuto(this.checked)">
+          <label for="graph-auto">实时刷新</label>
+        </div>
+        <button class="btn btn-ghost" onclick="refreshGraph()"
+                style="padding:4px 10px;font-size:11px;flex-shrink:0">↻ 刷新</button>
+      </div>
+      <div class="graph-canvas" id="graph-canvas">
+        <svg id="wiki-graph-svg" width="100%" height="100%"></svg>
+        <div class="graph-empty" id="graph-empty">
+          <div class="icon">🕸️</div>
+          <div>选择知识库域名后显示知识图谱</div>
+          <div style="font-size:12px;color:#484f58;margin-top:4px">先完成知识库建设，图谱将在此实时呈现</div>
+        </div>
+        <div class="graph-tooltip" id="graph-tooltip"></div>
+      </div>
+      <div class="graph-legend" id="graph-legend">
+        <span><span class="legend-dot" style="background:#388bfd"></span>概念</span>
+        <span><span class="legend-dot" style="background:#3fb950"></span>实体</span>
+        <span><span class="legend-dot" style="background:#bc8cff"></span>综合</span>
+        <span><span class="legend-dot" style="background:#ff7b72"></span>关系网</span>
+        <span><span class="legend-dot" style="background:#58a6ff"></span>摘要</span>
+        <span><span class="legend-dot" style="background:#e3b341"></span>目录</span>
+        <span style="color:#484f58">· 节点大小代表关联度，可拖拽/滚轮缩放</span>
       </div>
     </div>
 
@@ -607,10 +695,18 @@ async function reconnectActiveBuild() {
 
 // ── Tabs ───────────────────────────────────────────────────────────────────────
 function switchTab(name) {
-  ['log', 'chat'].forEach(n => {
-    document.getElementById('tab-' + n).classList.toggle('active', n === name);
+  ['log', 'chat', 'graph'].forEach(n => {
+    document.getElementById('tab-'  + n).classList.toggle('active', n === name);
     document.getElementById('pane-' + n).classList.toggle('active', n === name);
   });
+  if (name === 'graph') {
+    // Lazy init + first load when tab is first opened
+    requestAnimationFrame(() => {
+      if (!graphInitialized) initGraphSvg();
+      const domain = document.getElementById('graph-sel').value;
+      if (domain && !graphData.nodes.length) refreshGraph();
+    });
+  }
 }
 
 // ── Domains ────────────────────────────────────────────────────────────────────
@@ -654,6 +750,12 @@ function fillSelects(doms) {
   cs.innerHTML = '<option value="">通用对话 (DeepSeek)</option>' +
     doms.map(d => `<option value="${esc(d.name)}">📚 ${esc(d.name)}</option>`).join('');
   if (cc) cs.value = cc;
+
+  // Graph select
+  const gs = document.getElementById('graph-sel');
+  const gc = gs.value;
+  gs.innerHTML = '<option value="">— 选择域名 —</option>' + opts;
+  if (gc) gs.value = gc;
 
   onWikiSelChange();
   onChatSelChange();
@@ -834,6 +936,11 @@ async function buildWiki() {
   btn.disabled = true;
   btn.textContent = '⏳ 建设中...';
   statusEl.textContent = '⏳ 正在启动知识库建设...';
+  // Auto-sync graph domain and start polling so the graph lights up in real-time
+  const gs = document.getElementById('graph-sel');
+  if (!gs.value) gs.value = domain;
+  document.getElementById('graph-auto').checked = true;
+  startGraphAutoRefresh();
   statusEl.style.color = 'var(--orange)';
 
   // Surface progress in the log tab so the user can watch it live.
@@ -877,6 +984,13 @@ function endWikiBuild(domain, statusEl) {
   const btn = document.getElementById('btn-wiki');
   btn.textContent = '⚙ 开始建设';
   btn.disabled = !document.getElementById('wiki-sel').value || isRunning;
+  // Final graph refresh + stop auto-poll
+  stopGraphAutoRefresh();
+  if (domain) {
+    const gs = document.getElementById('graph-sel');
+    if (!gs.value) gs.value = domain;
+    refreshGraph();
+  }
 }
 
 function subscribeWikiEvents(domain, statusEl) {
@@ -1028,6 +1142,12 @@ async function consumeStream(resp, typingId) {
   bubble.innerHTML = renderMarkdown(full);
   bubble.classList.add('rendered');
   chatHistory.push({ role: 'assistant', content: full });
+  // In wiki mode: show "save to synthesis" button under the reply
+  const wikiDomainNow = document.getElementById('chat-sel').value;
+  if (wikiDomainNow && full.trim()) {
+    const lastUserMsg = [...chatHistory].reverse().find(m => m.role === 'user')?.content || '';
+    addSaveWikiButton(bubble.parentElement, lastUserMsg, full, wikiDomainNow);
+  }
   scrollChat();
 }
 
@@ -1093,6 +1213,217 @@ function renderMarkdown(src) {
   }
   closeLists();
   return out.join('\n').replace(/\n{2,}/g, '\n');
+}
+
+// ── Knowledge Graph ───────────────────────────────────────────────────────────
+
+const GCOLOR = {
+  concepts:  '#388bfd', entities:  '#3fb950', synthesis: '#bc8cff',
+  summaries: '#58a6ff', relations:  '#ff7b72', root:      '#8b949e',
+};
+function gNodeColor(d) {
+  if (d.id === 'relations.md') return GCOLOR.relations;
+  if (d.id === 'index.md')     return '#e3b341';
+  return GCOLOR[d.type] || GCOLOR.root;
+}
+function gNodeR(d) { return Math.max(7, Math.min(28, 7 + (d.degree || 0) * 1.8)); }
+
+let graphInitialized = false;
+let graphSimulation   = null;
+let graphSvgRoot      = null;
+let graphData         = { nodes: [], links: [] };
+let graphAutoTimer    = null;
+
+function initGraphSvg() {
+  const container = document.getElementById('graph-canvas');
+  const w = container.clientWidth  || 900;
+  const h = container.clientHeight || 560;
+
+  const svg = d3.select('#wiki-graph-svg').attr('width', w).attr('height', h);
+  svg.selectAll('*').remove();
+
+  // Arrow marker for relation edges
+  svg.append('defs').append('marker')
+    .attr('id', 'g-arrow').attr('viewBox', '0 -4 8 8')
+    .attr('refX', 16).attr('refY', 0)
+    .attr('markerWidth', 5).attr('markerHeight', 5).attr('orient', 'auto')
+    .append('path').attr('d', 'M0,-4L8,0L0,4').attr('fill', '#555');
+
+  const g = svg.append('g').attr('class', 'graph-root');
+  g.append('g').attr('class', 'g-links');
+  g.append('g').attr('class', 'g-nodes');
+
+  // Zoom / pan
+  svg.call(
+    d3.zoom().scaleExtent([0.15, 5])
+      .on('zoom', e => g.attr('transform', e.transform))
+  );
+  // Double-click to reset zoom
+  svg.on('dblclick.zoom', () => {
+    svg.transition().duration(500)
+       .call(d3.zoom().transform, d3.zoomIdentity);
+  });
+
+  graphSimulation = d3.forceSimulation()
+    .force('link',      d3.forceLink().id(d => d.id).distance(90).strength(0.45))
+    .force('charge',    d3.forceManyBody().strength(-280).distanceMax(360))
+    .force('center',    d3.forceCenter(w / 2, h / 2))
+    .force('x',         d3.forceX(w / 2).strength(0.035))
+    .force('y',         d3.forceY(h / 2).strength(0.035))
+    .force('collision', d3.forceCollide().radius(d => gNodeR(d) + 7))
+    .alphaDecay(0.018);
+
+  graphSvgRoot    = svg;
+  graphInitialized = true;
+}
+
+function updateGraphVis(data) {
+  if (!graphInitialized) return;
+  const g      = graphSvgRoot.select('.graph-root');
+  const tip    = document.getElementById('graph-tooltip');
+  const canvas = document.getElementById('graph-canvas');
+
+  // ── links ──
+  const lSel = g.select('.g-links').selectAll('.g-link')
+    .data(data.links, d => `${d.source.id||d.source}~~${d.target.id||d.target}`);
+  lSel.exit().transition().duration(300).attr('opacity', 0).remove();
+  const lEnter = lSel.enter().append('line').attr('class', 'g-link')
+    .attr('stroke', d => d.type === 'citation' ? '#2a3040' : '#4a3a6a')
+    .attr('stroke-width', d => d.type === 'citation' ? 1 : 1.6)
+    .attr('stroke-opacity', 0.8)
+    .attr('marker-end', d => d.type !== 'citation' ? 'url(#g-arrow)' : null);
+  const lAll = lEnter.merge(lSel);
+
+  // ── nodes ──
+  const nSel = g.select('.g-nodes').selectAll('.g-node')
+    .data(data.nodes, d => d.id);
+  nSel.exit().transition().duration(400).attr('opacity', 0).remove();
+
+  const nEnter = nSel.enter().append('g').attr('class', 'g-node')
+    .attr('opacity', 0).style('cursor', 'pointer')
+    .call(d3.drag()
+      .on('start', (e, d) => { if (!e.active) graphSimulation.alphaTarget(0.25).restart(); d.fx = d.x; d.fy = d.y; })
+      .on('drag',  (e, d) => { d.fx = e.x; d.fy = e.y; })
+      .on('end',   (e, d) => { if (!e.active) graphSimulation.alphaTarget(0); d.fx = d.fy = null; }))
+    .on('mouseenter', (e, d) => {
+      tip.style.display = 'block';
+      tip.innerHTML = `<b>${d.name}</b><br><span style="color:var(--muted);font-size:10.5px">${d.type} · ${d.id}</span><br>关联度: ${d.degree}`;
+    })
+    .on('mousemove', e => {
+      const r = canvas.getBoundingClientRect();
+      tip.style.left = (e.clientX - r.left + 14) + 'px';
+      tip.style.top  = (e.clientY - r.top  - 10) + 'px';
+    })
+    .on('mouseleave', () => { tip.style.display = 'none'; })
+    .on('click', (e, d) => {
+      e.stopPropagation();
+      const dom = document.getElementById('graph-sel').value;
+      if (dom) viewWikiPage({ dataset: { wiki: d.name } });
+    });
+
+  // Glow ring for high-degree nodes
+  nEnter.filter(d => d.degree >= 4).append('circle')
+    .attr('r', d => gNodeR(d) + 5)
+    .attr('fill', 'none')
+    .attr('stroke', d => gNodeColor(d))
+    .attr('stroke-width', 1).attr('stroke-opacity', 0.25);
+
+  nEnter.append('circle').attr('class', 'g-circle')
+    .attr('r', d => gNodeR(d))
+    .attr('fill', gNodeColor)
+    .attr('stroke', '#0d1117').attr('stroke-width', 1.5);
+
+  nEnter.append('text')
+    .attr('dy', d => gNodeR(d) + 12).attr('text-anchor', 'middle')
+    .attr('font-size', '9.5px').attr('fill', '#7a828c')
+    .attr('pointer-events', 'none')
+    .text(d => d.name.length > 13 ? d.name.slice(0, 12) + '…' : d.name);
+
+  // Pop-in
+  nEnter.transition().duration(450).attr('opacity', 1);
+  const nAll = nEnter.merge(nSel);
+  // Update radius / color for returning nodes (degree may have changed)
+  nAll.select('.g-circle').attr('r', d => gNodeR(d)).attr('fill', gNodeColor);
+
+  // tick
+  graphSimulation.nodes(data.nodes).on('tick', () => {
+    lAll.attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+        .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+    nAll.attr('transform', d => `translate(${d.x},${d.y})`);
+  });
+  graphSimulation.force('link').links(data.links);
+
+  const newNodes = data.nodes.length !== graphData.nodes.length;
+  graphSimulation.alpha(newNodes ? 0.4 : 0.1).restart();
+
+  document.getElementById('graph-stats').textContent =
+    `${data.nodes.length} 节点 · ${data.links.length} 关系`;
+  document.getElementById('graph-empty').style.display =
+    data.nodes.length ? 'none' : 'flex';
+}
+
+async function refreshGraph() {
+  const domain = document.getElementById('graph-sel').value;
+  if (!domain) return;
+  try {
+    const resp = await fetch(`/api/wiki/graph/${encodeURIComponent(domain)}`);
+    if (!resp.ok) return;
+    const data = await resp.json();
+    if (!graphInitialized) initGraphSvg();
+    updateGraphVis(data);
+    graphData = data;
+  } catch(e) { console.error('graph:', e); }
+}
+
+function onGraphSelChange() {
+  graphData = { nodes: [], links: [] };
+  if (!graphInitialized) initGraphSvg();
+  refreshGraph();
+}
+
+function toggleGraphAuto(on) {
+  on ? startGraphAutoRefresh() : stopGraphAutoRefresh();
+}
+function startGraphAutoRefresh() {
+  if (graphAutoTimer) return;
+  graphAutoTimer = setInterval(refreshGraph, 3000);
+}
+function stopGraphAutoRefresh() {
+  if (graphAutoTimer) { clearInterval(graphAutoTimer); graphAutoTimer = null; }
+  document.getElementById('graph-auto').checked = false;
+}
+
+// ── Save Q&A to wiki synthesis ─────────────────────────────────────────────────
+
+function addSaveWikiButton(msgRowEl, question, answer, domain) {
+  if (!msgRowEl) return;
+  const btn = document.createElement('button');
+  btn.className = 'save-wiki-btn';
+  btn.title = '将此问答存入知识库 synthesis 页面（可在图谱中查看）';
+  btn.textContent = '💾 存入知识库';
+  btn.onclick = async () => {
+    btn.disabled = true; btn.textContent = '⏳ 存入中...';
+    const ok = await saveToWiki(question, answer, domain);
+    btn.textContent = ok ? '✅ 已存入知识库' : '❌ 存入失败';
+    if (ok) {
+      // Refresh graph to show new synthesis node
+      const gs = document.getElementById('graph-sel');
+      if (!gs.value) gs.value = domain;
+      setTimeout(refreshGraph, 800);
+    }
+  };
+  msgRowEl.appendChild(btn);
+}
+
+async function saveToWiki(question, answer, domain) {
+  try {
+    const resp = await fetch('/api/wiki/save-synthesis', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ domain, question, answer, api_key: API_KEY }),
+    });
+    return resp.ok;
+  } catch(_) { return false; }
 }
 
 // ── Wiki Viewer ───────────────────────────────────────────────────────────────

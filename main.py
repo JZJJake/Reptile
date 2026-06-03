@@ -347,6 +347,85 @@ async def wiki_query(req: WikiQueryRequest):
             parts.append(answer)
         return {"answer": "\n\n".join(parts)}
 
+@wiki_router.get("/graph/{domain}")
+async def wiki_graph(domain: str):
+    """Return nodes + links for the knowledge graph visualisation."""
+    import re as _re
+    from pathlib import Path as _Path
+    from wiki.wiki_manager import WikiManager
+
+    mgr   = WikiManager(domain, "")
+    pages = [p for p in mgr.list_pages()
+             if not p.startswith("atoms/") and p not in ("log.md",)]
+
+    # ── nodes ──
+    node_map: dict[str, dict] = {}
+    for p in pages:
+        seg   = p.split("/")
+        dtype = seg[0] if len(seg) > 1 else "root"
+        node_map[p] = {
+            "id":     p,
+            "name":   _Path(p).stem.replace("-", " "),
+            "type":   dtype,
+            "degree": 0,
+        }
+
+    # ── links from [[citations]] ──
+    link_set: set[tuple] = set()
+    links: list[dict]    = []
+    cite_re = _re.compile(r'\[\[([^\]]+)\]\]')
+
+    for p in pages:
+        content = mgr.read_page(p) or ""
+        for cite in cite_re.findall(content):
+            slug = _re.sub(r'[^a-z0-9]+', '-', cite.lower()).strip('-')
+            target = next(
+                (tp for tp in node_map
+                 if slug == _Path(tp).stem.lower()
+                 or (len(slug) > 3 and slug in _Path(tp).stem.lower())),
+                None,
+            )
+            if target and target != p and (p, target) not in link_set:
+                link_set.add((p, target))
+                links.append({"source": p, "target": target, "type": "citation"})
+                node_map[p]["degree"]      += 1
+                node_map[target]["degree"] += 1
+
+    # ── explicit relation edges from relations.md ──
+    rel_content = mgr.read_page("relations.md") or ""
+    rel_re      = _re.compile(
+        r'\[\[([^\]]+)\]\]\s*[—\-]+\(([^)]+)\)\s*[—→\-]+\s*\[\[([^\]]+)\]\]'
+    )
+    for m in rel_re.finditer(rel_content):
+        src_name, rel_type, tgt_name = m.group(1), m.group(2), m.group(3)
+        src_slug = _re.sub(r'[^a-z0-9]+', '-', src_name.lower()).strip('-')
+        tgt_slug = _re.sub(r'[^a-z0-9]+', '-', tgt_name.lower()).strip('-')
+        sp = next((tp for tp in node_map if src_slug in _Path(tp).stem.lower()), None)
+        tp = next((tp for tp in node_map if tgt_slug in _Path(tp).stem.lower()), None)
+        if sp and tp and sp != tp and (sp, tp) not in link_set:
+            link_set.add((sp, tp))
+            links.append({"source": sp, "target": tp, "type": rel_type[:20]})
+
+    nodes = list(node_map.values())
+    return {"nodes": nodes, "links": links,
+            "stats": {"total_nodes": len(nodes), "total_links": len(links)}}
+
+
+class SaveSynthesisRequest(BaseModel):
+    domain: str
+    question: str
+    answer: str
+    api_key: str
+
+@wiki_router.post("/save-synthesis")
+async def wiki_save_synthesis(req: SaveSynthesisRequest):
+    """Archive a Q&A answer as a synthesis wiki page."""
+    from wiki.wiki_manager import WikiManager
+    mgr = WikiManager(req.domain, req.api_key)
+    await mgr._save_answer_as_synthesis(req.question, req.answer)
+    return {"status": "saved", "domain": req.domain}
+
+
 @wiki_router.get("/find/{domain}")
 async def wiki_find_page(domain: str, name: str = ""):
     """Find a wiki page by name — searches all subdirectories for a matching stem."""
