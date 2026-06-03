@@ -347,6 +347,22 @@ async def wiki_query(req: WikiQueryRequest):
             parts.append(answer)
         return {"answer": "\n\n".join(parts)}
 
+@wiki_router.get("/find/{domain}")
+async def wiki_find_page(domain: str, name: str = ""):
+    """Find a wiki page by name — searches all subdirectories for a matching stem."""
+    import re as _re
+    from pathlib import Path
+    from wiki.wiki_manager import WikiManager
+    mgr = WikiManager(domain, "")
+    search = _re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')
+    for page_path in mgr.list_pages():
+        stem = Path(page_path).stem.lower()
+        if stem == search or (len(search) > 3 and (search in stem or stem in search)):
+            content = mgr.read_page(page_path)
+            if content:
+                return {"path": page_path, "name": name, "content": content}
+    raise HTTPException(status_code=404, detail=f"未找到页面: {name}")
+
 @wiki_router.post("/lint")
 async def wiki_lint(domain: str, api_key: str, background_tasks: BackgroundTasks):
     from wiki.wiki_manager import WikiManager
@@ -357,6 +373,21 @@ async def wiki_lint(domain: str, api_key: str, background_tasks: BackgroundTasks
     return {"status": "lint started", "domain": domain}
 
 app.include_router(wiki_router)
+
+# ── Raw source file access ────────────────────────────────────────────────────
+
+@app.get("/api/source/{domain}/{filename:path}")
+async def get_source_file(domain: str, filename: str):
+    """Return the raw scraped markdown file for a domain."""
+    from pathlib import Path
+    base = (Path(os.getcwd()) / "scraped_data" / domain).resolve()
+    target = (base / filename).resolve()
+    if not str(target).startswith(str(base)):
+        raise HTTPException(status_code=403, detail="禁止访问")
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="源文件未找到")
+    content = target.read_text(encoding="utf-8")
+    return {"domain": domain, "filename": filename, "content": content}
 
 # ── Direct chat (no wiki required) ───────────────────────────────────────────
 

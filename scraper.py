@@ -157,8 +157,8 @@ def setup_base_directory(start_url: str) -> tuple:
 # ── Date filtering ───────────────────────────────────────────────────────────
 
 _DATE_PATTERNS = [
-    re.compile(r'(\d{4})[-/](\d{1,2})[-/](\d{1,2})'),
-    re.compile(r'(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日?'),
+    re.compile(r'(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})'),   # YYYY-MM-DD / YYYY.MM.DD
+    re.compile(r'(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日?'), # Chinese
 ]
 
 def parse_publish_date(date_str: str):
@@ -187,7 +187,9 @@ def is_within_date_window(date_str, years: int = DATE_WINDOW_YEARS) -> bool:
 # ── Content extraction ───────────────────────────────────────────────────────
 
 _PUBLISH_PATTERNS = [
-    re.compile(r'(?:发布|创建|更新)时间\s*[:：]\s*(\d{4}[-/年]\d{1,2}[-/月]\d{1,2}[日]?[\s\d:]*)'),
+    # Primary: explicit publish/create/update time label with date value
+    re.compile(r'(?:发布|创建|更新|日期)\s*[:：]\s*(\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}[日]?[\s\d:]*)'),
+    # Source / author — stored separately, NOT used as publish date
     re.compile(r'来源\s*[:：]\s*([^\s<>]+)'),
     re.compile(r'作者\s*[:：]\s*([^\s<>]+)'),
 ]
