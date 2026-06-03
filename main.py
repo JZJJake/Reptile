@@ -214,6 +214,14 @@ class WikiQueryRequest(BaseModel):
 def _wiki_queue_id(domain: str) -> str:
     return f"wiki::{domain}"
 
+# Domains currently being built — prevents duplicate/overlapping builds.
+_wiki_building: set = set()
+
+@wiki_router.get("/building")
+async def wiki_building_status():
+    """Return the set of domains currently being built (for UI button gating)."""
+    return {"building": sorted(_wiki_building)}
+
 @wiki_router.post("/build")
 async def wiki_build(req: WikiBuildRequest, background_tasks: BackgroundTasks):
     """Build or update the wiki for a domain. Streams progress via /api/wiki/events."""
@@ -223,11 +231,17 @@ async def wiki_build(req: WikiBuildRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=409,
                             detail="爬虫正在运行，请等待爬取完成后再建设知识库")
 
+    # Guard against duplicate builds of the same domain
+    if req.domain in _wiki_building:
+        raise HTTPException(status_code=409,
+                            detail="该知识库正在建设中，请勿重复点击")
+
     from scraper import push_status, create_log_queue
     from wiki.wiki_manager import WikiManager
 
     qid = _wiki_queue_id(req.domain)
     q = create_log_queue(qid)   # create BEFORE returning so SSE can attach
+    _wiki_building.add(req.domain)
 
     async def run_build():
         def progress(msg, mtype="log"):
@@ -238,9 +252,12 @@ async def wiki_build(req: WikiBuildRequest, background_tasks: BackgroundTasks):
             result = await mgr.ingest(batch_size=req.batch_size, progress=progress)
             db_manager.log_wiki_operation(req.domain, "build", result)
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             push_status(qid, f"知识库建设失败：{e}", "error")
             db_manager.log_wiki_operation(req.domain, "build_error", {"error": str(e)})
         finally:
+            _wiki_building.discard(req.domain)
             # sentinel: tell SSE stream to close
             try:
                 q.put_nowait(None)

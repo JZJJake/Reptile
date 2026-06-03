@@ -95,6 +95,14 @@ def url_to_slug(url: str) -> str:
     hash_suffix = hashlib.md5(url.encode()).hexdigest()[:8]
     return f"{slug}_{hash_suffix}"
 
+_LIST_URL_RE = re.compile(r'/(list|index|column|node)([/_]|$)', re.IGNORECASE)
+
+def is_list_page(url: str) -> bool:
+    """True if the URL looks like a list/index/navigation page (e.g. /News/List/...).
+    These are useful for link discovery but are not knowledge content."""
+    path = urllib.parse.urlparse(url).path
+    return bool(_LIST_URL_RE.search(path))
+
 def compute_content_hash(content: str) -> str:
     return hashlib.md5(content.encode('utf-8')).hexdigest()
 
@@ -476,6 +484,15 @@ async def process_single_url(task_id: str, current_url: str, start_url: str,
             await asyncio.to_thread(
                 db_manager.mark_url_filtered, task_id, current_url,
                 f"date_out_of_window:{date_str}"
+            )
+            return
+
+        # Skip list/navigation pages — keep them for link discovery (already
+        # done above) but don't save them as knowledge content.
+        if is_list_page(current_url):
+            push_status(task_id, f"↩ 跳过 (列表/导航页): {current_url}", "info")
+            await asyncio.to_thread(
+                db_manager.mark_url_filtered, task_id, current_url, "list_page"
             )
             return
 
