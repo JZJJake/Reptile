@@ -249,28 +249,51 @@ class WikiManager:
         return "\n".join(lines)
 
     def _find_relevant_pages(self, question: str, max_chars: int = 20_000) -> str:
-        """Keyword-based fallback page selector (no API call)."""
+        """Keyword-based fallback page selector (no API call).
+        First tries curated pages (concepts/entities/synthesis/summaries).
+        If none match, falls back to Stage-1 atoms with a disclaimer so the
+        user gets an answer even before Stage-2 assembly is complete.
+        """
         words = set(re.findall(r'\w+', question.lower()))
-        scored = []
+        curated, atoms = [], []
         for rel_path in self.list_pages():
-            if rel_path in ("log.md",) or rel_path == ".ingested":
+            if rel_path in ("log.md",) or rel_path in (".ingested", ".stage1_done"):
                 continue
-            if rel_path.startswith("atoms/"):
-                continue   # raw Stage-1 units — answer from curated pages
             content = self.read_page(rel_path) or ""
             score = sum(1 for w in words if w in content.lower())
-            if score > 0:
-                scored.append((score, rel_path, content))
-        scored.sort(reverse=True, key=lambda x: x[0])
-        parts = []
-        total = 0
-        for _, rel_path, content in scored:
-            entry = f"=== {rel_path} ===\n{content}"
-            if total + len(entry) > max_chars:
-                break
-            parts.append(entry)
-            total += len(entry)
-        return "\n\n".join(parts) if parts else f"(无匹配页面。目录:\n{self.read_index()})"
+            if score == 0:
+                continue
+            if rel_path.startswith("atoms/"):
+                atoms.append((score, rel_path, content))
+            else:
+                curated.append((score, rel_path, content))
+
+        def _pack(scored_list, budget):
+            scored_list.sort(reverse=True, key=lambda x: x[0])
+            parts, total = [], 0
+            for _, rel_path, content in scored_list:
+                entry = f"=== {rel_path} ===\n{content}"
+                if total + len(entry) > budget:
+                    break
+                parts.append(entry)
+                total += len(entry)
+            return parts
+
+        curated_parts = _pack(curated, max_chars)
+        if curated_parts:
+            return "\n\n".join(curated_parts)
+
+        # ── Fallback: answer from Stage-1 atoms ──────────────────────────────
+        atom_parts = _pack(atoms, max_chars)
+        if atom_parts:
+            disclaimer = (
+                "\n\n【提示：知识库尚未完成二级关系组装（Stage 2），"
+                "以下内容来自第一级知识原子，可能不够完整。"
+                "建议点击「重建知识库」以完成完整的关系网组装后再提问。】"
+            )
+            return "\n\n".join(atom_parts) + disclaimer
+
+        return f"(无匹配页面。目录:\n{self.read_index()})"
 
     # ── Stage 1: single-doc distillation → knowledge atoms ─────────────────────
 

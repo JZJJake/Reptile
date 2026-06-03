@@ -629,6 +629,8 @@ input:focus, select:focus { border-color: var(--accent); }
         <span><span class="legend-dot" style="background:#ff7b72"></span>关系网</span>
         <span><span class="legend-dot" style="background:#58a6ff"></span>摘要</span>
         <span><span class="legend-dot" style="background:#e3b341"></span>目录</span>
+        <span><span class="legend-dot" style="background:#d29922"></span>通用</span>
+        <span><span class="legend-dot" style="background:#3d444d;opacity:.7"></span>原子(L1)</span>
         <span style="color:#484f58">· 节点大小代表关联度，可拖拽/滚轮缩放</span>
       </div>
     </div>
@@ -1219,14 +1221,18 @@ function renderMarkdown(src) {
 
 const GCOLOR = {
   concepts:  '#388bfd', entities:  '#3fb950', synthesis: '#bc8cff',
-  summaries: '#58a6ff', relations:  '#ff7b72', root:      '#8b949e',
+  summaries: '#58a6ff', relations:  '#ff7b72', root:      '#d29922',
+  atom:      '#3d444d',   // Stage-1 raw atoms: dark dim dots
 };
 function gNodeColor(d) {
   if (d.id === 'relations.md') return GCOLOR.relations;
   if (d.id === 'index.md')     return '#e3b341';
   return GCOLOR[d.type] || GCOLOR.root;
 }
-function gNodeR(d) { return Math.max(7, Math.min(28, 7 + (d.degree || 0) * 1.8)); }
+function gNodeR(d) {
+  if (d.type === 'atom') return 4;   // atoms: tiny background dots
+  return Math.max(7, Math.min(28, 7 + (d.degree || 0) * 1.8));
+}
 
 let graphInitialized = false;
 let graphSimulation   = null;
@@ -1321,8 +1327,8 @@ function updateGraphVis(data) {
       if (dom) viewWikiPage({ dataset: { wiki: d.name } });
     });
 
-  // Glow ring for high-degree nodes
-  nEnter.filter(d => d.degree >= 4).append('circle')
+  // Glow ring only for high-degree curated nodes (not atoms)
+  nEnter.filter(d => d.type !== 'atom' && d.degree >= 4).append('circle')
     .attr('r', d => gNodeR(d) + 5)
     .attr('fill', 'none')
     .attr('stroke', d => gNodeColor(d))
@@ -1331,16 +1337,20 @@ function updateGraphVis(data) {
   nEnter.append('circle').attr('class', 'g-circle')
     .attr('r', d => gNodeR(d))
     .attr('fill', gNodeColor)
-    .attr('stroke', '#0d1117').attr('stroke-width', 1.5);
+    .attr('stroke', d => d.type === 'atom' ? 'none' : '#0d1117')
+    .attr('stroke-width', 1.5)
+    .attr('opacity',  d => d.type === 'atom' ? 0.45 : 1);
 
-  nEnter.append('text')
+  // Labels only on curated nodes (not atoms)
+  nEnter.filter(d => d.type !== 'atom').append('text')
     .attr('dy', d => gNodeR(d) + 12).attr('text-anchor', 'middle')
     .attr('font-size', '9.5px').attr('fill', '#7a828c')
     .attr('pointer-events', 'none')
     .text(d => d.name.length > 13 ? d.name.slice(0, 12) + '…' : d.name);
 
-  // Pop-in
-  nEnter.transition().duration(450).attr('opacity', 1);
+  // Pop-in: atoms appear faster and dimmer
+  nEnter.filter(d => d.type === 'atom').transition().duration(200).attr('opacity', 0.45);
+  nEnter.filter(d => d.type !== 'atom').transition().duration(450).attr('opacity', 1);
   const nAll = nEnter.merge(nSel);
   // Update radius / color for returning nodes (degree may have changed)
   nAll.select('.g-circle').attr('r', d => gNodeR(d)).attr('fill', gNodeColor);
@@ -1353,11 +1363,16 @@ function updateGraphVis(data) {
   });
   graphSimulation.force('link').links(data.links);
 
-  const newNodes = data.nodes.length !== graphData.nodes.length;
-  graphSimulation.alpha(newNodes ? 0.4 : 0.1).restart();
+  // Only heat up simulation when genuinely new nodes appear — existing nodes stay put
+  const prevIds = new Set(graphData.nodes.map(n => n.id));
+  const hasNew  = data.nodes.some(n => !prevIds.has(n.id));
+  graphSimulation.alpha(hasNew ? 0.4 : 0.03).restart();
 
+  const st = data.stats || {};
+  const atomN    = st.atom_nodes    ?? data.nodes.filter(n => n.type === 'atom').length;
+  const curatedN = st.curated_nodes ?? (data.nodes.length - atomN);
   document.getElementById('graph-stats').textContent =
-    `${data.nodes.length} 节点 · ${data.links.length} 关系`;
+    `${curatedN} 知识页 · ${atomN} 原子(L1) · ${data.links.length} 关系`;
   document.getElementById('graph-empty').style.display =
     data.nodes.length ? 'none' : 'flex';
 }
@@ -1370,6 +1385,18 @@ async function refreshGraph() {
     if (!resp.ok) return;
     const data = await resp.json();
     if (!graphInitialized) initGraphSvg();
+
+    // Preserve existing node positions so the graph doesn't reset on each refresh.
+    // Copy {x, y, vx, vy} from current simulation state into the new data batch.
+    const posMap = {};
+    graphData.nodes.forEach(n => {
+      if (n.x != null) posMap[n.id] = { x: n.x, y: n.y, vx: n.vx || 0, vy: n.vy || 0 };
+    });
+    data.nodes.forEach(n => {
+      const p = posMap[n.id];
+      if (p) { n.x = p.x; n.y = p.y; n.vx = p.vx; n.vy = p.vy; }
+    });
+
     updateGraphVis(data);
     graphData = data;
   } catch(e) { console.error('graph:', e); }
