@@ -349,19 +349,23 @@ async def wiki_query(req: WikiQueryRequest):
 
 @wiki_router.get("/graph/{domain}")
 async def wiki_graph(domain: str):
-    """Return nodes + links for the knowledge graph visualisation."""
+    """Return nodes + links for the knowledge graph visualisation.
+    Includes Stage-1 atoms as dim background dots so the live build process
+    is visible; only curated (non-atom) pages carry citation / relation edges.
+    """
     import re as _re
     from pathlib import Path as _Path
     from wiki.wiki_manager import WikiManager
 
-    mgr   = WikiManager(domain, "")
-    pages = [p for p in mgr.list_pages()
-             if not p.startswith("atoms/") and p not in ("log.md",)]
+    mgr = WikiManager(domain, "")
+    skip = {"log.md", ".ingested", ".stage1_done"}
+    all_pages = [p for p in mgr.list_pages() if p not in skip]
 
     # ── nodes ──
     node_map: dict[str, dict] = {}
-    for p in pages:
-        seg   = p.split("/")
+    for p in all_pages:
+        seg = p.split("/")
+        # atoms/ → type "atom"; any known subdir → that subdir name; root → "root"
         dtype = seg[0] if len(seg) > 1 else "root"
         node_map[p] = {
             "id":     p,
@@ -370,12 +374,14 @@ async def wiki_graph(domain: str):
             "degree": 0,
         }
 
-    # ── links from [[citations]] ──
+    # ── links from [[citations]] in curated (non-atom) pages ──
     link_set: set[tuple] = set()
     links: list[dict]    = []
     cite_re = _re.compile(r'\[\[([^\]]+)\]\]')
 
-    for p in pages:
+    for p in all_pages:
+        if p.startswith("atoms/"):
+            continue  # raw atoms don't carry curated citations
         content = mgr.read_page(p) or ""
         for cite in cite_re.findall(content):
             slug = _re.sub(r'[^a-z0-9]+', '-', cite.lower()).strip('-')
@@ -400,15 +406,26 @@ async def wiki_graph(domain: str):
         src_name, rel_type, tgt_name = m.group(1), m.group(2), m.group(3)
         src_slug = _re.sub(r'[^a-z0-9]+', '-', src_name.lower()).strip('-')
         tgt_slug = _re.sub(r'[^a-z0-9]+', '-', tgt_name.lower()).strip('-')
-        sp = next((tp for tp in node_map if src_slug in _Path(tp).stem.lower()), None)
-        tp = next((tp for tp in node_map if tgt_slug in _Path(tp).stem.lower()), None)
-        if sp and tp and sp != tp and (sp, tp) not in link_set:
-            link_set.add((sp, tp))
-            links.append({"source": sp, "target": tp, "type": rel_type[:20]})
+        sp  = next((tp for tp in node_map if src_slug in _Path(tp).stem.lower()), None)
+        tp_ = next((tp for tp in node_map if tgt_slug in _Path(tp).stem.lower()), None)
+        if sp and tp_ and sp != tp_ and (sp, tp_) not in link_set:
+            link_set.add((sp, tp_))
+            links.append({"source": sp, "target": tp_, "type": rel_type[:20]})
+            node_map[sp]["degree"]  += 1
+            node_map[tp_]["degree"] += 1
 
     nodes = list(node_map.values())
-    return {"nodes": nodes, "links": links,
-            "stats": {"total_nodes": len(nodes), "total_links": len(links)}}
+    atom_count    = sum(1 for n in nodes if n["type"] == "atom")
+    curated_count = len(nodes) - atom_count
+    return {
+        "nodes": nodes, "links": links,
+        "stats": {
+            "total_nodes":   len(nodes),
+            "total_links":   len(links),
+            "atom_nodes":    atom_count,
+            "curated_nodes": curated_count,
+        },
+    }
 
 
 class SaveSynthesisRequest(BaseModel):
