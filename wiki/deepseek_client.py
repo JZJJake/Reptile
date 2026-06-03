@@ -16,12 +16,14 @@ async def chat_completion(
     stream: bool = False,
     api_key: Optional[str] = None,
     temperature: float = 0.7,
+    timeout: Optional[float] = None,
 ) -> str | AsyncGenerator[str, None]:
     """
     Call DeepSeek chat completions endpoint.
     stream=True returns an async generator yielding text deltas.
     stream=False returns the full response string.
     API key from DEEPSEEK_API_KEY env var if not passed.
+    `timeout` overrides the default per call (large assembly calls need longer).
     """
     key = api_key or os.environ.get("DEEPSEEK_API_KEY", "")
     if not key:
@@ -37,15 +39,16 @@ async def chat_completion(
         "stream": stream,
         "temperature": temperature,
     }
+    eff_timeout = timeout or TIMEOUT
 
     if stream:
-        return _stream_response(headers, payload)
+        return _stream_response(headers, payload, eff_timeout)
     else:
-        return await _full_response(headers, payload)
+        return await _full_response(headers, payload, eff_timeout)
 
 
-async def _full_response(headers: dict, payload: dict) -> str:
-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+async def _full_response(headers: dict, payload: dict, timeout: float = TIMEOUT) -> str:
+    async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(
             f"{DEEPSEEK_BASE_URL}/chat/completions",
             headers=headers,
@@ -56,8 +59,9 @@ async def _full_response(headers: dict, payload: dict) -> str:
         return data["choices"][0]["message"]["content"]
 
 
-async def _stream_response(headers: dict, payload: dict) -> AsyncGenerator[str, None]:
-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+async def _stream_response(headers: dict, payload: dict,
+                           timeout: float = TIMEOUT) -> AsyncGenerator[str, None]:
+    async with httpx.AsyncClient(timeout=timeout) as client:
         async with client.stream(
             "POST",
             f"{DEEPSEEK_BASE_URL}/chat/completions",
