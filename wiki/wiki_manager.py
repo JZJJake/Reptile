@@ -38,7 +38,14 @@ from wiki.schema import (
 )
 from wiki import deepseek_client
 
-FILE_WRITE_RE = re.compile(r'<<<FILE:\s*(.+?)>>>\n(.*?)<<<END>>>', re.DOTALL)
+# Path: no newlines, no '>', max 200 chars — prevents the lazy .+? from consuming
+# multiple lines when LLM writes garbage on the header line (e.g. >>>]# Title).
+# Trailing junk on the header line (after >>>) is swallowed by [^\n]*.
+# <<<END accepts all truncated variants: <<<END>>> / <<<END>> / <<<END> / <<<END
+FILE_WRITE_RE = re.compile(
+    r'<<<FILE:\s*([^\n>]{1,200})>>>[^\n]*\n(.*?)<<<END(?:>>>|>>|>|)',
+    re.DOTALL,
+)
 
 MAX_CONTEXT_CHARS = 80_000   # safe limit per LLM call
 EXISTING_PAGE_CAP = 24_000   # max chars of fetched existing pages fed to write phase
@@ -315,6 +322,14 @@ class WikiManager:
             model=self.model, stream=False, api_key=self.api_key,
         )
         blocks = await asyncio.to_thread(self._parse_file_blocks, response)
+        if not blocks:
+            report(
+                f"批次 {batch_no}：DeepSeek 未输出有效 FILE_WRITE 块——"
+                "可能是格式不符合 <<<FILE: path>>>/<<<END>>> 协议",
+                "warn",
+            )
+            print(f"[wiki/{self.domain}] batch {batch_no}: 0 blocks parsed. "
+                  f"Response head: {response[:300]!r}")
         created, updated = await asyncio.to_thread(self._apply_file_blocks, blocks)
         return created, updated
 
