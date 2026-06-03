@@ -248,30 +248,56 @@ class WikiManager:
                 lines.append(f"- {sf.name}")
         return "\n".join(lines)
 
+    @staticmethod
+    def _score_text(question: str, content: str) -> int:
+        """Relevance score supporting both ASCII words and CJK characters.
+
+        Chinese text is NOT space-delimited, so re.findall(r'\\w+', ...) returns
+        the whole sentence as one token and never matches individual characters.
+        We handle this by scoring:
+          - ASCII / alphanumeric words (for English/number terms)
+          - Individual CJK characters (coarse but effective for Chinese)
+          - CJK bigrams (2-char pairs — better precision than single chars)
+        """
+        content_lower = content.lower()
+        score = 0
+
+        # ASCII words
+        ascii_words = set(re.findall(r'[a-zA-Z0-9]+', question))
+        score += sum(1 for w in ascii_words if w and w.lower() in content_lower)
+
+        # CJK characters and bigrams from the question
+        cjk_chars = [ch for ch in question if '一' <= ch <= '鿿']
+        # Bigrams (2-char pairs) — weighted double for precision
+        bigrams = {''.join(cjk_chars[i:i+2]) for i in range(len(cjk_chars) - 1)}
+        score += sum(2 for bg in bigrams if bg in content)
+        # Individual chars as backup (weight 1)
+        score += sum(1 for ch in set(cjk_chars) if ch in content)
+
+        return score
+
     def _find_relevant_pages(self, question: str, max_chars: int = 20_000) -> str:
         """Keyword-based fallback page selector (no API call).
+
         First tries curated pages (concepts/entities/synthesis/summaries).
-        If none match, falls back to Stage-1 atoms with a disclaimer so the
-        user gets an answer even before Stage-2 assembly is complete.
+        Falls back to Stage-1 atoms if no curated pages match.
+        Last resort: returns top atoms by filename sort when even scoring gives 0.
         """
-        words = set(re.findall(r'\w+', question.lower()))
         curated, atoms = [], []
         for rel_path in self.list_pages():
             if rel_path in ("log.md",) or rel_path in (".ingested", ".stage1_done"):
                 continue
             content = self.read_page(rel_path) or ""
-            score = sum(1 for w in words if w in content.lower())
-            if score == 0:
-                continue
-            if rel_path.startswith("atoms/"):
-                atoms.append((score, rel_path, content))
-            else:
-                curated.append((score, rel_path, content))
+            score = self._score_text(question, content)
+            bucket = atoms if rel_path.startswith("atoms/") else curated
+            bucket.append((score, rel_path, content))
 
-        def _pack(scored_list, budget):
+        def _pack(scored_list, budget, min_score=0):
             scored_list.sort(reverse=True, key=lambda x: x[0])
             parts, total = [], 0
-            for _, rel_path, content in scored_list:
+            for sc, rel_path, content in scored_list:
+                if sc < min_score:
+                    break
                 entry = f"=== {rel_path} ===\n{content}"
                 if total + len(entry) > budget:
                     break
@@ -279,12 +305,18 @@ class WikiManager:
                 total += len(entry)
             return parts
 
-        curated_parts = _pack(curated, max_chars)
+        # 1. Curated pages with any relevance signal
+        curated_parts = _pack(curated, max_chars, min_score=1)
         if curated_parts:
             return "\n\n".join(curated_parts)
 
-        # ── Fallback: answer from Stage-1 atoms ──────────────────────────────
-        atom_parts = _pack(atoms, max_chars)
+        # 2. Atoms with relevance signal
+        atom_parts = _pack(atoms, max_chars, min_score=1)
+
+        # 3. Last resort: top atoms by score regardless (even if score=0)
+        if not atom_parts and atoms:
+            atom_parts = _pack(atoms, max_chars, min_score=0)
+
         if atom_parts:
             disclaimer = (
                 "\n\n【提示：知识库尚未完成二级关系组装（Stage 2），"
@@ -602,6 +634,19 @@ class WikiManager:
         Falls back to keyword-based page selection if Step 1 fails.
         """
         index_content = await asyncio.to_thread(self.read_index)
+
+        # When only Stage-1 atoms exist, tell DeepSeek the wiki is being built
+        # so it doesn't refuse due to "empty directory" language in the index.
+        if "尚无内容" in index_content:
+            atom_count = sum(
+                1 for p in await asyncio.to_thread(self.list_pages)
+                if p.startswith("atoms/")
+            )
+            if atom_count > 0:
+                index_content = (
+                    f"（知识库建设中：已完成第一级蒸馏 {atom_count} 个知识原子，"
+                    "二级关系网组装尚未完成。以下知识来自原子层，请据此回答。）"
+                )
 
         # Relation network = reasoning scaffold (always loaded if present).
         relations_content = await asyncio.to_thread(self.read_page, "relations.md")

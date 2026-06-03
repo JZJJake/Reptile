@@ -350,26 +350,44 @@ async def wiki_query(req: WikiQueryRequest):
 @wiki_router.get("/graph/{domain}")
 async def wiki_graph(domain: str):
     """Return nodes + links for the knowledge graph visualisation.
-    Includes Stage-1 atoms as dim background dots so the live build process
-    is visible; only curated (non-atom) pages carry citation / relation edges.
+
+    Node names come from the first '# Title' line of each page (real Chinese
+    titles), not the filename slug.
+
+    Edges come from three sources (in order of quality):
+      1. Explicit [[citations]] inside curated pages
+      2. Explicit relation edges parsed from relations.md
+      3. Shared-tag edges between Stage-1 atoms (connects even before Stage 2)
     """
     import re as _re
     from pathlib import Path as _Path
     from wiki.wiki_manager import WikiManager
+    from collections import defaultdict
 
     mgr = WikiManager(domain, "")
     skip = {"log.md", ".ingested", ".stage1_done"}
     all_pages = [p for p in mgr.list_pages() if p not in skip]
 
-    # ── nodes ──
+    def _page_title(content: str, fallback: str) -> str:
+        """Return the first '# Heading' line, stripped, or fallback."""
+        for line in (content or "").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("# "):
+                return stripped[2:].strip()[:50] or fallback
+        return fallback
+
+    # ── nodes: read each page once, extract real title ──
+    page_contents: dict[str, str] = {}
     node_map: dict[str, dict] = {}
     for p in all_pages:
-        seg = p.split("/")
-        # atoms/ → type "atom"; any known subdir → that subdir name; root → "root"
+        content = mgr.read_page(p) or ""
+        page_contents[p] = content
+        seg   = p.split("/")
         dtype = seg[0] if len(seg) > 1 else "root"
+        slug_name = _Path(p).stem.replace("-", " ")
         node_map[p] = {
             "id":     p,
-            "name":   _Path(p).stem.replace("-", " "),
+            "name":   _page_title(content, slug_name),
             "type":   dtype,
             "degree": 0,
         }
@@ -379,16 +397,15 @@ async def wiki_graph(domain: str):
     links: list[dict]    = []
     cite_re = _re.compile(r'\[\[([^\]]+)\]\]')
 
-    for p in all_pages:
+    for p, content in page_contents.items():
         if p.startswith("atoms/"):
             continue  # raw atoms don't carry curated citations
-        content = mgr.read_page(p) or ""
         for cite in cite_re.findall(content):
-            slug = _re.sub(r'[^a-z0-9]+', '-', cite.lower()).strip('-')
+            slug = _re.sub(r'[^a-z0-9一-鿿]+', '-', cite.lower()).strip('-')
             target = next(
                 (tp for tp in node_map
                  if slug == _Path(tp).stem.lower()
-                 or (len(slug) > 3 and slug in _Path(tp).stem.lower())),
+                 or (len(slug) > 2 and slug in _Path(tp).stem.lower())),
                 None,
             )
             if target and target != p and (p, target) not in link_set:
@@ -398,14 +415,14 @@ async def wiki_graph(domain: str):
                 node_map[target]["degree"] += 1
 
     # ── explicit relation edges from relations.md ──
-    rel_content = mgr.read_page("relations.md") or ""
-    rel_re      = _re.compile(
+    rel_content = page_contents.get("relations.md", "") or ""
+    rel_re = _re.compile(
         r'\[\[([^\]]+)\]\]\s*[—\-]+\(([^)]+)\)\s*[—→\-]+\s*\[\[([^\]]+)\]\]'
     )
     for m in rel_re.finditer(rel_content):
         src_name, rel_type, tgt_name = m.group(1), m.group(2), m.group(3)
-        src_slug = _re.sub(r'[^a-z0-9]+', '-', src_name.lower()).strip('-')
-        tgt_slug = _re.sub(r'[^a-z0-9]+', '-', tgt_name.lower()).strip('-')
+        src_slug = _re.sub(r'[^a-z0-9一-鿿]+', '-', src_name.lower()).strip('-')
+        tgt_slug = _re.sub(r'[^a-z0-9一-鿿]+', '-', tgt_name.lower()).strip('-')
         sp  = next((tp for tp in node_map if src_slug in _Path(tp).stem.lower()), None)
         tp_ = next((tp for tp in node_map if tgt_slug in _Path(tp).stem.lower()), None)
         if sp and tp_ and sp != tp_ and (sp, tp_) not in link_set:
@@ -413,6 +430,35 @@ async def wiki_graph(domain: str):
             links.append({"source": sp, "target": tp_, "type": rel_type[:20]})
             node_map[sp]["degree"]  += 1
             node_map[tp_]["degree"] += 1
+
+    # ── Stage-1 atom concept-tag edges (active even before Stage 2) ──
+    # Parse "概念标签: tag1, tag2" from each atom and connect atoms that share tags.
+    tag_re  = _re.compile(r'概念标签[：:]\s*([^\n]+)')
+    tag_map: "defaultdict[str, list[str]]" = defaultdict(list)
+    for p, content in page_contents.items():
+        if not p.startswith("atoms/"):
+            continue
+        m = tag_re.search(content)
+        if not m:
+            continue
+        raw = m.group(1)
+        for tag in _re.split(r'[，,、；;]+', raw):
+            tag = tag.strip()
+            if tag and tag != '无' and len(tag) >= 2:
+                tag_map[tag].append(p)
+
+    # For each tag shared by 2–8 atoms, add "concept" edges (avoid mega-hubs)
+    for tag, members in tag_map.items():
+        if len(members) < 2 or len(members) > 8:
+            continue
+        for i, src in enumerate(members):
+            for tgt in members[i + 1:]:
+                if (src, tgt) not in link_set:
+                    link_set.add((src, tgt))
+                    links.append({"source": src, "target": tgt,
+                                  "type": f"共同概念: {tag[:12]}"})
+                    node_map[src]["degree"] += 1
+                    node_map[tgt]["degree"] += 1
 
     nodes = list(node_map.values())
     atom_count    = sum(1 for n in nodes if n["type"] == "atom")
