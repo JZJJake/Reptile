@@ -43,6 +43,12 @@ FILE_WRITE_RE = re.compile(r'<<<FILE:\s*(.+?)>>>\n(.*?)<<<END>>>', re.DOTALL)
 MAX_CONTEXT_CHARS = 80_000   # safe limit per LLM call
 EXISTING_PAGE_CAP = 24_000   # max chars of fetched existing pages fed to write phase
 
+# Source files that are navigation/list/index pages, not real content.
+# e.g. News_List_2018..._abcd1234.md  →  skipped from knowledge base.
+SKIP_SOURCE_RE = re.compile(
+    r'(?i)(^|_)(news_)?list(_|$)|(^|_)index(_|$)|(^|_)column(_|$)|(^|_)node(_|$)'
+)
+
 
 class WikiManager:
     def __init__(self, domain: str, api_key: str,
@@ -117,11 +123,20 @@ class WikiManager:
                 f.write(name.strip() + "\n")
 
     def _get_unprocessed_sources(self) -> list[Path]:
-        """Flat *.md files under scraped_data/{domain}/ not yet ingested."""
+        """Flat *.md files under scraped_data/{domain}/ not yet ingested.
+        Navigation/list/index pages (e.g. News_List_*) are skipped — they are
+        not knowledge content."""
         if not self.raw_path.is_dir():
             return []
         ingested = self._get_ingested_sources()
-        return [p for p in sorted(self.raw_path.glob("*.md")) if p.name not in ingested]
+        result = []
+        for p in sorted(self.raw_path.glob("*.md")):
+            if p.name in ingested:
+                continue
+            if SKIP_SOURCE_RE.search(p.stem):
+                continue   # navigation / list page — not real content
+            result.append(p)
+        return result
 
     # ── Shared helpers ─────────────────────────────────────────────────────────
 

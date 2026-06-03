@@ -266,6 +266,36 @@ input:focus, select:focus { border-color: var(--accent); }
   border-radius: 4px 12px 12px 12px;
 }
 
+/* Rendered markdown inside assistant bubbles */
+.msg-bubble .md-p { margin: 0 0 8px 0; }
+.msg-bubble .md-p:last-child { margin-bottom: 0; }
+.msg-bubble .md-h { font-weight: 700; color: #f0f6fc; margin: 10px 0 6px; line-height: 1.4; }
+.msg-bubble .md-h1 { font-size: 1.25em; }
+.msg-bubble .md-h2 { font-size: 1.15em; }
+.msg-bubble .md-h3 { font-size: 1.06em; }
+.msg-bubble .md-h4, .msg-bubble .md-h5, .msg-bubble .md-h6 { font-size: 1em; }
+.msg-bubble .md-ul, .msg-bubble .md-ol { margin: 4px 0 8px; padding-left: 22px; }
+.msg-bubble .md-ul li, .msg-bubble .md-ol li { margin: 2px 0; }
+.msg-bubble strong { color: #f0f6fc; font-weight: 700; }
+.msg-bubble em { font-style: italic; }
+.msg-bubble .md-code {
+  background: #0d1117; border: 1px solid var(--border); border-radius: 4px;
+  padding: 1px 5px; font-family: 'Consolas', monospace; font-size: .9em; color: #79c0ff;
+}
+.msg-bubble .md-pre {
+  background: #0d1117; border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 12px; margin: 8px 0; overflow-x: auto;
+}
+.msg-bubble .md-pre code {
+  font-family: 'Consolas', monospace; font-size: 12px; color: #c9d1d9; white-space: pre;
+}
+.msg-bubble .md-cite {
+  background: #1c3a5e; color: #79c0ff; border-radius: 4px;
+  padding: 0 5px; font-size: .9em; white-space: nowrap;
+}
+.msg-bubble a { color: #58a6ff; text-decoration: none; }
+.msg-bubble a:hover { text-decoration: underline; }
+
 /* Typing animation */
 .typing-dots { display: inline-flex; gap: 4px; align-items: center; padding: 2px 0; }
 .typing-dot {
@@ -454,13 +484,39 @@ let pagesDone = 0;
 let pagesQueue = 0;
 let chatHistory = [];   // [{role, content}]
 let isChatBusy = false;
+let wikiBuilding = false;
 
 // ── Boot ───────────────────────────────────────────────────────────────────────
 (function boot() {
   if (!API_KEY) { window.location.href = '/'; return; }
   loadDomains();
+  reconnectActiveBuild();
   setInterval(loadDomains, 15000);
 })();
+
+// If a wiki build is already running on the server (e.g. after a page reload),
+// reattach the live log so progress and breakpoint-resume stay visible.
+async function reconnectActiveBuild() {
+  try {
+    const d = await (await fetch('/api/wiki/building')).json();
+    if (d.building && d.building.length) {
+      const domain = d.building[0];
+      wikiBuilding = true;
+      const sel = document.getElementById('wiki-sel');
+      if ([...sel.options].some(o => o.value === domain)) sel.value = domain;
+      onWikiSelChange();
+      const btn = document.getElementById('btn-wiki');
+      btn.textContent = '⏳ 建设中...';
+      const statusEl = document.getElementById('wiki-status');
+      statusEl.textContent = `⏳ 知识库建设进行中 (${domain})...`;
+      statusEl.style.color = 'var(--orange)';
+      document.getElementById('log-lbl').innerHTML = `知识库建设: <b>${esc(domain)}</b>`;
+      setStatus('analyzing');
+      switchTab('log');
+      subscribeWikiEvents(domain, statusEl);
+    }
+  } catch(_) {}
+}
 
 // ── Tabs ───────────────────────────────────────────────────────────────────────
 function switchTab(name) {
@@ -518,7 +574,7 @@ function fillSelects(doms) {
 
 function onWikiSelChange() {
   const v = document.getElementById('wiki-sel').value;
-  document.getElementById('btn-wiki').disabled = !v || isRunning;
+  document.getElementById('btn-wiki').disabled = !v || isRunning || wikiBuilding;
 }
 
 function onChatSelChange() {
@@ -681,11 +737,15 @@ function setStatus(s) {
 let wikiEvtSrc = null;
 
 async function buildWiki() {
+  if (wikiBuilding) return;          // guard: already building
   const domain = document.getElementById('wiki-sel').value;
   if (!domain) return;
   const btn = document.getElementById('btn-wiki');
   const statusEl = document.getElementById('wiki-status');
+
+  wikiBuilding = true;
   btn.disabled = true;
+  btn.textContent = '⏳ 建设中...';
   statusEl.textContent = '⏳ 正在启动知识库建设...';
   statusEl.style.color = 'var(--orange)';
 
@@ -695,10 +755,9 @@ async function buildWiki() {
   document.getElementById('log-lbl').innerHTML = `知识库建设: <b>${esc(domain)}</b>`;
   setStatus('analyzing');
 
-  // Attach SSE BEFORE firing the build so we don't miss early events.
-  subscribeWikiEvents(domain, statusEl, btn);
-
   try {
+    // Fire the build FIRST so the server creates the SSE queue, then attach.
+    // (Attaching before the POST races with queue creation and loses events.)
     const r = await fetch('/api/wiki/build', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -706,37 +765,44 @@ async function buildWiki() {
     });
     const d = await r.json();
     if (!r.ok) {
-      if (wikiEvtSrc) { wikiEvtSrc.close(); wikiEvtSrc = null; }
       statusEl.textContent = `❌ ${d.detail || '建设失败'}`;
       statusEl.style.color = 'var(--red)';
       appendLog('', d.detail || '建设失败', 'error');
       setStatus('stopped');
-      btn.disabled = false;
-    } else {
-      statusEl.textContent = `⏳ 知识库建设进行中 (${domain})...`;
-      statusEl.style.color = 'var(--orange)';
+      endWikiBuild(domain, statusEl);
+      return;
     }
+    statusEl.textContent = `⏳ 知识库建设进行中 (${domain})...`;
+    statusEl.style.color = 'var(--orange)';
+    // Now subscribe — queue already exists, so no events are lost.
+    subscribeWikiEvents(domain, statusEl);
   } catch(e) {
-    if (wikiEvtSrc) { wikiEvtSrc.close(); wikiEvtSrc = null; }
     statusEl.textContent = `网络错误: ${e.message}`;
     statusEl.style.color = 'var(--red)';
     setStatus('stopped');
-    btn.disabled = false;
+    endWikiBuild(domain, statusEl);
   }
 }
 
-function subscribeWikiEvents(domain, statusEl, btn) {
+function endWikiBuild(domain, statusEl) {
+  wikiBuilding = false;
+  if (wikiEvtSrc) { wikiEvtSrc.close(); wikiEvtSrc = null; }
+  const btn = document.getElementById('btn-wiki');
+  btn.textContent = '⚙ 开始建设';
+  btn.disabled = !document.getElementById('wiki-sel').value || isRunning;
+}
+
+function subscribeWikiEvents(domain, statusEl) {
   if (wikiEvtSrc) wikiEvtSrc.close();
   wikiEvtSrc = new EventSource(`/api/wiki/events/${encodeURIComponent(domain)}`);
 
   wikiEvtSrc.onmessage = (e) => {
     if (!e.data || e.data === 'null') {
       // build finished
-      wikiEvtSrc.close(); wikiEvtSrc = null;
       setStatus('done');
-      btn.disabled = !document.getElementById('wiki-sel').value || isRunning;
       refreshWikiStatus(domain, statusEl);
       loadDomains();
+      endWikiBuild(domain, statusEl);
       return;
     }
     try {
@@ -757,8 +823,9 @@ function subscribeWikiEvents(domain, statusEl, btn) {
   };
 
   wikiEvtSrc.onerror = () => {
-    if (wikiEvtSrc) { wikiEvtSrc.close(); wikiEvtSrc = null; }
-    btn.disabled = !document.getElementById('wiki-sel').value || isRunning;
+    // EventSource auto-reconnects; only treat as terminal if we already saw
+    // the sentinel. Here we just note the drop but keep build state until
+    // a reconnect delivers the sentinel or the user reloads.
     refreshWikiStatus(domain, statusEl);
   };
 }
@@ -864,13 +931,80 @@ async function consumeStream(resp, typingId) {
       if (raw === '[DONE]') break;
       try {
         const delta = JSON.parse(raw).delta || '';
+        // Stream as plain text for smoothness; render markdown once complete.
         if (delta) { full += delta; bubble.textContent = full; scrollChat(); }
       } catch(_) {}
     }
   }
 
+  // Final pass: render markdown so **bold**, ## headings, lists, paragraphs
+  // display as proper formatting instead of raw symbols.
+  bubble.innerHTML = renderMarkdown(full);
   chatHistory.push({ role: 'assistant', content: full });
   scrollChat();
+}
+
+// Lightweight, safe Markdown → HTML (escapes first, then formats).
+function renderMarkdown(src) {
+  if (!src) return '';
+  let s = esc(src);
+
+  // Fenced code blocks ```...```
+  s = s.replace(/```([\s\S]*?)```/g, (_, code) =>
+    `<pre class="md-pre"><code>${code.replace(/^\n/, '')}</code></pre>`);
+
+  // Inline code `x`
+  s = s.replace(/`([^`\n]+)`/g, '<code class="md-code">$1</code>');
+
+  // Headings ###### .. #
+  s = s.replace(/^(#{1,6})\s+(.+)$/gm, (_, h, txt) => {
+    const lvl = Math.min(h.length, 6);
+    return `<div class="md-h md-h${lvl}">${txt.trim()}</div>`;
+  });
+
+  // Bold / italic
+  s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  s = s.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
+
+  // [[wiki page]] citations
+  s = s.replace(/\[\[([^\]]+)\]\]/g, '<span class="md-cite">$1</span>');
+
+  // Markdown links [text](url)
+  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+    '<a href="$2" target="_blank" rel="noopener">$1</a>');
+
+  // Process lists & paragraphs line by line
+  const lines = s.split('\n');
+  const out = [];
+  let inUl = false, inOl = false;
+  const closeLists = () => {
+    if (inUl) { out.push('</ul>'); inUl = false; }
+    if (inOl) { out.push('</ol>'); inOl = false; }
+  };
+  for (let line of lines) {
+    const ul = line.match(/^\s*[-*•]\s+(.+)$/);
+    const ol = line.match(/^\s*\d+[.)]\s+(.+)$/);
+    if (ul) {
+      if (inOl) { out.push('</ol>'); inOl = false; }
+      if (!inUl) { out.push('<ul class="md-ul">'); inUl = true; }
+      out.push(`<li>${ul[1]}</li>`);
+    } else if (ol) {
+      if (inUl) { out.push('</ul>'); inUl = false; }
+      if (!inOl) { out.push('<ol class="md-ol">'); inOl = true; }
+      out.push(`<li>${ol[1]}</li>`);
+    } else if (line.trim() === '') {
+      closeLists();
+      out.push('');
+    } else if (line.startsWith('<div class="md-h') || line.startsWith('<pre')) {
+      closeLists();
+      out.push(line);
+    } else {
+      closeLists();
+      out.push(`<p class="md-p">${line}</p>`);
+    }
+  }
+  closeLists();
+  return out.join('\n').replace(/\n{2,}/g, '\n');
 }
 
 function addChatBubble(role, text, id) {
