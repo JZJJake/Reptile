@@ -361,7 +361,7 @@ async def wiki_graph(domain: str):
     """
     import re as _re
     from pathlib import Path as _Path
-    from wiki.wiki_manager import WikiManager
+    from wiki.wiki_manager import WikiManager, slugify, is_cjk
     from collections import defaultdict
 
     mgr = WikiManager(domain, "")
@@ -383,7 +383,9 @@ async def wiki_graph(domain: str):
         content = mgr.read_page(p) or ""
         page_contents[p] = content
         seg   = p.split("/")
-        dtype = seg[0] if len(seg) > 1 else "root"
+        # "atoms/" dir → singular "atom" type (matches GCOLOR/JS comparisons);
+        # any other subdir keeps its name; root-level pages → "root"
+        dtype = "atom" if seg[0] == "atoms" else (seg[0] if len(seg) > 1 else "root")
         slug_name = _Path(p).stem.replace("-", " ")
         node_map[p] = {
             "id":     p,
@@ -401,11 +403,14 @@ async def wiki_graph(domain: str):
         if p.startswith("atoms/"):
             continue  # raw atoms don't carry curated citations
         for cite in cite_re.findall(content):
-            slug = _re.sub(r'[^a-z0-9一-鿿]+', '-', cite.lower()).strip('-')
+            slug = slugify(cite)
+            # CJK substrings carry more meaning per character than ASCII ones
+            # (e.g. "api"/"gpt" are too short to substring-match safely)
+            cite_min_len = 2 if any(is_cjk(ch) for ch in slug) else 4
             target = next(
                 (tp for tp in node_map
                  if slug == _Path(tp).stem.lower()
-                 or (len(slug) > 2 and slug in _Path(tp).stem.lower())),
+                 or (len(slug) >= cite_min_len and slug in _Path(tp).stem.lower())),
                 None,
             )
             if target and target != p and (p, target) not in link_set:
@@ -421,8 +426,8 @@ async def wiki_graph(domain: str):
     )
     for m in rel_re.finditer(rel_content):
         src_name, rel_type, tgt_name = m.group(1), m.group(2), m.group(3)
-        src_slug = _re.sub(r'[^a-z0-9一-鿿]+', '-', src_name.lower()).strip('-')
-        tgt_slug = _re.sub(r'[^a-z0-9一-鿿]+', '-', tgt_name.lower()).strip('-')
+        src_slug = slugify(src_name)
+        tgt_slug = slugify(tgt_name)
         sp  = next((tp for tp in node_map if src_slug in _Path(tp).stem.lower()), None)
         tp_ = next((tp for tp in node_map if tgt_slug in _Path(tp).stem.lower()), None)
         if sp and tp_ and sp != tp_ and (sp, tp_) not in link_set:
@@ -433,7 +438,9 @@ async def wiki_graph(domain: str):
 
     # ── Stage-1 atom concept-tag edges (active even before Stage 2) ──
     # Parse "概念标签: tag1, tag2" from each atom and connect atoms that share tags.
-    tag_re  = _re.compile(r'概念标签[：:]\s*([^\n]+)')
+    # Primary field name per schema.py; fallbacks tolerate minor LLM format
+    # drift (synonyms the model may substitute for "概念标签").
+    tag_re = _re.compile(r'(?:概念标签|标签|关键词|主题词)[：:]\s*([^\n]+)')
     tag_map: "defaultdict[str, list[str]]" = defaultdict(list)
     for p, content in page_contents.items():
         if not p.startswith("atoms/"):
@@ -492,14 +499,24 @@ async def wiki_save_synthesis(req: SaveSynthesisRequest):
 @wiki_router.get("/find/{domain}")
 async def wiki_find_page(domain: str, name: str = ""):
     """Find a wiki page by name — searches all subdirectories for a matching stem."""
-    import re as _re
     from pathlib import Path
-    from wiki.wiki_manager import WikiManager
+    from wiki.wiki_manager import WikiManager, slugify, is_cjk
     mgr = WikiManager(domain, "")
-    search = _re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')
+    # Exact-path fast path: graph clicks pass the real page path (e.g.
+    # "concepts/digital-currency-policy.md") since titles are now Chinese
+    # and won't fuzzy-match LLM-generated English/pinyin filenames below.
+    if name.endswith(".md") and "/" in name:
+        content = mgr.read_page(name)
+        if content:
+            return {"path": name, "name": name, "content": content}
+    # CJK-aware slugify (matches _atom_slug / wiki_graph): preserves Chinese
+    # chars instead of stripping them — names/titles are now mostly Chinese.
+    search = slugify(name)
+    has_cjk  = any(is_cjk(ch) for ch in search)
+    min_len  = 2 if has_cjk else 4   # CJK substrings carry more meaning per char
     for page_path in mgr.list_pages():
         stem = Path(page_path).stem.lower()
-        if stem == search or (len(search) > 3 and (search in stem or stem in search)):
+        if stem == search or (len(search) >= min_len and (search in stem or stem in search)):
             content = mgr.read_page(page_path)
             if content:
                 return {"path": page_path, "name": name, "content": content}

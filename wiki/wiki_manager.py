@@ -77,6 +77,18 @@ def estimate_tokens(text: str) -> int:
     other = len(text) - cjk
     return int(cjk + other * 0.3) + 1
 
+
+def slugify(text: str) -> str:
+    """CJK-aware slug: lowercase, hyphen-joined, preserves Chinese characters
+    (titles/names are now mostly Chinese) instead of stripping them."""
+    return re.sub(r'[^a-z0-9一-鿿]+', '-', text.lower()).strip('-')
+
+
+def is_cjk(ch: str) -> bool:
+    """True if `ch` is a CJK Unified Ideograph (the common Chinese text range)."""
+    return '一' <= ch <= '鿿'
+
+
 # Source files that are navigation/list/index pages, not real content.
 # e.g. News_List_2018..._abcd1234.md  →  skipped from knowledge base.
 SKIP_SOURCE_RE = re.compile(
@@ -177,7 +189,7 @@ class WikiManager:
     def _atom_slug(self, source_name: str) -> str:
         """Deterministic atom filename for a source file (preserves uniqueness)."""
         stem = re.sub(r'\.md$', '', source_name)
-        slug = re.sub(r'[^a-zA-Z0-9一-鿿]+', '-', stem).strip('-').lower()
+        slug = slugify(stem)
         return (slug or "atom")[:80] + ".md"
 
     def _get_distilled_sources(self) -> set[str]:
@@ -267,7 +279,7 @@ class WikiManager:
         score += sum(1 for w in ascii_words if w and w.lower() in content_lower)
 
         # CJK characters and bigrams from the question
-        cjk_chars = [ch for ch in question if '一' <= ch <= '鿿']
+        cjk_chars = [ch for ch in question if is_cjk(ch)]
         # Bigrams (2-char pairs) — weighted double for precision
         bigrams = {''.join(cjk_chars[i:i+2]) for i in range(len(cjk_chars) - 1)}
         score += sum(2 for bg in bigrams if bg in content)
@@ -313,10 +325,6 @@ class WikiManager:
         # 2. Atoms with relevance signal
         atom_parts = _pack(atoms, max_chars, min_score=1)
 
-        # 3. Last resort: top atoms by score regardless (even if score=0)
-        if not atom_parts and atoms:
-            atom_parts = _pack(atoms, max_chars, min_score=0)
-
         if atom_parts:
             disclaimer = (
                 "\n\n【提示：知识库尚未完成二级关系组装（Stage 2），"
@@ -324,6 +332,16 @@ class WikiManager:
                 "建议点击「重建知识库」以完成完整的关系网组装后再提问。】"
             )
             return "\n\n".join(atom_parts) + disclaimer
+
+        # Last resort: no scored match anywhere. Don't dump arbitrary atom
+        # content (it may be entirely unrelated to the question) — instead
+        # surface the index plus an atom-count hint so the LLM can say
+        # honestly that the knowledge base doesn't yet cover this topic.
+        if atoms:
+            return (
+                f"(未找到与问题直接相关的页面。知识库目前包含 {len(atoms)} 个知识原子，"
+                f"但均未匹配到问题中的关键词。目录:\n{self.read_index()})"
+            )
 
         return f"(无匹配页面。目录:\n{self.read_index()})"
 
