@@ -334,9 +334,16 @@ async def wiki_query(req: WikiQueryRequest):
     if req.stream:
         async def event_stream():
             for mgr in managers:
-                gen = await mgr.query(req.question, stream=True)
-                async for chunk in gen:
-                    yield f"data: {json.dumps({'delta': chunk}, ensure_ascii=False)}\n\n"
+                try:
+                    gen = await mgr.query(req.question, stream=True)
+                    async for chunk in gen:
+                        yield f"data: {json.dumps({'delta': chunk}, ensure_ascii=False)}\n\n"
+                except Exception as e:
+                    # Isolate per-domain failures in multi-domain queries — one
+                    # bad manager (bad API key, I/O error) shouldn't silently
+                    # truncate the whole stream with no [DONE]/error frame.
+                    err = f"\n\n【{mgr.domain} 查询出错：{e}】"
+                    yield f"data: {json.dumps({'delta': err}, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
         return StreamingResponse(event_stream(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -394,6 +401,33 @@ async def wiki_graph(domain: str):
             "degree": 0,
         }
 
+    # ── shared name resolution: [[citations]]/relations reference pages by
+    # their (often Chinese) display TITLE, but filenames are LLM-generated
+    # English/pinyin slugs per schema convention — neither alone reliably
+    # matches the other, so check both slug forms for every node. ──
+    node_slugs: dict[str, tuple[str, str]] = {
+        tp: (_Path(tp).stem.lower(), slugify(node_map[tp]["name"]))
+        for tp in node_map
+    }
+
+    def _match_node(name: str) -> "str | None":
+        slug = slugify(name)
+        if not slug:
+            return None
+        for tp, (stem_slug, title_slug) in node_slugs.items():
+            if slug == stem_slug or slug == title_slug:
+                return tp
+        # CJK substrings carry more meaning per character than ASCII ones
+        # (e.g. "api"/"gpt" are too short to substring-match safely)
+        min_len = 2 if any(is_cjk(ch) for ch in slug) else 4
+        if len(slug) < min_len:
+            return None
+        for tp, (stem_slug, title_slug) in node_slugs.items():
+            if (slug in stem_slug or stem_slug in slug
+                    or slug in title_slug or title_slug in slug):
+                return tp
+        return None
+
     # ── links from [[citations]] in curated (non-atom) pages ──
     link_set: set[tuple] = set()
     links: list[dict]    = []
@@ -403,16 +437,7 @@ async def wiki_graph(domain: str):
         if p.startswith("atoms/"):
             continue  # raw atoms don't carry curated citations
         for cite in cite_re.findall(content):
-            slug = slugify(cite)
-            # CJK substrings carry more meaning per character than ASCII ones
-            # (e.g. "api"/"gpt" are too short to substring-match safely)
-            cite_min_len = 2 if any(is_cjk(ch) for ch in slug) else 4
-            target = next(
-                (tp for tp in node_map
-                 if slug == _Path(tp).stem.lower()
-                 or (len(slug) >= cite_min_len and slug in _Path(tp).stem.lower())),
-                None,
-            )
+            target = _match_node(cite)
             if target and target != p and (p, target) not in link_set:
                 link_set.add((p, target))
                 links.append({"source": p, "target": target, "type": "citation"})
@@ -426,10 +451,8 @@ async def wiki_graph(domain: str):
     )
     for m in rel_re.finditer(rel_content):
         src_name, rel_type, tgt_name = m.group(1), m.group(2), m.group(3)
-        src_slug = slugify(src_name)
-        tgt_slug = slugify(tgt_name)
-        sp  = next((tp for tp in node_map if src_slug in _Path(tp).stem.lower()), None)
-        tp_ = next((tp for tp in node_map if tgt_slug in _Path(tp).stem.lower()), None)
+        sp  = _match_node(src_name)
+        tp_ = _match_node(tgt_name)
         if sp and tp_ and sp != tp_ and (sp, tp_) not in link_set:
             link_set.add((sp, tp_))
             links.append({"source": sp, "target": tp_, "type": rel_type[:20]})

@@ -23,6 +23,7 @@ import os
 import re
 import json
 import asyncio
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, AsyncGenerator
@@ -190,7 +191,12 @@ class WikiManager:
         """Deterministic atom filename for a source file (preserves uniqueness)."""
         stem = re.sub(r'\.md$', '', source_name)
         slug = slugify(stem)
-        return (slug or "atom")[:80] + ".md"
+        # Scraper-generated filenames often share long common prefixes
+        # (e.g. "News_2024-xx_<long-title>_<hash>"); truncating alone can
+        # collapse two distinct sources onto the same atom path, silently
+        # overwriting one. A short content hash keeps them distinct.
+        suffix = hashlib.md5(source_name.encode("utf-8")).hexdigest()[:8]
+        return (slug or "atom")[:70] + "-" + suffix + ".md"
 
     def _get_distilled_sources(self) -> set[str]:
         """Source filenames already distilled into atoms/ (Stage 1 done)."""
@@ -675,10 +681,19 @@ class WikiManager:
 
         if page_paths:
             parts = []
+            total = 0
             for path in page_paths:
                 content = await asyncio.to_thread(self.read_page, path)
-                if content:
-                    parts.append(f"=== {path} ===\n{content}")
+                if not content:
+                    continue
+                entry = f"=== {path} ===\n{content}"
+                # LLM-selected pages can be large (synthesis pages run tens of
+                # KB); cap the total like _find_relevant_pages does, or a big
+                # selection can blow DeepSeek's context window into a 400.
+                if total + len(entry) > MAX_CONTEXT_CHARS:
+                    break
+                parts.append(entry)
+                total += len(entry)
             pages_content = (
                 "\n\n".join(parts)
                 if parts
@@ -711,12 +726,21 @@ class WikiManager:
     async def _stream_query(self, messages: list[dict], question: str,
                              save_answer: bool) -> "AsyncGenerator[str, None]":
         full_answer: list[str] = []
-        gen = await deepseek_client.chat_completion(
-            messages, model=self.model, stream=True, api_key=self.api_key
-        )
-        async for chunk in gen:
-            full_answer.append(chunk)
-            yield chunk
+        try:
+            gen = await deepseek_client.chat_completion(
+                messages, model=self.model, stream=True, api_key=self.api_key
+            )
+            async for chunk in gen:
+                full_answer.append(chunk)
+                yield chunk
+        except Exception as e:
+            # Surface connect-time errors (missing API key, auth, timeout) and
+            # mid-stream errors as visible text instead of silently truncating
+            # the answer or crashing the StreamingResponse with no message.
+            err = f"\n\n【查询出错：{e}】"
+            full_answer.append(err)
+            yield err
+            return
         if save_answer and full_answer:
             await self._save_answer_as_synthesis(question, "".join(full_answer))
 

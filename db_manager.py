@@ -172,7 +172,7 @@ def get_active_count(task_id: str) -> int:
     return row['c'] if row else 0
 
 def mark_url_scraped(task_id: str, url: str, title: str = None, saved_file: str = None,
-                     content_hash: str = None):
+                     content_hash: str = None, bump_count: bool = True):
     ts = datetime.utcnow().isoformat()
     conn = get_db_connection()
     conn.execute(
@@ -180,9 +180,13 @@ def mark_url_scraped(task_id: str, url: str, title: str = None, saved_file: str 
            last_crawled_at=? WHERE task_id=? AND url=?''',
         (title, saved_file, content_hash, ts, task_id, url)
     )
-    conn.execute(
-        'UPDATE tasks SET total_scraped=total_scraped+1 WHERE task_id=?', (task_id,)
-    )
+    # bump_count=False for re-crawls of unchanged pages (update_mode) — the
+    # page was already counted when first scraped; counting it again would
+    # inflate total_scraped past the actual number of saved files on disk.
+    if bump_count:
+        conn.execute(
+            'UPDATE tasks SET total_scraped=total_scraped+1 WHERE task_id=?', (task_id,)
+        )
     conn.commit()
     conn.close()
 

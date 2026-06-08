@@ -516,7 +516,8 @@ async def process_single_url(task_id: str, current_url: str, start_url: str,
             if old_hash and old_hash == new_hash:
                 push_status(task_id, f"✓ 未变化: {title}", "info")
                 await asyncio.to_thread(
-                    db_manager.mark_url_scraped, task_id, current_url, title, None, new_hash
+                    db_manager.mark_url_scraped, task_id, current_url, title, None, new_hash,
+                    bump_count=False
                 )
                 record_domain_success(domain)
                 return
