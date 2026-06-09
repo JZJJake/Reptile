@@ -667,9 +667,50 @@ let viewerHistory = [];        // navigation stack [{title, html}]
 (function boot() {
   if (!API_KEY) { window.location.href = '/'; return; }
   loadDomains();
-  reconnectActiveBuild();
+  reconnectActiveScrape();   // restore scrape task state first
+  reconnectActiveBuild();    // then wiki build state
   setInterval(loadDomains, 15000);
 })();
+
+// On page refresh / reconnect, check whether a scrape task is still running
+// on the server and restore the UI to that state (buttons, status, counts)
+// instead of showing a blank idle page.
+async function reconnectActiveScrape() {
+  try {
+    const d = await (await fetch('/api/scrape/active')).json();
+    if (!d.active || !d.active.length) return;
+    const task = d.active[0];   // restore the most recent active task
+    taskId   = task.task_id;
+    isRunning = task.status === 'running';
+    isPaused  = task.status === 'paused';
+
+    // Restore header / log label from saved start_url
+    let host = task.start_url;
+    try { host = new URL(task.start_url).hostname; } catch(_) {}
+    document.getElementById('hdr-domain').textContent = host;
+    document.getElementById('log-lbl').innerHTML =
+      `${isPaused ? '已暂停: ' : '采集中: '}<b>${esc(host)}</b>`;
+
+    // Restore counts from DB
+    const st = await (await fetch(`/api/scrape/status/${taskId}`)).json();
+    pagesDone  = st.pages_scraped || 0;
+    pagesQueue = st.pages_queued  || 0;
+    updateCount();
+
+    // Restore button states
+    document.getElementById('btn-start').disabled = isRunning || isPaused;
+    document.getElementById('btn-stop').disabled  = false;
+    document.getElementById('btn-pause').disabled = false;
+    document.getElementById('btn-pause').textContent = isPaused ? '▶' : '⏸';
+
+    setStatus(isPaused ? 'paused' : 'running');
+    switchTab('log');
+
+    // Show reconnect notice then reattach SSE stream for live events
+    appendLog('--:--', `↩ 重新连接至进行中的任务 (${taskId.slice(0,8)}…) · 已保存 ${pagesDone} 篇`, 'info');
+    subscribeSSE(taskId);
+  } catch(_) {}
+}
 
 // If a wiki build is already running on the server (e.g. after a page reload),
 // reattach the live log so progress and breakpoint-resume stay visible.
@@ -1324,7 +1365,9 @@ function updateGraphVis(data) {
     .on('click', (e, d) => {
       e.stopPropagation();
       const dom = document.getElementById('graph-sel').value;
-      if (dom) viewWikiPage({ dataset: { wiki: d.name } });
+      // Pass the exact page path (d.id) for reliable lookup — node names are
+      // now real (often Chinese) titles that won't slug-match English filenames.
+      if (dom) viewWikiPage({ dataset: { wiki: d.name, path: d.id } });
     });
 
   // Glow ring only for high-degree curated nodes (not atoms)
@@ -1363,10 +1406,13 @@ function updateGraphVis(data) {
   });
   graphSimulation.force('link').links(data.links);
 
-  // Only heat up simulation when genuinely new nodes appear — existing nodes stay put
+  // Only heat up simulation when the node set actually changes (additions or
+  // removals) — a same-set refresh leaves existing nodes' positions untouched
   const prevIds = new Set(graphData.nodes.map(n => n.id));
-  const hasNew  = data.nodes.some(n => !prevIds.has(n.id));
-  graphSimulation.alpha(hasNew ? 0.4 : 0.03).restart();
+  const newIds  = new Set(data.nodes.map(n => n.id));
+  const changed = data.nodes.some(n => !prevIds.has(n.id)) ||
+                  graphData.nodes.some(n => !newIds.has(n.id));
+  graphSimulation.alpha(changed ? 0.4 : 0.03).restart();
 
   const st = data.stats || {};
   const atomN    = st.atom_nodes    ?? data.nodes.filter(n => n.type === 'atom').length;
@@ -1511,12 +1557,16 @@ function closeWikiViewer() {
 
 async function viewWikiPage(el) {
   const name = el.dataset.wiki;
+  const path = el.dataset.path;
   const domain = currentViewDomain || document.getElementById('chat-sel').value;
   if (!domain || !name) return;
+  // Prefer the exact page path (set by graph node clicks) — Chinese titles
+  // won't fuzzy-match LLM-generated English/pinyin filenames.
+  const lookupKey = path || name;
   const isOpen = document.getElementById('wiki-viewer').style.display === 'flex';
   try {
     const resp = await fetch(
-      `/api/wiki/find/${encodeURIComponent(domain)}?name=${encodeURIComponent(name)}`
+      `/api/wiki/find/${encodeURIComponent(domain)}?name=${encodeURIComponent(lookupKey)}`
     );
     if (!resp.ok) {
       const html = `<p class="md-p" style="color:var(--muted)">未找到知识库页面：[[${name}]]</p>`;

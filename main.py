@@ -334,9 +334,16 @@ async def wiki_query(req: WikiQueryRequest):
     if req.stream:
         async def event_stream():
             for mgr in managers:
-                gen = await mgr.query(req.question, stream=True)
-                async for chunk in gen:
-                    yield f"data: {json.dumps({'delta': chunk}, ensure_ascii=False)}\n\n"
+                try:
+                    gen = await mgr.query(req.question, stream=True)
+                    async for chunk in gen:
+                        yield f"data: {json.dumps({'delta': chunk}, ensure_ascii=False)}\n\n"
+                except Exception as e:
+                    # Isolate per-domain failures in multi-domain queries — one
+                    # bad manager (bad API key, I/O error) shouldn't silently
+                    # truncate the whole stream with no [DONE]/error frame.
+                    err = f"\n\n【{mgr.domain} 查询出错：{e}】"
+                    yield f"data: {json.dumps({'delta': err}, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
         return StreamingResponse(event_stream(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -361,7 +368,7 @@ async def wiki_graph(domain: str):
     """
     import re as _re
     from pathlib import Path as _Path
-    from wiki.wiki_manager import WikiManager
+    from wiki.wiki_manager import WikiManager, slugify, is_cjk
     from collections import defaultdict
 
     mgr = WikiManager(domain, "")
@@ -383,7 +390,9 @@ async def wiki_graph(domain: str):
         content = mgr.read_page(p) or ""
         page_contents[p] = content
         seg   = p.split("/")
-        dtype = seg[0] if len(seg) > 1 else "root"
+        # "atoms/" dir → singular "atom" type (matches GCOLOR/JS comparisons);
+        # any other subdir keeps its name; root-level pages → "root"
+        dtype = "atom" if seg[0] == "atoms" else (seg[0] if len(seg) > 1 else "root")
         slug_name = _Path(p).stem.replace("-", " ")
         node_map[p] = {
             "id":     p,
@@ -391,6 +400,33 @@ async def wiki_graph(domain: str):
             "type":   dtype,
             "degree": 0,
         }
+
+    # ── shared name resolution: [[citations]]/relations reference pages by
+    # their (often Chinese) display TITLE, but filenames are LLM-generated
+    # English/pinyin slugs per schema convention — neither alone reliably
+    # matches the other, so check both slug forms for every node. ──
+    node_slugs: dict[str, tuple[str, str]] = {
+        tp: (_Path(tp).stem.lower(), slugify(node_map[tp]["name"]))
+        for tp in node_map
+    }
+
+    def _match_node(name: str) -> "str | None":
+        slug = slugify(name)
+        if not slug:
+            return None
+        for tp, (stem_slug, title_slug) in node_slugs.items():
+            if slug == stem_slug or slug == title_slug:
+                return tp
+        # CJK substrings carry more meaning per character than ASCII ones
+        # (e.g. "api"/"gpt" are too short to substring-match safely)
+        min_len = 2 if any(is_cjk(ch) for ch in slug) else 4
+        if len(slug) < min_len:
+            return None
+        for tp, (stem_slug, title_slug) in node_slugs.items():
+            if (slug in stem_slug or stem_slug in slug
+                    or slug in title_slug or title_slug in slug):
+                return tp
+        return None
 
     # ── links from [[citations]] in curated (non-atom) pages ──
     link_set: set[tuple] = set()
@@ -401,13 +437,7 @@ async def wiki_graph(domain: str):
         if p.startswith("atoms/"):
             continue  # raw atoms don't carry curated citations
         for cite in cite_re.findall(content):
-            slug = _re.sub(r'[^a-z0-9一-鿿]+', '-', cite.lower()).strip('-')
-            target = next(
-                (tp for tp in node_map
-                 if slug == _Path(tp).stem.lower()
-                 or (len(slug) > 2 and slug in _Path(tp).stem.lower())),
-                None,
-            )
+            target = _match_node(cite)
             if target and target != p and (p, target) not in link_set:
                 link_set.add((p, target))
                 links.append({"source": p, "target": target, "type": "citation"})
@@ -421,10 +451,8 @@ async def wiki_graph(domain: str):
     )
     for m in rel_re.finditer(rel_content):
         src_name, rel_type, tgt_name = m.group(1), m.group(2), m.group(3)
-        src_slug = _re.sub(r'[^a-z0-9一-鿿]+', '-', src_name.lower()).strip('-')
-        tgt_slug = _re.sub(r'[^a-z0-9一-鿿]+', '-', tgt_name.lower()).strip('-')
-        sp  = next((tp for tp in node_map if src_slug in _Path(tp).stem.lower()), None)
-        tp_ = next((tp for tp in node_map if tgt_slug in _Path(tp).stem.lower()), None)
+        sp  = _match_node(src_name)
+        tp_ = _match_node(tgt_name)
         if sp and tp_ and sp != tp_ and (sp, tp_) not in link_set:
             link_set.add((sp, tp_))
             links.append({"source": sp, "target": tp_, "type": rel_type[:20]})
@@ -433,7 +461,9 @@ async def wiki_graph(domain: str):
 
     # ── Stage-1 atom concept-tag edges (active even before Stage 2) ──
     # Parse "概念标签: tag1, tag2" from each atom and connect atoms that share tags.
-    tag_re  = _re.compile(r'概念标签[：:]\s*([^\n]+)')
+    # Primary field name per schema.py; fallbacks tolerate minor LLM format
+    # drift (synonyms the model may substitute for "概念标签").
+    tag_re = _re.compile(r'(?:概念标签|标签|关键词|主题词)[：:]\s*([^\n]+)')
     tag_map: "defaultdict[str, list[str]]" = defaultdict(list)
     for p, content in page_contents.items():
         if not p.startswith("atoms/"):
@@ -492,14 +522,24 @@ async def wiki_save_synthesis(req: SaveSynthesisRequest):
 @wiki_router.get("/find/{domain}")
 async def wiki_find_page(domain: str, name: str = ""):
     """Find a wiki page by name — searches all subdirectories for a matching stem."""
-    import re as _re
     from pathlib import Path
-    from wiki.wiki_manager import WikiManager
+    from wiki.wiki_manager import WikiManager, slugify, is_cjk
     mgr = WikiManager(domain, "")
-    search = _re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')
+    # Exact-path fast path: graph clicks pass the real page path (e.g.
+    # "concepts/digital-currency-policy.md") since titles are now Chinese
+    # and won't fuzzy-match LLM-generated English/pinyin filenames below.
+    if name.endswith(".md") and "/" in name:
+        content = mgr.read_page(name)
+        if content:
+            return {"path": name, "name": name, "content": content}
+    # CJK-aware slugify (matches _atom_slug / wiki_graph): preserves Chinese
+    # chars instead of stripping them — names/titles are now mostly Chinese.
+    search = slugify(name)
+    has_cjk  = any(is_cjk(ch) for ch in search)
+    min_len  = 2 if has_cjk else 4   # CJK substrings carry more meaning per char
     for page_path in mgr.list_pages():
         stem = Path(page_path).stem.lower()
-        if stem == search or (len(search) > 3 and (search in stem or stem in search)):
+        if stem == search or (len(search) >= min_len and (search in stem or stem in search)):
             content = mgr.read_page(page_path)
             if content:
                 return {"path": page_path, "name": name, "content": content}

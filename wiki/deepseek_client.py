@@ -77,8 +77,18 @@ async def _stream_response(headers: dict, payload: dict,
                     break
                 try:
                     data = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                if "error" in data:
+                    # DeepSeek sends error-shaped SSE events mid-stream for
+                    # rate limiting / content filtering instead of raising at
+                    # connect time — surface it instead of dropping it silently.
+                    err = data["error"]
+                    msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                    raise RuntimeError(f"DeepSeek 流式响应错误: {msg}")
+                try:
                     delta = data["choices"][0]["delta"].get("content", "")
                     if delta:
                         yield delta
-                except (json.JSONDecodeError, KeyError, IndexError):
+                except (KeyError, IndexError):
                     continue
