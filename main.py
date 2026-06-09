@@ -537,17 +537,40 @@ async def wiki_find_page(domain: str, name: str = ""):
         content = mgr.read_page(name)
         if content:
             return {"path": name, "name": name, "content": content}
-    # CJK-aware slugify (matches _atom_slug / wiki_graph): preserves Chinese
-    # chars instead of stripping them — names/titles are now mostly Chinese.
+
     search = slugify(name)
-    has_cjk  = any(is_cjk(ch) for ch in search)
-    min_len  = 2 if has_cjk else 4   # CJK substrings carry more meaning per char
-    for page_path in mgr.list_pages():
+    has_cjk = any(is_cjk(ch) for ch in search)
+    min_len = 2 if has_cjk else 4   # CJK substrings carry more meaning per char
+    pages = mgr.list_pages()
+
+    # Pass 1: filename-stem search
+    for page_path in pages:
         stem = Path(page_path).stem.lower()
         if stem == search or (len(search) >= min_len and (search in stem or stem in search)):
             content = mgr.read_page(page_path)
             if content:
                 return {"path": page_path, "name": name, "content": content}
+
+    # Pass 2: page-title search — handles the common case where DeepSeek cites
+    # "数字货币" but the file is named "digital-currency.md" with "# 数字货币"
+    # as its first heading. Read the first # line of each page and compare.
+    for page_path in pages:
+        content = mgr.read_page(page_path)
+        if not content:
+            continue
+        title = ""
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("# "):
+                title = stripped[2:].strip()
+                break
+        if not title:
+            continue
+        title_slug = slugify(title)
+        if title_slug == search or (len(search) >= min_len and
+                                    (search in title_slug or title_slug in search)):
+            return {"path": page_path, "name": name, "content": content}
+
     raise HTTPException(status_code=404, detail=f"未找到页面: {name}")
 
 @wiki_router.post("/lint")
