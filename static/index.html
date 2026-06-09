@@ -482,6 +482,22 @@ input:focus, select:focus { border-color: var(--accent); }
 }
 .save-wiki-btn:hover { background: #1c3a6b; color: #79c0ff; border-color: #1f6feb; }
 .save-wiki-btn:disabled { opacity: .4; cursor: default; }
+/* ── Download mode pills ── */
+.mode-pills { display:flex; gap:4px; margin-bottom:4px; }
+.mode-pills .pill { flex:1; padding:5px 0; font-size:11px; border-radius:4px;
+  border:1px solid var(--border); background:var(--panel); cursor:pointer;
+  color:var(--muted); transition:background .15s,color .15s; }
+.mode-pills .pill.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+/* ── Graph controls ── */
+.graph-controls {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 5px 14px; border-bottom: 1px solid var(--border);
+  background: var(--surface); flex-shrink: 0; font-size: 11px; color: var(--muted);
+}
+.ctrl-group { display: flex; align-items: center; gap: 5px; }
+.ctrl-group label { white-space: nowrap; }
+.ctrl-group input[type=range] { width: 70px; accent-color: var(--accent); }
+.ctrl-group input[type=checkbox] { width:auto; accent-color: var(--accent); }
 </style>
 </head>
 <body>
@@ -506,6 +522,17 @@ input:focus, select:focus { border-color: var(--accent); }
       <label class="field-lbl">目标网址</label>
       <input type="url" id="url-input" placeholder="https://example.com/docs/"
              onkeydown="if(event.key==='Enter') startTask()">
+      <label class="field-lbl" style="margin-top:8px">下载模式</label>
+      <div class="mode-pills" id="download-mode-pills">
+        <button class="pill active" data-mode="all"    onclick="setDownloadMode(this)">全站</button>
+        <button class="pill"        data-mode="single" onclick="setDownloadMode(this)">单页</button>
+        <button class="pill"        data-mode="date"   onclick="setDownloadMode(this)">按日期</button>
+      </div>
+      <div id="date-filter-row" style="display:none;margin-bottom:6px">
+        <label class="field-lbl">发布日期 ≥</label>
+        <input type="month" id="date-from-input"
+               style="width:100%;background:var(--panel);color:var(--fg,#e6edf3);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px">
+      </div>
       <div class="chk-row">
         <input type="checkbox" id="chk-update">
         <label for="chk-update">迭代更新（跳过已下载内容）</label>
@@ -613,6 +640,29 @@ input:focus, select:focus { border-color: var(--accent); }
         <button class="btn btn-ghost" onclick="refreshGraph()"
                 style="padding:4px 10px;font-size:11px;flex-shrink:0">↻ 刷新</button>
       </div>
+      <!-- Obsidian-style graph controls -->
+      <div class="graph-controls">
+        <div class="ctrl-group">
+          <label>斥力</label>
+          <input type="range" id="ctrl-repulsion" min="-800" max="-50" value="-280" step="10"
+                 oninput="applyGraphForces()">
+        </div>
+        <div class="ctrl-group">
+          <label>连线距离</label>
+          <input type="range" id="ctrl-distance" min="30" max="250" value="90" step="5"
+                 oninput="applyGraphForces()">
+        </div>
+        <div class="ctrl-group">
+          <label>引力</label>
+          <input type="range" id="ctrl-gravity" min="1" max="20" value="4" step="1"
+                 oninput="applyGraphForces()">
+        </div>
+        <div class="ctrl-group">
+          <label><input type="checkbox" id="ctrl-atoms" checked onchange="applyGraphForces()"> 显示原子</label>
+        </div>
+        <button class="btn btn-ghost" style="padding:4px 10px;font-size:11px;flex-shrink:0"
+                onclick="fitGraphToScreen()">⛶ 适配视图</button>
+      </div>
       <div class="graph-canvas" id="graph-canvas">
         <svg id="wiki-graph-svg" width="100%" height="100%"></svg>
         <div class="graph-empty" id="graph-empty">
@@ -670,6 +720,15 @@ let viewerHistory = [];        // navigation stack [{title, html}]
   reconnectActiveScrape();   // restore scrape task state first
   reconnectActiveBuild();    // then wiki build state
   setInterval(loadDomains, 15000);
+
+  // Initialize date picker bounds (1-5 years ago, month precision)
+  const _now = new Date();
+  const _inp = document.getElementById('date-from-input');
+  if (_inp) {
+    _inp.max   = _now.toISOString().slice(0, 7);
+    _inp.min   = new Date(_now.getFullYear() - 5, _now.getMonth(), 1).toISOString().slice(0, 7);
+    _inp.value = new Date(_now.getFullYear() - 1, _now.getMonth(), 1).toISOString().slice(0, 7);
+  }
 })();
 
 // On page refresh / reconnect, check whether a scrape task is still running
@@ -822,6 +881,14 @@ function pickChatDomain(domain) {
   switchTab('chat');
 }
 
+// ── Download mode ──────────────────────────────────────────────────────────────
+function setDownloadMode(btn) {
+  document.querySelectorAll('#download-mode-pills .pill').forEach(p => p.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('date-filter-row').style.display =
+    btn.dataset.mode === 'date' ? 'block' : 'none';
+}
+
 // ── Task control ───────────────────────────────────────────────────────────────
 async function startTask() {
   const url = document.getElementById('url-input').value.trim();
@@ -840,6 +907,9 @@ async function startTask() {
         api_key: API_KEY,
         update_data: document.getElementById('chk-rebuild').checked,
         update_mode: document.getElementById('chk-update').checked,
+        single_page: (document.querySelector('#download-mode-pills .pill.active')?.dataset.mode || 'all') === 'single',
+        date_from: (document.querySelector('#download-mode-pills .pill.active')?.dataset.mode || 'all') === 'date'
+                   ? (document.getElementById('date-from-input').value || '') : '',
       }),
     });
     const d = await r.json();
@@ -1144,7 +1214,8 @@ async function streamWikiQuery(domain, question, typingId) {
   const resp = await fetch('/api/wiki/query', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ question, domain, api_key: API_KEY, stream: true }),
+    body: JSON.stringify({ question, domain, api_key: API_KEY, stream: true,
+                          history: chatHistory.slice(0, -1) }),
   });
   if (!resp.ok) {
     if (resp.status === 404) return streamDirect(typingId);
@@ -1456,6 +1527,57 @@ function onGraphSelChange() {
 
 function toggleGraphAuto(on) {
   on ? startGraphAutoRefresh() : stopGraphAutoRefresh();
+}
+
+// ── Graph force controls (Obsidian-style) ──────────────────────────────────────
+function applyGraphForces() {
+  if (!graphSimulation) return;
+  const repulsion = +document.getElementById('ctrl-repulsion').value;
+  const distance  = +document.getElementById('ctrl-distance').value;
+  const gravity   = +document.getElementById('ctrl-gravity').value * 0.005;
+  const showAtoms = document.getElementById('ctrl-atoms').checked;
+
+  graphSimulation
+    .force('charge', d3.forceManyBody().strength(repulsion).distanceMax(500))
+    .force('link', d3.forceLink().id(d => d.id).distance(distance).strength(0.45))
+    .force('x', d3.forceX(graphSvgRoot.attr('width') / 2 || 450).strength(gravity))
+    .force('y', d3.forceY(graphSvgRoot.attr('height') / 2 || 280).strength(gravity));
+  graphSimulation.alpha(0.3).restart();
+
+  if (graphSvgRoot) {
+    graphSvgRoot.select('.g-nodes').selectAll('.g-node')
+      .attr('display', d => (!showAtoms && d.type === 'atom') ? 'none' : null);
+    graphSvgRoot.select('.g-links').selectAll('.g-link')
+      .attr('display', d => {
+        if (!showAtoms) {
+          const st = (d.source && d.source.type) ? d.source.type : '';
+          const tt = (d.target && d.target.type) ? d.target.type : '';
+          if (st === 'atom' || tt === 'atom') return 'none';
+        }
+        return null;
+      });
+  }
+}
+
+function fitGraphToScreen() {
+  if (!graphSvgRoot) return;
+  const root = graphSvgRoot.select('.graph-root').node();
+  if (!root) return;
+  try {
+    const bounds = root.getBBox();
+    if (!bounds.width || !bounds.height) return;
+    const container = document.getElementById('graph-canvas');
+    const w = container.clientWidth  || 900;
+    const h = container.clientHeight || 560;
+    const scale = 0.85 * Math.min(w / bounds.width, h / bounds.height);
+    const tx = w / 2 - scale * (bounds.x + bounds.width  / 2);
+    const ty = h / 2 - scale * (bounds.y + bounds.height / 2);
+    graphSvgRoot.transition().duration(600)
+      .call(d3.zoom().scaleExtent([0.15, 5])
+               .on('zoom', e => graphSvgRoot.select('.graph-root').attr('transform', e.transform))
+               .transform,
+            d3.zoomIdentity.translate(tx, ty).scale(scale));
+  } catch(e) { /* getBBox may fail on empty graph */ }
 }
 function startGraphAutoRefresh() {
   if (graphAutoTimer) return;

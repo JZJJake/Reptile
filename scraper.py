@@ -45,7 +45,12 @@ CIRCUIT_COOLDOWN = 300
 _domain_last_request: dict = {}
 DOMAIN_MIN_INTERVAL = 1.5      # seconds
 
-DATE_WINDOW_YEARS = 1          # only content published within this many years
+# Branch skip throttle — tracks consecutive skips under each parent URL.
+# When a parent's children are all being filtered (list pages, too short,
+# date-filtered…) the remaining siblings are fast-skipped without loading,
+# preventing depth-first spirals that waste workers on dead branches.
+_branch_skip_counts: dict = {}   # {f"{task_id}:{parent_url}": int}
+BRANCH_SKIP_THRESHOLD = 8        # skip without browser fetch after this many consecutive sibling skips
 
 # ── Initialisation ───────────────────────────────────────────────────────────
 
@@ -174,15 +179,17 @@ def parse_publish_date(date_str: str):
                 continue
     return None
 
-def is_within_date_window(date_str, years: int = DATE_WINDOW_YEARS) -> bool:
-    """True if date is within `years` of today, or if date is None/unparseable."""
-    if not date_str:
+def is_within_date_window(date_str, cutoff_date=None) -> bool:
+    """True if content is within the date window, or if date is unparseable (safe default).
+    cutoff_date=None means no filter (keep all content regardless of date)."""
+    if cutoff_date is None:
         return True
+    if not date_str:
+        return True      # missing date → assume recent
     dt = parse_publish_date(date_str)
     if dt is None:
-        return True
-    cutoff = datetime.now(timezone.utc) - timedelta(days=years * 365)
-    return dt >= cutoff
+        return True      # unparseable → assume recent
+    return dt >= cutoff_date
 
 # ── Content extraction ───────────────────────────────────────────────────────
 
@@ -402,13 +409,24 @@ async def check_pause_stop(task_id: str) -> bool:
 
 async def process_single_url(task_id: str, current_url: str, start_url: str,
                               base_path: str, browser, selectors: dict,
-                              update_mode: bool = False) -> None:
+                              update_mode: bool = False,
+                              single_page: bool = False,
+                              date_cutoff=None,
+                              parent_url: str = None) -> None:
     """Process one URL: load, extract with selectors, save flat markdown."""
 
     if await check_pause_stop(task_id):
         return
 
     domain = _get_domain(current_url)
+
+    # Branch throttle: if this parent's siblings have been skipped too many
+    # times in a row, fast-skip without loading the page at all.
+    branch_key = f"{task_id}:{parent_url or ''}"
+    if parent_url and _branch_skip_counts.get(branch_key, 0) >= BRANCH_SKIP_THRESHOLD:
+        push_status(task_id, f"↩ 快速跳过 (父级分支连续跳过 {_branch_skip_counts[branch_key]} 次): {current_url}", "info")
+        await asyncio.to_thread(db_manager.mark_url_filtered, task_id, current_url, "branch_throttled")
+        return
 
     if check_circuit(domain):
         push_status(task_id, f"⚡ 跳过 {current_url} (线路熔断)", "warn")
@@ -467,10 +485,11 @@ async def process_single_url(task_id: str, current_url: str, start_url: str,
             task_root_prefixes[task_id] = dynamic_root
             await asyncio.to_thread(db_manager.update_task_dynamic_root, task_id, dynamic_root)
 
-        # Discover new links
-        new_links = get_sub_domain_links(html_content, current_url, start_url, dynamic_root)
-        if new_links:
-            await asyncio.to_thread(db_manager.add_discovered_urls, task_id, current_url, new_links)
+        # Discover new links (skipped in single_page mode)
+        if not single_page:
+            new_links = get_sub_domain_links(html_content, current_url, start_url, dynamic_root)
+            if new_links:
+                await asyncio.to_thread(db_manager.add_discovered_urls, task_id, current_url, new_links)
 
         # ── Extract content ──
         full_soup = BeautifulSoup(html_content, 'lxml')
@@ -480,31 +499,34 @@ async def process_single_url(task_id: str, current_url: str, start_url: str,
         date_str = extracted['date_str']
         content_md = extracted['content_md'] or ''
 
-        # ── Date filter ──
-        if not is_within_date_window(date_str):
-            push_status(task_id, f"📅 跳过 (时间超出范围 {date_str}): {current_url}", "info")
-            await asyncio.to_thread(
-                db_manager.mark_url_filtered, task_id, current_url,
-                f"date_out_of_window:{date_str}"
-            )
+        def _skip(reason_label: str, db_reason: str):
+            """Record a skip and increment the branch-skip counter."""
+            push_status(task_id, f"{reason_label}: {current_url}", "info")
+            asyncio.ensure_future(asyncio.to_thread(
+                db_manager.mark_url_filtered, task_id, current_url, db_reason
+            ))
+            if parent_url:
+                _branch_skip_counts[branch_key] = _branch_skip_counts.get(branch_key, 0) + 1
+
+        # ── Date filter (only active when caller passes a cutoff) ──
+        if not is_within_date_window(date_str, cutoff_date=date_cutoff):
+            _skip(f"📅 跳过 (时间超出范围 {date_str})", f"date_out_of_window:{date_str}")
             return
 
         # Skip list/navigation pages — keep them for link discovery (already
         # done above) but don't save them as knowledge content.
         if is_list_page(current_url):
-            push_status(task_id, f"↩ 跳过 (列表/导航页): {current_url}", "info")
-            await asyncio.to_thread(
-                db_manager.mark_url_filtered, task_id, current_url, "list_page"
-            )
+            _skip("↩ 跳过 (列表/导航页)", "list_page")
             return
 
         # Skip near-empty pages (navigation hubs / index pages)
         if len(content_md.strip()) < 100:
-            push_status(task_id, f"↩ 跳过 (内容过少): {current_url}", "info")
-            await asyncio.to_thread(
-                db_manager.mark_url_filtered, task_id, current_url, "content_too_short"
-            )
+            _skip("↩ 跳过 (内容过少)", "content_too_short")
             return
+
+        # Page has real content — reset the branch-skip counter
+        if parent_url:
+            _branch_skip_counts.pop(branch_key, None)
 
         # ── Build markdown ──
         markdown = build_markdown_file(title, current_url, date_str, content_md)
@@ -553,22 +575,29 @@ async def process_single_url(task_id: str, current_url: str, start_url: str,
 
 async def worker_task(task_id: str, start_url: str, base_path: str, browser,
                       semaphore: asyncio.Semaphore, selectors: dict,
-                      update_mode: bool = False):
+                      update_mode: bool = False,
+                      single_page: bool = False,
+                      date_cutoff=None):
     async with semaphore:
         try:
             if await check_pause_stop(task_id):
                 return False
 
-            current_url = await asyncio.to_thread(db_manager.get_and_lock_pending_url, task_id)
-            if not current_url:
+            result = await asyncio.to_thread(db_manager.get_and_lock_pending_url, task_id)
+            if not result:
                 return True
+            current_url, parent_url = result
 
             delay = random.uniform(1.0, 2.5)
             await asyncio.sleep(delay)
 
             await process_single_url(
                 task_id, current_url, start_url, base_path,
-                browser, selectors, update_mode=update_mode
+                browser, selectors,
+                update_mode=update_mode,
+                single_page=single_page,
+                date_cutoff=date_cutoff,
+                parent_url=parent_url,
             )
             return True
         except asyncio.CancelledError:
@@ -582,7 +611,9 @@ async def worker_task(task_id: str, start_url: str, base_path: str, browser,
 # ── Main crawl worker ────────────────────────────────────────────────────────
 
 async def crawl_worker(task_id: str, start_url: str, api_key: str,
-                       update_mode: bool = False):
+                       update_mode: bool = False,
+                       single_page: bool = False,
+                       date_from: str = ""):
     """
     Background manager:
     1. Analyses site structure with DeepSeek (once per domain, cached)
@@ -594,6 +625,15 @@ async def crawl_worker(task_id: str, start_url: str, api_key: str,
     base_path, base_domain = setup_base_directory(start_url)
     await asyncio.to_thread(db_manager.create_task, task_id, start_url, start_url)
     await asyncio.to_thread(db_manager.update_task_base_path, task_id, base_path)
+
+    # Parse cutoff date from "YYYY-MM" string
+    date_cutoff = None
+    if date_from:
+        try:
+            y, m = int(date_from[:4]), int(date_from[5:7])
+            date_cutoff = datetime(y, m, 1, tzinfo=timezone.utc)
+        except (ValueError, IndexError):
+            pass
 
     semaphore = asyncio.Semaphore(5)
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
@@ -677,7 +717,10 @@ async def crawl_worker(task_id: str, start_url: str, api_key: str,
                 while len(active_tasks) < 5 and active_count > 0:
                     t = asyncio.create_task(
                         worker_task(task_id, start_url, base_path, browser,
-                                    semaphore, selectors, update_mode=update_mode)
+                                    semaphore, selectors,
+                                    update_mode=update_mode,
+                                    single_page=single_page,
+                                    date_cutoff=date_cutoff)
                     )
                     active_tasks.add(t)
                     active_count -= 1

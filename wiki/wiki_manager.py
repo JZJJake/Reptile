@@ -649,7 +649,8 @@ class WikiManager:
             return []
 
     async def query(self, question: str, stream: bool = True,
-                    save_answer: bool = False) -> "AsyncGenerator[str, None] | str":
+                    save_answer: bool = False,
+                    history: list = None) -> "AsyncGenerator[str, None] | str":
         """
         Answer a question from the wiki (not raw sources).
         Two steps:
@@ -703,15 +704,19 @@ class WikiManager:
             pages_content = await asyncio.to_thread(self._find_relevant_pages, question)
 
         # Step 2: answer
-        messages = [
-            {"role": "system", "content": DEFAULT_SCHEMA},
-            {"role": "user",   "content": QUERY_PROMPT_TEMPLATE.format(
-                index_content=index_content,
-                relations_content=relations_content,
-                pages_content=pages_content,
-                question=question,
-            )},
-        ]
+        query_turn = QUERY_PROMPT_TEMPLATE.format(
+            index_content=index_content,
+            relations_content=relations_content,
+            pages_content=pages_content,
+            question=question,
+        )
+        messages = [{"role": "system", "content": DEFAULT_SCHEMA}]
+        # Inject prior conversation turns for multi-turn context
+        if history:
+            for msg in history:
+                if msg.get("role") in ("user", "assistant") and msg.get("content"):
+                    messages.append({"role": msg["role"], "content": msg["content"]})
+        messages.append({"role": "user", "content": query_turn})
 
         if stream:
             return self._stream_query(messages, question, save_answer)
