@@ -76,6 +76,8 @@ class ScrapeRequest(BaseModel):
     api_key: str
     update_data: bool = False   # clear DB and re-crawl from scratch
     update_mode: bool = False   # iterative: skip unchanged pages
+    single_page: bool = False   # scrape only the start URL, no link discovery
+    date_from: str = ""         # "YYYY-MM" cutoff; empty = no date filter
 
 @app.post("/api/scrape/start")
 async def start_scraping(req: ScrapeRequest, background_tasks: BackgroundTasks):
@@ -102,6 +104,8 @@ async def start_scraping(req: ScrapeRequest, background_tasks: BackgroundTasks):
         req.url,
         req.api_key,
         req.update_mode,
+        req.single_page,
+        req.date_from,
     )
 
     return {"task_id": task_id, "status": "started"}
@@ -210,6 +214,7 @@ class WikiQueryRequest(BaseModel):
     domain: Optional[str] = None
     api_key: str
     stream: bool = True
+    history: list = []   # prior turns: [{"role":"user","content":"..."},...]
 
 def _wiki_queue_id(domain: str) -> str:
     return f"wiki::{domain}"
@@ -335,7 +340,7 @@ async def wiki_query(req: WikiQueryRequest):
         async def event_stream():
             for mgr in managers:
                 try:
-                    gen = await mgr.query(req.question, stream=True)
+                    gen = await mgr.query(req.question, stream=True, history=req.history)
                     async for chunk in gen:
                         yield f"data: {json.dumps({'delta': chunk}, ensure_ascii=False)}\n\n"
                 except Exception as e:
@@ -350,7 +355,7 @@ async def wiki_query(req: WikiQueryRequest):
     else:
         parts = []
         for mgr in managers:
-            answer = await mgr.query(req.question, stream=False)
+            answer = await mgr.query(req.question, stream=False, history=req.history)
             parts.append(answer)
         return {"answer": "\n\n".join(parts)}
 
