@@ -126,13 +126,16 @@ def get_active_tasks() -> List[dict]:
 
 # ── URLs ─────────────────────────────────────────────────────────────────────
 
-def get_and_lock_pending_url(task_id: str) -> Optional[str]:
+def get_and_lock_pending_url(task_id: str) -> "Optional[tuple[str, Optional[str]]]":
+    """Return (url, parent_url) for the next pending URL, or None.
+    Uses FIFO ordering (ORDER BY id ASC) for breadth-first crawl — avoids
+    depth-first spirals where a dead branch consumes all workers."""
     conn = None
     try:
         conn = get_db_connection()
         conn.execute("BEGIN EXCLUSIVE")
         row = conn.execute(
-            'SELECT url FROM urls WHERE task_id=? AND status=? ORDER BY id DESC LIMIT 1',
+            'SELECT url, parent_url FROM urls WHERE task_id=? AND status=? ORDER BY id ASC LIMIT 1',
             (task_id, 'pending')
         ).fetchone()
         if row:
@@ -142,7 +145,7 @@ def get_and_lock_pending_url(task_id: str) -> Optional[str]:
                 ('processing', task_id, url)
             )
             conn.commit()
-            return url
+            return url, row['parent_url']
         conn.commit()
         return None
     except Exception as e:
