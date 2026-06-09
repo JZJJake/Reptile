@@ -11,3 +11,7 @@ scraper_state.db
 
 # Scraped Data
 scraped_data/
+
+# Generated wiki domain directories (runtime knowledge base data)
+# wiki/*.py source files remain tracked; only built domain dirs are ignored
+wiki/*/
