@@ -5,138 +5,418 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Reptile — 智能知识库系统</title>
 <style>
+  /* ─────────────────────────────────────────────────────────────
+     Design tokens — mirror of remotion/src/theme.ts so the live
+     hero matches the rendered brand video exactly.
+  ───────────────────────────────────────────────────────────────*/
+  :root {
+    --bg:      #0d1117;   /* canvas  */
+    --surface: #161b22;   /* card    */
+    --border:  #30363d;
+    --text:    #f0f6fc;   /* display */
+    --muted:   #8b949e;
+    --accent:  #58a6ff;   /* edges / links */
+    --node:    #3fb950;   /* active / success */
+    --synth:   #bc8cff;   /* weave highlight  */
+    --red:     #f85149;
+
+    --space-1: 4px;  --space-2: 8px;  --space-3: 12px;
+    --space-4: 16px; --space-6: 24px; --space-8: 32px;
+    --radius:  14px;
+
+    /* signature wordmark tracking — tightens on assemble */
+    --track-loose: 0.12em;
+    --track-tight: -0.035em;
+  }
+
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
+  html, body { height: 100%; }
   body {
-    font-family: 'Segoe UI', system-ui, sans-serif;
-    background: #0d1117;
-    color: #c9d1d9;
+    font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+    background: var(--bg);
+    color: var(--text);
     min-height: 100vh;
     display: flex;
     align-items: center;
     justify-content: center;
+    overflow: hidden;
+    position: relative;
   }
 
-  .card {
-    background: #161b22;
-    border: 1px solid #30363d;
-    border-radius: 12px;
-    padding: 48px 40px;
-    width: 420px;
-    max-width: 95vw;
-    box-shadow: 0 16px 48px rgba(0,0,0,.4);
+  /* ── Constellation canvas (full-bleed, behind everything) ── */
+  #constellation {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 0;
+    /* radial vignette keeps the centre quiet behind the wordmark */
+    background: radial-gradient(circle at 50% 42%, var(--surface) 0%, var(--bg) 68%);
+  }
+  #constellation svg { width: 100%; height: 100%; display: block; }
+
+  .edge {
+    stroke: var(--accent);
+    stroke-width: 1.4;
+    stroke-linecap: round;
+    stroke-dashoffset: 0;                 /* final (drawn) state = reduced-motion fallback */
+    opacity: 0.26;
+  }
+  .node-pop  { transform: scale(1); transform-origin: center; transform-box: fill-box; }
+  .node-glow { opacity: 0.2; }
+  /* sweep is hidden at rest; the animation owns its brief visibility so it
+     never gets "stuck" on the canvas edge after the crawl beat ends */
+  #sweep { opacity: 0; }
+
+  /* one-shot intro animations only run when motion is welcome */
+  @media (prefers-reduced-motion: no-preference) {
+    .edge {
+      stroke-dashoffset: var(--len);
+      animation:
+        edge-draw  0.6s cubic-bezier(.2,.8,.2,1) var(--draw-delay) forwards,
+        edge-pulse 5s   ease-in-out var(--draw-delay) infinite;
+    }
+    .node-pop {
+      transform: scale(0);
+      animation: node-pop 0.55s cubic-bezier(.2,.9,.25,1.15) var(--pop-delay) forwards;
+    }
+    .node-bob { animation: node-bob 4.5s ease-in-out var(--bob-delay) infinite alternate; }
+    .flare-ring { animation: flare-ring 0.7s ease-out var(--flare-delay) 1 both; }
+    .node-core  { animation: node-flare 0.7s ease-out var(--flare-delay) 1; }
+    #sweep      { animation: sweep 1.8s cubic-bezier(.4,0,.2,1) 0.5s 1; }
+    .wm-mark    { animation: mark-in 0.6s cubic-bezier(.2,.9,.25,1.2) 0.1s both; }
+    .wm-title   { animation: title-in 0.7s cubic-bezier(.2,.8,.2,1) 0.18s both; }
+    .wm-tag     { animation: tag-in 0.7s ease-out 0.42s both; }
+    .auth-card  { animation: card-in 0.6s cubic-bezier(.2,.8,.2,1) 0.5s both; }
   }
 
-  .logo {
-    text-align: center;
-    margin-bottom: 32px;
+  @keyframes edge-draw  { from { stroke-dashoffset: var(--len); } to { stroke-dashoffset: 0; } }
+  @keyframes edge-pulse { 0%,100% { opacity: 0.16; } 50% { opacity: 0.34; } }
+  @keyframes node-pop   { from { transform: scale(0); } to { transform: scale(1); } }
+  @keyframes node-bob   { from { transform: translateY(-3.5px); } to { transform: translateY(3.5px); } }
+  @keyframes node-flare { 0% { opacity: .7; } 22% { opacity: 1; } 100% { opacity: .9; } }
+  @keyframes flare-ring { 0% { opacity: .55; transform: scale(1); } 100% { opacity: 0; transform: scale(2.4); } }
+  @keyframes sweep      { 0% { opacity: 0; transform: translateX(0); }
+                          14% { opacity: .55; } 86% { opacity: .55; }
+                          100% { opacity: 0; transform: translateX(740px); } }
+  @keyframes mark-in    { from { opacity: 0; transform: scale(.6); } to { opacity: 1; transform: scale(1); } }
+  @keyframes title-in   { from { opacity: 0; transform: translateY(26px); letter-spacing: var(--track-loose); }
+                          to   { opacity: 1; transform: translateY(0);    letter-spacing: var(--track-tight); } }
+  @keyframes tag-in     { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } }
+  @keyframes card-in    { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+
+  /* "converge" flourish on successful auth — edges brighten + pull focus */
+  #constellation.converge .edge { animation: edge-pulse 0s; opacity: .85 !important; transition: opacity .6s ease; stroke: var(--node); }
+  #constellation.converge .node-core { fill: var(--node) !important; transition: fill .6s ease; }
+
+  /* ── Centre column ── */
+  .stage {
+    position: relative;
+    z-index: 2;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-8);
+    padding: var(--space-6);
+    width: 100%;
+    max-width: 460px;
   }
-  .logo .icon { font-size: 48px; line-height: 1; }
-  .logo h1 { font-size: 22px; font-weight: 700; color: #f0f6fc; margin-top: 10px; }
-  .logo p  { font-size: 13px; color: #8b949e; margin-top: 4px; }
 
-  .form-group { margin-bottom: 20px; }
-  label { display: block; font-size: 13px; color: #8b949e; margin-bottom: 6px; }
+  /* ── Wordmark ── */
+  .wordmark { text-align: center; }
+  .wm-mark  { font-size: 64px; line-height: 1; filter: drop-shadow(0 0 26px rgba(88,166,255,.35)); }
+  .wm-title {
+    font-weight: 800;
+    font-size: clamp(34px, 9vw, 46px);
+    color: var(--text);
+    letter-spacing: var(--track-tight);
+    margin-top: var(--space-3);
+  }
+  .wm-tag {
+    font-family: ui-monospace, 'Consolas', monospace;
+    font-size: 12px;
+    letter-spacing: 0.34em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-top: var(--space-2);
+  }
 
+  /* ── Auth card (glass over the constellation) ── */
+  .auth-card {
+    width: 100%;
+    background: rgba(22, 27, 34, 0.72);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: var(--space-8) var(--space-6);
+    box-shadow: 0 16px 48px rgba(0,0,0,.5);
+  }
+
+  .field { margin-bottom: var(--space-4); }
+  .field label {
+    display: block;
+    font-family: ui-monospace, 'Consolas', monospace;
+    font-size: 11px;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: var(--space-2);
+  }
+  .input-wrap { position: relative; }
+  .input-wrap .key-glyph {
+    position: absolute; left: 12px; top: 50%; transform: translateY(-50%);
+    color: var(--muted); font-size: 14px; pointer-events: none;
+  }
   input[type=password], input[type=text] {
     width: 100%;
-    background: #0d1117;
-    border: 1px solid #30363d;
-    border-radius: 8px;
-    color: #c9d1d9;
-    padding: 10px 14px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    color: var(--text);
+    padding: 12px 14px 12px 34px;
     font-size: 14px;
-    font-family: 'Consolas', monospace;
+    font-family: ui-monospace, 'Consolas', monospace;
     outline: none;
-    transition: border-color .15s;
+    transition: border-color .15s, box-shadow .15s;
   }
-  input:focus { border-color: #388bfd; }
+  input::placeholder { color: #4b535c; }
+  input:focus-visible {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(88,166,255,.18);
+  }
 
   .btn {
     width: 100%;
-    padding: 11px;
-    border: none;
-    border-radius: 8px;
-    background: #238636;
-    color: #fff;
+    min-height: 48px;                 /* ≥44px touch target */
+    border: 1px solid transparent;
+    border-radius: 9px;
+    background: var(--node);
+    color: #0d1117;
     font-size: 15px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: opacity .15s;
+    font-weight: 700;
     letter-spacing: .02em;
+    cursor: pointer;
+    transition: filter .15s, transform .08s;
+    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
   }
-  .btn:hover:not(:disabled) { opacity: .85; }
-  .btn:disabled { opacity: .4; cursor: not-allowed; }
+  .btn:hover:not(:disabled)  { filter: brightness(1.08); }
+  .btn:active:not(:disabled) { transform: translateY(1px); }
+  .btn:focus-visible { outline: none; box-shadow: 0 0 0 3px rgba(63,185,80,.35); }
+  .btn:disabled { opacity: .55; cursor: not-allowed; }
 
+  /* ── Feedback states — icon + text (never colour alone) ── */
   .msg {
-    margin-top: 14px;
-    padding: 10px 14px;
-    border-radius: 6px;
+    margin-top: var(--space-4);
+    padding: 11px 14px;
+    border-radius: 9px;
     font-size: 13px;
+    line-height: 1.5;
     display: none;
+    align-items: flex-start;
+    gap: 9px;
   }
-  .msg.error   { background: #2d1317; border: 1px solid #6e211f; color: #f85149; }
-  .msg.success { background: #16302b; border: 1px solid #196c2e; color: #3fb950; }
-  .msg.loading { background: #1f2d3d; border: 1px solid #1f6feb; color: #58a6ff; }
+  .msg::before { font-size: 14px; line-height: 1.4; flex-shrink: 0; }
+  .msg.error   { display: flex; background: #2d1317; border: 1px solid #6e211f; color: #ff7b72; }
+  .msg.error::before   { content: "⚠"; }
+  .msg.success { display: flex; background: #16302b; border: 1px solid #196c2e; color: var(--node); }
+  .msg.success::before { content: "✓"; }
+  .msg.loading { display: flex; background: #11243d; border: 1px solid #1f4f8f; color: var(--accent); }
+  .msg.loading::before { content: ""; }
+
+  .spinner {
+    width: 13px; height: 13px;
+    border: 2px solid rgba(88,166,255,.3);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin .7s linear infinite;
+    margin-top: 1px; flex-shrink: 0;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
 
   .hint {
-    margin-top: 20px;
+    margin-top: var(--space-6);
     font-size: 12px;
     color: #6e7681;
     text-align: center;
-    line-height: 1.6;
+    line-height: 1.7;
   }
-  .hint a { color: #58a6ff; text-decoration: none; }
-  .hint a:hover { text-decoration: underline; }
+  .hint a { color: var(--accent); text-decoration: none; }
+  .hint a:hover, .hint a:focus-visible { text-decoration: underline; }
 
-  .spinner {
-    display: inline-block;
-    width: 12px; height: 12px;
-    border: 2px solid rgba(88,166,255,.3);
-    border-top-color: #58a6ff;
-    border-radius: 50%;
-    animation: spin .7s linear infinite;
-    margin-right: 6px;
-    vertical-align: middle;
+  /* error shake — motion-safe only */
+  @media (prefers-reduced-motion: no-preference) {
+    .auth-card.shake { animation: shake .4s ease; }
   }
-  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes shake {
+    0%,100% { transform: translateX(0); }
+    20%,60% { transform: translateX(-6px); }
+    40%,80% { transform: translateX(6px); }
+  }
+
+  @media (max-width: 420px) {
+    .stage { gap: var(--space-6); padding: var(--space-4); }
+    .auth-card { padding: var(--space-6) var(--space-4); }
+  }
 </style>
 </head>
 <body>
 
-<div class="card">
-  <div class="logo">
-    <div class="icon">🦎</div>
-    <h1>Reptile 智能知识库</h1>
-    <p>请输入您的 DeepSeek API Key 以继续</p>
-  </div>
-
-  <div class="form-group">
-    <label for="apikey">DeepSeek API Key</label>
-    <input type="password" id="apikey"
-           placeholder="sk-xxxxxxxxxxxxxxxx"
-           autocomplete="off"
-           onkeydown="if(event.key==='Enter') doLogin()">
-  </div>
-
-  <button class="btn" id="login-btn" onclick="doLogin()">验证并进入系统</button>
-
-  <div class="msg" id="msg"></div>
-
-  <div class="hint">
-    API Key 仅存储在本地会话中，不会上传到任何服务器。<br>
-    获取 Key：<a href="https://platform.deepseek.com/api_keys" target="_blank">platform.deepseek.com</a>
-  </div>
+<!-- Brand hero: the self-weaving knowledge constellation.
+     Same NODES/EDGES spec as remotion/src/graph.ts, built at load. -->
+<div id="constellation" aria-hidden="true">
+  <svg viewBox="0 0 1000 1000" preserveAspectRatio="xMidYMid slice">
+    <defs>
+      <linearGradient id="sweepGrad" x1="0" y1="0" x2="1" y2="0">
+        <stop offset="0%"   stop-color="var(--accent)" stop-opacity="0"/>
+        <stop offset="50%"  stop-color="var(--accent)" stop-opacity="0.9"/>
+        <stop offset="100%" stop-color="var(--synth)"  stop-opacity="0"/>
+      </linearGradient>
+    </defs>
+    <g id="edges"></g>
+    <g id="sweep">
+      <rect x="80" y="0" width="80" height="1000" fill="url(#sweepGrad)"/>
+      <line x1="120" y1="0" x2="120" y2="1000" stroke="var(--accent)" stroke-width="1.5" opacity="0.7"/>
+    </g>
+    <g id="nodes"></g>
+  </svg>
 </div>
 
+<main class="stage">
+  <div class="wordmark">
+    <div class="wm-mark">🦎</div>
+    <div class="wm-title">Reptile</div>
+    <div class="wm-tag">智能知识库系统</div>
+  </div>
+
+  <section class="auth-card" id="auth-card" aria-label="登录">
+    <div class="field">
+      <label for="apikey">DeepSeek API Key</label>
+      <div class="input-wrap">
+        <span class="key-glyph">🔑</span>
+        <input type="password" id="apikey"
+               placeholder="sk-xxxxxxxxxxxxxxxx"
+               autocomplete="off" spellcheck="false"
+               aria-describedby="msg hint-text"
+               onkeydown="if(event.key==='Enter') doLogin()">
+      </div>
+    </div>
+
+    <button class="btn" id="login-btn" onclick="doLogin()">验证并进入系统</button>
+
+    <div class="msg" id="msg" role="status" aria-live="polite"></div>
+
+    <p class="hint" id="hint-text">
+      API Key 仅存储在本地会话中，不会上传到任何服务器。<br>
+      获取 Key：<a href="https://platform.deepseek.com/api_keys" target="_blank" rel="noopener">platform.deepseek.com</a>
+    </p>
+  </section>
+</main>
+
 <script>
+// ── Shared constellation spec (mirror of remotion/src/graph.ts) ──────────────
+const NODES = [
+  { id:0,  x:500, y:180, r:13, kind:'accent' },
+  { id:1,  x:700, y:250, r:10, kind:'muted'  },
+  { id:2,  x:820, y:420, r:12, kind:'node'   },
+  { id:3,  x:815, y:610, r:9,  kind:'muted'  },
+  { id:4,  x:690, y:760, r:12, kind:'accent' },
+  { id:5,  x:500, y:820, r:10, kind:'muted'  },
+  { id:6,  x:310, y:765, r:13, kind:'synth'  },
+  { id:7,  x:185, y:610, r:9,  kind:'muted'  },
+  { id:8,  x:180, y:420, r:12, kind:'node'   },
+  { id:9,  x:300, y:250, r:10, kind:'muted'  },
+  { id:10, x:430, y:360, r:9,  kind:'accent' },
+  { id:11, x:615, y:360, r:9,  kind:'muted'  },
+  { id:12, x:680, y:540, r:10, kind:'node'   },
+  { id:13, x:560, y:660, r:9,  kind:'muted'  },
+  { id:14, x:400, y:620, r:10, kind:'synth'  },
+  { id:15, x:335, y:500, r:9,  kind:'accent' },
+];
+const EDGES = [
+  [0,1],[1,2],[2,3],[3,4],[4,5],[5,6],[6,7],[7,8],[8,9],[9,0],
+  [10,11],[11,12],[12,13],[13,14],[14,15],[15,10],
+  [9,10],[1,11],[2,12],[4,13],[6,14],[7,15],[0,10],
+  [10,12],[15,13],
+];
+const COLOR = { accent:'#58a6ff', node:'#3fb950', synth:'#bc8cff', muted:'#8b949e' };
+const SVGNS = 'http://www.w3.org/2000/svg';
+
+// Sweep maps node.x 120→900 over 0.5s→2.3s (matches the Remotion crawl beat).
+function flareDelay(x) {
+  const t = Math.min(1, Math.max(0, (x - 120) / (900 - 120)));
+  return (0.5 + t * 1.8).toFixed(2) + 's';
+}
+
+function buildConstellation() {
+  const edgesG = document.getElementById('edges');
+  const nodesG = document.getElementById('nodes');
+
+  EDGES.forEach(([a, b], i) => {
+    const na = NODES[a], nb = NODES[b];
+    const len = Math.hypot(nb.x - na.x, nb.y - na.y);
+    const line = document.createElementNS(SVGNS, 'line');
+    line.setAttribute('class', 'edge');
+    line.setAttribute('x1', na.x); line.setAttribute('y1', na.y);
+    line.setAttribute('x2', nb.x); line.setAttribute('y2', nb.y);
+    line.style.setProperty('--len', len.toFixed(1));
+    line.style.setProperty('--draw-delay', (0.7 + i * 0.06).toFixed(2) + 's');
+    line.style.strokeDasharray = len.toFixed(1);
+    edgesG.appendChild(line);
+  });
+
+  NODES.forEach((n) => {
+    const c = COLOR[n.kind];
+    const bob = document.createElementNS(SVGNS, 'g');
+    bob.setAttribute('class', 'node-bob');
+    bob.setAttribute('transform', `translate(${n.x} ${n.y})`);
+    bob.style.setProperty('--bob-delay', (n.id * 0.21).toFixed(2) + 's');
+
+    const pop = document.createElementNS(SVGNS, 'g');
+    pop.setAttribute('class', 'node-pop');
+    pop.style.setProperty('--pop-delay', (n.id * 0.07).toFixed(2) + 's');
+
+    const glow = document.createElementNS(SVGNS, 'circle');
+    glow.setAttribute('class', 'node-glow');
+    glow.setAttribute('r', n.r * 2.6); glow.setAttribute('fill', c);
+
+    const ring = document.createElementNS(SVGNS, 'circle');
+    ring.setAttribute('class', 'flare-ring');
+    ring.setAttribute('r', n.r + 5);
+    ring.setAttribute('fill', 'none');
+    ring.setAttribute('stroke', c);
+    ring.setAttribute('stroke-width', '1.4');
+    ring.style.transformOrigin = 'center';
+    ring.style.transformBox = 'fill-box';
+    ring.style.opacity = '0';
+    ring.style.setProperty('--flare-delay', flareDelay(n.x));
+
+    const core = document.createElementNS(SVGNS, 'circle');
+    core.setAttribute('class', 'node-core');
+    core.setAttribute('r', n.r); core.setAttribute('fill', c);
+    core.style.opacity = '0.9';
+    core.style.setProperty('--flare-delay', flareDelay(n.x));
+
+    pop.appendChild(glow); pop.appendChild(ring); pop.appendChild(core);
+    bob.appendChild(pop); nodesG.appendChild(bob);
+  });
+}
+buildConstellation();
+
+// ── Auth flow ────────────────────────────────────────────────────────────────
 async function doLogin() {
   const key = document.getElementById('apikey').value.trim();
-  if (!key) { showMsg('error', '请输入 API Key'); return; }
+  if (!key) {
+    showMsg('error', 'API Key 不能为空 — 请粘贴以 sk- 开头的密钥。');
+    shakeCard();
+    document.getElementById('apikey').focus();
+    return;
+  }
 
   const btn = document.getElementById('login-btn');
   btn.disabled = true;
-  showMsg('loading', '<span class="spinner"></span>正在验证 API Key，请稍候...');
+  showMsg('loading', '正在验证 API Key，请稍候…', true);
 
   try {
     const r = await fetch('/api/auth/validate', {
@@ -148,26 +428,35 @@ async function doLogin() {
 
     if (d.valid) {
       sessionStorage.setItem('api_key', key);
-      showMsg('success', '✅ 验证成功，正在进入系统...');
-      setTimeout(() => { window.location.href = '/app'; }, 800);
+      showMsg('success', '验证成功，正在进入系统…');
+      document.getElementById('constellation').classList.add('converge');
+      setTimeout(() => { window.location.href = '/app'; }, 900);
     } else {
-      showMsg('error', '❌ API Key 无效，请检查后重试');
+      showMsg('error', 'API Key 无效。请确认密钥正确且账户额度充足后重试。');
+      shakeCard();
       btn.disabled = false;
     }
   } catch (e) {
-    showMsg('error', `网络错误: ${e.message}`);
+    showMsg('error', `无法连接验证服务（${e.message}）。请检查网络后重试。`);
+    shakeCard();
     btn.disabled = false;
   }
 }
 
-function showMsg(type, html) {
+function showMsg(type, text, withSpinner) {
   const el = document.getElementById('msg');
   el.className = `msg ${type}`;
-  el.innerHTML = html;
-  el.style.display = 'block';
+  el.innerHTML = withSpinner ? `<span class="spinner"></span><span>${text}</span>` : text;
 }
 
-// If already logged in, redirect directly
+function shakeCard() {
+  const card = document.getElementById('auth-card');
+  card.classList.remove('shake');
+  void card.offsetWidth;            // restart the animation
+  card.classList.add('shake');
+}
+
+// Already authenticated → straight through
 if (sessionStorage.getItem('api_key')) {
   window.location.href = '/app';
 }
