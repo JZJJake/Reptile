@@ -498,6 +498,56 @@ input:focus, select:focus { border-color: var(--accent); }
 .ctrl-group label { white-space: nowrap; }
 .ctrl-group input[type=range] { width: 70px; accent-color: var(--accent); }
 .ctrl-group input[type=checkbox] { width:auto; accent-color: var(--accent); }
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Brand + UX polish layer — same identity as the login hero (knowledge
+   constellation), kept lightweight and dependency-free. No Remotion in the
+   interactive panels: the live log / chat / D3 graph stay event-driven.
+──────────────────────────────────────────────────────────────────────────*/
+
+/* Header brand — signature tight tracking + soft glow, accent hairline */
+header { position: relative; }
+header::after {
+  content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 1px;
+  background: linear-gradient(90deg, var(--accent), transparent 38%);
+  opacity: .5;
+}
+header .brand { filter: drop-shadow(0 0 8px rgba(88,166,255,.35)); }
+header h1 { letter-spacing: -0.02em; }
+
+/* Visible keyboard focus on every interactive control (accessibility) */
+.btn:focus-visible, .pill:focus-visible, .send-btn:focus-visible,
+button:focus-visible, select:focus-visible {
+  outline: none; box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
+}
+.btn:active:not(:disabled), .pill:active, .send-btn:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+/* Empty states as invitations to act — a quiet constellation glyph that
+   breathes, a clear primary line, and an actionable hint. */
+.chat-empty .icon, .graph-empty .icon { filter: drop-shadow(0 0 14px rgba(88,166,255,.25)); }
+.chat-empty > div:not(.icon):not(.sub),
+.graph-empty > div:not(.icon) { color: var(--text); font-weight: 600; }
+.log-empty {
+  display: flex; align-items: center; gap: 8px;
+  font-style: normal !important; color: var(--muted);
+}
+.log-empty::before {
+  content: "◇"; color: var(--accent); opacity: .7;
+  animation: log-idle-pulse 2.4s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .chat-empty .icon, .graph-empty .icon { animation: glyph-breathe 4s ease-in-out infinite; }
+}
+@keyframes glyph-breathe {
+  0%,100% { transform: translateY(0);    opacity: .9; }
+  50%     { transform: translateY(-4px); opacity: 1;  }
+}
+@keyframes log-idle-pulse { 0%,100% { opacity: .25; } 50% { opacity: .8; } }
+@media (prefers-reduced-motion: reduce) {
+  .log-empty::before { animation: none; }
+}
 </style>
 </head>
 <body>
