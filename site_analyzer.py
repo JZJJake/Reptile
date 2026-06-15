@@ -8,7 +8,8 @@ import json
 import httpx
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
-DEFAULT_MODEL = "deepseek-chat"
+# Use DeepSeek's top-tier "thinking" model everywhere, including selector analysis.
+DEFAULT_MODEL = "deepseek-reasoner"
 
 ANALYSIS_PROMPT = """You are analyzing a webpage HTML to identify CSS selectors for key content elements.
 
@@ -75,7 +76,7 @@ async def analyze_site_structure(html: str, api_key: str) -> dict:
     }
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=120.0) as client:
             r = await client.post(
                 f"{DEEPSEEK_BASE_URL}/chat/completions",
                 headers={
