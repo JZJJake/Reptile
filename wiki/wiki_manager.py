@@ -33,9 +33,6 @@ from wiki.schema import (
     DISTILL_ATOM_PROMPT_TEMPLATE,
     ASSEMBLE_PROMPT_TEMPLATE,
     ASSEMBLE_INCREMENTAL_PROMPT_TEMPLATE,
-    PLAN_PROMPT_TEMPLATE,
-    INGEST_PROMPT_TEMPLATE,
-    WRITE_WITH_CONTEXT_PROMPT_TEMPLATE,
     PAGE_SELECT_PROMPT_TEMPLATE,
     QUERY_PROMPT_TEMPLATE,
     LINT_PROMPT_TEMPLATE,
@@ -53,6 +50,8 @@ FILE_WRITE_RE = re.compile(
 
 MAX_CONTEXT_CHARS = 80_000   # safe limit per LLM call
 EXISTING_PAGE_CAP = 24_000   # max chars of fetched existing pages fed to write phase
+RELATIONS_CAP_CHARS = 20_000  # relations.md grows without bound over many ingests;
+                               # cap it so it can't crowd out pages_content in query()
 
 # ── Multi-layer distillation budgets (in tokens) ──────────────────────────────
 # Quality-optimal window for relationship assembly. We favour MORE small calls
@@ -63,7 +62,7 @@ HARD_CONTEXT_CAP_TOKENS = 330_000   # ~1M/3, never exceed
 EXISTING_NETWORK_CAP_TOKENS = 30_000  # cap on prior-network context in chunked assembly
 STAGE1_DOC_CHARS = 40_000           # max source chars fed to one distillation call
 STAGE1_CONCURRENCY = 4              # parallel single-doc distillation calls
-ASSEMBLY_TIMEOUT = 300.0            # large assembly calls need a longer timeout
+ASSEMBLY_TIMEOUT = 600.0            # deepseek-reasoner "thinking" adds latency on large assembly calls
 
 
 def estimate_tokens(text: str) -> int:
@@ -216,6 +215,21 @@ class WikiManager:
             return []
         return sorted(atoms_dir.glob("*.md"))
 
+    # ── Stage-2 assembly tracking (.stage2_done file) ─────────────────────────
+
+    def _get_assembled_atoms(self) -> set[str]:
+        """Atom filenames already folded into the relation network (Stage 2 done)."""
+        done_path = self.wiki_path / ".stage2_done"
+        if not done_path.is_file():
+            return set()
+        return {n.strip() for n in done_path.read_text(encoding="utf-8").splitlines()
+                if n.strip()}
+
+    def _mark_assembled(self, atom_names: list[str]):
+        with open(self.wiki_path / ".stage2_done", "a", encoding="utf-8") as f:
+            for name in atom_names:
+                f.write(name.strip() + "\n")
+
     # ── Shared helpers ─────────────────────────────────────────────────────────
 
     def _parse_file_blocks(self, text: str) -> list[tuple[str, str]]:
@@ -224,9 +238,14 @@ class WikiManager:
 
     def _apply_file_blocks(self, blocks: list[tuple[str, str]]) -> tuple[int, int]:
         created = updated = 0
+        wiki_root = self.wiki_path.resolve()
         for rel_path, content in blocks:
             target = (self.wiki_path / rel_path).resolve()
-            if not str(target).startswith(str(self.wiki_path.resolve())):
+            # A plain str.startswith() prefix check would also accept a sibling
+            # directory whose name extends this domain's (e.g. "wiki/example_com"
+            # vs "wiki/example_com_evil") — require the wiki root as an actual
+            # path ancestor.
+            if target != wiki_root and wiki_root not in target.parents:
                 print(f"[wiki] Blocked path traversal: {rel_path}")
                 continue
             existed = target.is_file()
@@ -234,37 +253,6 @@ class WikiManager:
             updated += existed
             created += not existed
         return created, updated
-
-    def _read_source_docs(self, source_files: list[Path]) -> str:
-        """Read and concatenate source docs up to MAX_CONTEXT_CHARS."""
-        parts = []
-        total = 0
-        for sf in source_files:
-            try:
-                text = sf.read_text(encoding="utf-8")
-                entry = f"=== SOURCE: {sf.name} ===\n{text}"
-                if total + len(entry) > MAX_CONTEXT_CHARS:
-                    break
-                parts.append(entry)
-                total += len(entry)
-            except Exception as e:
-                print(f"[wiki] Error reading {sf}: {e}")
-        return "\n\n".join(parts)
-
-    def _doc_titles_for_plan(self, source_files: list[Path]) -> str:
-        """Lightweight title-only list for the plan phase — avoids token waste."""
-        lines = []
-        for sf in source_files:
-            try:
-                text = sf.read_text(encoding="utf-8")
-                title = next(
-                    (l.lstrip("#").strip() for l in text.splitlines() if l.startswith("#")),
-                    sf.stem,
-                )
-                lines.append(f"- {sf.name}: {title[:120]}")
-            except Exception:
-                lines.append(f"- {sf.name}")
-        return "\n".join(lines)
 
     @staticmethod
     def _score_text(question: str, content: str) -> int:
@@ -502,35 +490,47 @@ class WikiManager:
         return created, updated
 
     async def _stage2_assemble(self, report) -> tuple[int, int]:
-        """Assemble ALL knowledge atoms into the relation network.
-        Single full-corpus call when atoms fit the budget; otherwise chunked
+        """Assemble newly-distilled knowledge atoms into the relation network.
+        Only atoms not yet folded in (.stage2_done) are sent — atoms already
+        represented in relations.md/concepts/etc are skipped, otherwise every
+        re-ingest would re-derive the same facts/relations from old atoms and
+        accumulate near-duplicate entries on top of what's already there.
+        Single call when the new atoms fit the budget; otherwise chunked
         incremental assembly that merges each chunk into the growing network."""
         atoms = await asyncio.to_thread(self._list_atoms)
         if not atoms:
             report("阶段②：没有知识原子可组装", "warn")
             return 0, 0
 
+        done2 = await asyncio.to_thread(self._get_assembled_atoms)
+        new_atoms = [a for a in atoms if a.name not in done2]
+        if not new_atoms:
+            report("阶段②：所有知识原子已组装入关系网（断点续传）", "info")
+            return 0, 0
+
+        existing = await asyncio.to_thread(
+            self._read_network_pages, EXISTING_NETWORK_CAP_TOKENS)
         chunks = await asyncio.to_thread(
-            self._chunk_atoms_by_budget, atoms, ASSEMBLY_BUDGET_TOKENS)
+            self._chunk_atoms_by_budget, new_atoms, ASSEMBLY_BUDGET_TOKENS)
         n = len(chunks)
 
-        if n == 1:
-            report(f"阶段② 关系组装：{len(atoms)} 个原子一次性全量组装"
+        if n == 1 and not existing:
+            report(f"阶段② 关系组装：{len(new_atoms)} 个原子一次性全量组装"
                    "（实体归并 / 关系提取 / 矛盾检测）", "info")
-            existing = await asyncio.to_thread(
-                self._read_network_pages, EXISTING_NETWORK_CAP_TOKENS)
-            atoms_text = await asyncio.to_thread(self._join_atoms, atoms)
+            atoms_text = await asyncio.to_thread(self._join_atoms, new_atoms)
             prompt = ASSEMBLE_PROMPT_TEMPLATE.format(
-                existing_network=existing or "（空——首次组装）",
+                existing_network="（空——首次组装）",
                 atoms=atoms_text,
             )
-            return await self._assemble_call(prompt, "阶段②", report)
+            result = await self._assemble_call(prompt, "阶段②", report)
+            await asyncio.to_thread(self._mark_assembled, [a.name for a in new_atoms])
+            return result
 
-        report(f"阶段② 关系组装：{len(atoms)} 个原子超出单次预算，"
+        report(f"阶段② 关系组装：{len(new_atoms)} 个新知识原子，"
                f"分 {n} 批增量融合进关系网", "info")
         tot_c = tot_u = 0
         for idx, chunk in enumerate(chunks, 1):
-            report(f"阶段②：组装第 {idx}/{n} 批（{len(chunk)} 个原子）...", "log")
+            report(f"阶段②：组装第 {idx}/{n} 批（{len(chunk)} 个新原子）...", "log")
             existing = await asyncio.to_thread(
                 self._read_network_pages, EXISTING_NETWORK_CAP_TOKENS)
             atoms_text = await asyncio.to_thread(self._join_atoms, chunk)
@@ -543,6 +543,7 @@ class WikiManager:
                 c, u = await self._assemble_call(prompt, f"阶段②批{idx}", report)
                 tot_c += c
                 tot_u += u
+                await asyncio.to_thread(self._mark_assembled, [a.name for a in chunk])
                 report(f"阶段②第 {idx}/{n} 批完成：新建 {c} 页 / 更新 {u} 页",
                        "success")
             except Exception as e:
@@ -676,6 +677,11 @@ class WikiManager:
         # Relation network = reasoning scaffold (always loaded if present).
         relations_content = await asyncio.to_thread(self.read_page, "relations.md")
         relations_content = relations_content or "（暂无显式关系网页面）"
+        if len(relations_content) > RELATIONS_CAP_CHARS:
+            relations_content = (
+                relations_content[:RELATIONS_CAP_CHARS]
+                + "\n\n（关系网内容过长，已截断——完整内容请查看 relations.md 页面）"
+            )
 
         # Step 1: LLM page selection
         page_paths = await self._select_relevant_pages(question)

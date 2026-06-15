@@ -6,8 +6,10 @@ from typing import AsyncGenerator, Optional
 import httpx
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
-DEFAULT_MODEL = "deepseek-chat"
-TIMEOUT = 120.0
+# deepseek-reasoner (R1, "thinking") is DeepSeek's top-tier model — used
+# everywhere in the wiki pipeline for higher-quality distillation/assembly/answers.
+DEFAULT_MODEL = "deepseek-reasoner"
+TIMEOUT = 180.0
 
 
 async def chat_completion(

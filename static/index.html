@@ -1303,7 +1303,9 @@ async function consumeStream(resp, typingId) {
   }
 
   // Final pass: render markdown, then switch off pre-wrap so HTML renders cleanly.
-  bubble.innerHTML = renderMarkdown(full);
+  // Use renderWikiContent so bare "*.md" source citations (e.g. "（来源: x.md）"
+  // copied verbatim from wiki pages) become clickable, not just [[wiki page]] links.
+  bubble.innerHTML = renderWikiContent(full);
   bubble.classList.add('rendered');
   chatHistory.push({ role: 'assistant', content: full });
   // In wiki mode: show "save to synthesis" button under the reply
@@ -1680,7 +1682,10 @@ function renderWikiContent(src) {
   // Replace *.md filenames that appear as text (not inside HTML attribute values).
   // Heuristic: if the last '<' before the match is after the last '>', we're inside
   // a tag and should skip; otherwise it's visible text content.
-  html = html.replace(/\b([a-z0-9][a-zA-Z0-9_\-]{2,79}\.md)\b/g,
+  // First char allows uppercase too — crawler filenames mirror URL path
+  // segments verbatim (e.g. "News_2024-xx_..._abcd1234.md") and are often
+  // capitalized, so a lowercase-only start would never match them.
+  html = html.replace(/\b([a-zA-Z0-9][a-zA-Z0-9_\-]{2,79}\.md)\b/g,
     (fn, _offset, str) => {
       const before = str.substring(0, _offset);
       if (before.lastIndexOf('<') > before.lastIndexOf('>')) return fn; // inside a tag
