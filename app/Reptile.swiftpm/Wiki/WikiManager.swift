@@ -97,6 +97,7 @@ final class WikiManager {
                     ["role": "system", "content": "你是知识蒸馏器，只输出规定格式的知识原子。"],
                     ["role": "user", "content": WikiSchema.distillAtom(filename: name, body: body)],
                 ],
+                model: DeepSeekClient.buildModel,   // 知识库建设：v4-pro
                 temperature: 0.2)
             atom = atom.trimmingCharacters(in: .whitespacesAndNewlines)
             if atom.isEmpty { log("蒸馏结果为空：\(name)", .warn); return nil }
@@ -165,6 +166,7 @@ final class WikiManager {
                     ["role": "system", "content": WikiSchema.defaultSchema],
                     ["role": "user", "content": prompt],
                 ],
+                model: DeepSeekClient.buildModel,   // 知识库建设：v4-pro
                 timeout: DeepSeekClient.assemblyTimeout)
             let blocks = parseFileBlocks(resp)
             if blocks.isEmpty { log("\(label)：未输出有效 FILE_WRITE 块（格式不符）", .warn) }
@@ -201,7 +203,7 @@ final class WikiManager {
             messages.append(m)
         }
         messages.append(["role": "user", "content": prompt])
-        return client.stream(messages: messages)
+        return client.stream(messages: messages, model: DeepSeekClient.queryModel)  // 问答：v4-flash
     }
 
     /// Keyword-scored page selection (no extra API call) — a pragmatic stand-in

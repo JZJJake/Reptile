@@ -1,11 +1,21 @@
 import Foundation
 
 /// DeepSeek API client (OpenAI-compatible), the Swift/URLSession equivalent of
-/// wiki/deepseek_client.py. Uses `deepseek-reasoner` (Pro / "thinking") tier
-/// everywhere, matching the web project.
+/// wiki/deepseek_client.py.
+///
+/// 混合模型策略（cost/quality 分层）：
+/// - 知识库建设（一级蒸馏 + 二级关系组装）走 `buildModel` = v4-pro：
+///   蒸馏与跨文档关系推理需要更强推理，质量优先。
+/// - 问答 / 通用对话走 `defaultModel`(=`queryModel`) = v4-flash：
+///   交互式、量大，速度与成本优先。
 struct DeepSeekClient {
     static let baseURL = "https://api.deepseek.com/v1"
-    static let defaultModel = "deepseek-reasoner"
+    /// 问答 / 通用对话默认模型（快、省）。
+    static let queryModel = "deepseek-v4-flash"
+    /// 知识库建设模型（强推理，质量优先）。
+    static let buildModel = "deepseek-v4-pro"
+    /// 未显式指定时的默认模型 = 问答档。
+    static let defaultModel = queryModel
     static let timeout: TimeInterval = 180
     static let assemblyTimeout: TimeInterval = 600
 
