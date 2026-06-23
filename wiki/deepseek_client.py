@@ -8,12 +8,33 @@ import httpx
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 
 # ── Hybrid model strategy (cost/quality tiering) ──────────────────────────────
-# Knowledge-base construction (Stage 1 distil / Stage 2 assembly / Stage 3 shard)
-# needs strong reasoning → v4-pro (quality first).
-# Interactive Q&A / page-selection is high-volume → v4-flash (speed/cost first).
-# Change models by editing these two constants only.
+# This assignment is deliberate and must NOT be reversed. The reasoning:
+#
+#   Knowledge-base construction is where errors COMPOUND. A wrong entity merge,
+#   a dropped fact, or a fabricated relation written during distillation/assembly
+#   becomes PERMANENT: it is read back as "existing network" by every later
+#   assembly batch and surfaces in every future answer. Construction is also the
+#   hardest reasoning in the system (entity resolution, relation extraction,
+#   contradiction detection, cross-doc synthesis) and is paid ONCE per document.
+#   → Construction (Stage 1 distil / Stage 2 assembly / Stage 3 shard) = v4-pro.
+#
+#   Interactive answers are EPHEMERAL: not stored back into the KB, grounded by
+#   already-curated pages (the hard reasoning is baked in), and the workload is
+#   high-volume + latency-sensitive (the user waits on a stream). The model mostly
+#   reads curated pages and phrases them well — a lighter task.
+#   → Q&A / page-selection = v4-flash (speed/cost first).
+#
+# A fast answer over a well-built KB beats a smart answer over a fragmented one:
+# garbage in stays garbage. So build quality is non-negotiable; query is the place
+# to economise. The ONE exception is genuine query-time synthesis ("connect these
+# clues into a new logic chain") — for that, callers pass deep=True to escalate the
+# *answer* step only to REASON_MODEL, while page-selection stays on the cheap tier.
+# Change models by editing these constants only.
 BUILD_MODEL = "deepseek-v4-pro"
 QUERY_MODEL = "deepseek-v4-flash"
+# Deep query-time reasoning (clue-connecting / new logic chains): same tier as
+# construction. Opt-in per query via deep=True so routine Q&A stays cheap.
+REASON_MODEL = BUILD_MODEL
 # Backwards-compatible default = query tier (matches the iOS port's defaultModel).
 DEFAULT_MODEL = QUERY_MODEL
 TIMEOUT = 180.0

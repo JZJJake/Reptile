@@ -31,6 +31,24 @@ stages. Run this whenever `wiki/schema.py` or `wiki/wiki_manager.py` change.
       be influenced by adversarial content in crawled source documents.
 - [ ] FILE_WRITE block parser (`FILE_WRITE_RE`) still matches all `<<<END>>>`
       variants DeepSeek actually emits; check `print` warnings for "0 blocks".
+- [ ] **Cross-batch entity identity** (`.entity_registry.json`): after 2+ ingest
+      cycles on the same domain, an entity introduced in an early batch is merged
+      into — not duplicated by — a later batch that mentions it, even when its
+      page falls outside `EXISTING_NETWORK_CAP_TOKENS`. The registry is the
+      mechanism; `_build_entity_hint` must surface it to every chunk. Spot-check
+      for duplicate `entities/*.md` pages describing the same object.
+- [ ] **Entity-match precision**: `_match_existing_entities` must not false-merge
+      distinct entities that merely share a generic suffix (e.g. "中心"); the
+      `ENTITY_MIN_MATCH_LEN` containment guard governs this. A false merge
+      corrupts knowledge worse than a duplicate — keep the guard conservative.
+- [ ] **Anti-loss backup**: a substantial page rewritten to under
+      `PAGE_SHRINK_BACKUP_RATIO` of its size is snapshotted to `.backups/` (as
+      `*.md.bak`, invisible to `list_pages()`) before being overwritten.
+- [ ] `_read_network_pages` sub-caps `relations.md` to half the budget and orders
+      the rest by relevance to the current chunk (`focus_text`), so entity/concept
+      pages are never fully crowded out by a large relation file.
+- [ ] These four items are covered by `python -m wiki.test_pipeline_offline`
+      (no API key needed) — run it whenever this file or `wiki_manager.py` changes.
 
 ## Stage 3 — 关系网分片 (relations.md → relations/ shards)
 
@@ -68,12 +86,20 @@ stages. Run this whenever `wiki/schema.py` or `wiki/wiki_manager.py` change.
       page-select and the streamed answer.  `site_analyzer.DEFAULT_MODEL`
       tracks the build tier.  Grep for `model=self.model` should return nothing
       (all call sites use `build_model`/`query_model` explicitly).
+- [ ] **Direction is intentional, do NOT reverse**: construction = pro because
+      its errors COMPOUND (read back as "existing network" forever); answers =
+      flash because they are ephemeral and grounded by already-curated pages.
+- [ ] **Deep answer escalation**: `query(deep=True)` routes ONLY the answer step
+      to `REASON_MODEL` (v4-pro) for clue-connecting/synthesis; page-select stays
+      on the cheap tier. `WikiQueryRequest.deep` plumbs it through `/api/wiki/query`.
 
 ## Query — 查询回答质量 (wiki → DeepSeek answer)
 
 - [ ] `_select_relevant_pages` returns real `index.md` page paths, not atom
       paths or hallucinated filenames — `query()` falls back to
       `_find_relevant_pages` correctly when it returns `[]`.
+- [ ] `_select_relevant_pages` caps `index.md` to `INDEX_SELECT_CAP_CHARS` before
+      the page-select call — at scale an uncapped index blows that call's context.
 - [ ] `relations_content` + `pages_content` + `index_content` together stay
       under `MAX_CONTEXT_CHARS` (now enforced via `RELATIONS_CAP_CHARS` on
       `relations.md`) — a 400 from DeepSeek on `query()` usually means one of
