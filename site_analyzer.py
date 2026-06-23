@@ -8,8 +8,9 @@ import json
 import httpx
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
-# Use DeepSeek's top-tier "thinking" model everywhere, including selector analysis.
-DEFAULT_MODEL = "deepseek-reasoner"
+# Selector analysis is a build-time structural-reasoning task → build tier
+# (v4-pro), consistent with the hybrid model strategy in wiki/deepseek_client.py.
+DEFAULT_MODEL = "deepseek-v4-pro"
 
 ANALYSIS_PROMPT = """You are analyzing a webpage HTML to identify CSS selectors for key content elements.
 

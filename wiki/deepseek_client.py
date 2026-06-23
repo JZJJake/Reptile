@@ -6,9 +6,16 @@ from typing import AsyncGenerator, Optional
 import httpx
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
-# deepseek-reasoner (R1, "thinking") is DeepSeek's top-tier model — used
-# everywhere in the wiki pipeline for higher-quality distillation/assembly/answers.
-DEFAULT_MODEL = "deepseek-reasoner"
+
+# ── Hybrid model strategy (cost/quality tiering) ──────────────────────────────
+# Knowledge-base construction (Stage 1 distil / Stage 2 assembly / Stage 3 shard)
+# needs strong reasoning → v4-pro (quality first).
+# Interactive Q&A / page-selection is high-volume → v4-flash (speed/cost first).
+# Change models by editing these two constants only.
+BUILD_MODEL = "deepseek-v4-pro"
+QUERY_MODEL = "deepseek-v4-flash"
+# Backwards-compatible default = query tier (matches the iOS port's defaultModel).
+DEFAULT_MODEL = QUERY_MODEL
 TIMEOUT = 180.0
 
 
