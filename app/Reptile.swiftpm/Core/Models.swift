@@ -2,25 +2,22 @@ import Foundation
 
 // MARK: - Crawl / extraction
 
-/// A page extracted from the live web via WKWebView + injected JS.
-/// Mirrors what scraper.py produces from a Playwright page.
 struct ExtractedPage {
     var url: String
     var title: String
-    var text: String          // cleaned main-content text (markdown-ish)
-    var html: String          // raw outerHTML (kept for debugging / re-parse)
-    var publishDate: String   // best-effort date string, "" if none found
-    var links: [String]       // same-host absolute links discovered on the page
+    var text: String
+    var html: String
+    var publishDate: String
+    var links: [String]
 }
 
 enum DownloadMode: String, CaseIterable, Identifiable {
-    case all     = "全站"
-    case single  = "单页"
-    case byDate  = "按日期"
+    case all    = "全站"
+    case single = "单页"
+    case byDate = "按日期"
     var id: String { rawValue }
 }
 
-/// One line in the live crawl/build console.
 struct LogLine: Identifiable, Equatable {
     enum Level: String {
         case info, log, success, warn, error, done
@@ -38,16 +35,15 @@ struct ChatMessage: Identifiable, Equatable {
     let id = UUID()
     var role: Role
     var content: String
-    var rendered: Bool = false   // streamed plain → rendered markdown when complete
+    var rendered: Bool = false
 }
 
 // MARK: - Wiki
 
-/// A reference to a wiki page on disk (relative path under wiki/{domain}/).
 struct WikiPageRef: Identifiable, Hashable {
     var id: String { relativePath }
-    var relativePath: String          // e.g. "concepts/transformer.md"
-    var category: String {            // top-level folder, or "root"
+    var relativePath: String
+    var category: String {
         let parts = relativePath.split(separator: "/")
         return parts.count > 1 ? String(parts[0]) : "root"
     }
@@ -56,13 +52,37 @@ struct WikiPageRef: Identifiable, Hashable {
     }
 }
 
-/// Result of an ingest run (mirrors WikiManager.ingest()'s dict).
 struct IngestResult {
     var pagesCreated: Int = 0
     var pagesUpdated: Int = 0
     var atomsMade: Int = 0
     var totalAtoms: Int = 0
     var noSources: Bool = false
+}
+
+// MARK: - Build modes
+
+/// Top-level mode selector in BuildView.
+enum BuildMode: String, CaseIterable, Identifiable {
+    case normal      = "构建/更新"
+    case importFiles = "导入文件"
+    case rebuild     = "版本重建"
+    var id: String { rawValue }
+}
+
+/// Granularity of a forced rebuild (version upgrade path).
+enum RebuildLevel: String, CaseIterable, Identifiable {
+    case stage2Only = "保留原子，重建Stage-2"
+    case full       = "全量重建（重新蒸馏）"
+    var id: String { rawValue }
+    var warning: String {
+        switch self {
+        case .stage2Only:
+            return "将清除 index / relations / concepts / entities / synthesis 页面并保留已蒸馏的知识原子，然后用现有原子重新组装关系网。适合 Stage-2 prompt 升级。"
+        case .full:
+            return "将清除整个知识库（含知识原子），从原始爬取文件完全重新蒸馏。适合 Stage-1 prompt 或数据结构重大升级，耗时最长。"
+        }
+    }
 }
 
 // MARK: - Errors

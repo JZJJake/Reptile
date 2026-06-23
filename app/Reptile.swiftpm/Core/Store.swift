@@ -6,13 +6,13 @@ import Foundation
 /// Layout under Documents/:
 ///   scraped_data/{domain}/<slug>.md          raw crawled docs (immutable)
 ///   wiki/{domain}/index.md, relations.md     LLM-curated knowledge base
+///   wiki/{domain}/relations/_index.md        Stage-3 shard index (derived)
+///   wiki/{domain}/relations/<topic>.md       Stage-3 topic shards (derived)
 ///   wiki/{domain}/atoms/<slug>.md            Stage-1 knowledge atoms
 ///   wiki/{domain}/concepts|entities|...      Stage-2 curated pages
 ///   wiki/{domain}/.stage1_done               sentinel: sources distilled
 ///   wiki/{domain}/.stage2_done               sentinel: atoms assembled
 ///   wiki/{domain}/.ingested                  sentinel: sources fully ingested
-///
-/// All methods are synchronous; callers hop off the main actor where needed.
 struct Store {
     static let shared = Store()
 
@@ -24,7 +24,7 @@ struct Store {
     var scrapedRoot: URL { documents.appendingPathComponent("scraped_data", isDirectory: true) }
     var wikiRoot: URL    { documents.appendingPathComponent("wiki", isDirectory: true) }
 
-    // MARK: domain helpers
+    // MARK: - domain helpers
 
     func scrapedDir(_ domain: String) -> URL {
         scrapedRoot.appendingPathComponent(domain, isDirectory: true)
@@ -37,10 +37,8 @@ struct Store {
         try? fm.createDirectory(at: url, withIntermediateDirectories: true)
     }
 
-    // MARK: scraped docs
+    // MARK: - scraped docs
 
-    /// Save one crawled page as a markdown file with YAML-ish frontmatter,
-    /// mirroring scraper.py's save format. Returns the saved filename.
     @discardableResult
     func saveScraped(domain: String, page: ExtractedPage) -> String {
         let dir = scrapedDir(domain)
@@ -76,7 +74,24 @@ struct Store {
             .sorted() ?? []
     }
 
-    // MARK: wiki pages
+    func scrapedFileCount(_ domain: String) -> Int {
+        listScraped(domain).count
+    }
+
+    /// Copy an external file (from Files app / document picker security scope)
+    /// into scraped_data/{domain}/. Returns true on success.
+    @discardableResult
+    func importFile(from src: URL, domain: String) -> Bool {
+        ensureDir(scrapedDir(domain))
+        let dest = scrapedDir(domain).appendingPathComponent(src.lastPathComponent)
+        do {
+            if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
+            try fm.copyItem(at: src, to: dest)
+            return true
+        } catch { return false }
+    }
+
+    // MARK: - wiki pages
 
     func readPage(domain: String, rel: String) -> String? {
         try? String(contentsOf: wikiDir(domain).appendingPathComponent(rel), encoding: .utf8)
@@ -89,13 +104,11 @@ struct Store {
     }
 
     /// Path-containment guard: reject FILE_WRITE paths that escape this domain's
-    /// wiki dir (".." traversal OR sibling-domain prefixes). Ported from the
-    /// fix in wiki_manager._apply_file_blocks.
+    /// wiki dir (".." traversal OR sibling-domain prefixes).
     func isSafe(domain: String, rel: String) -> Bool {
         let root = wikiDir(domain).standardizedFileURL
         let target = wikiDir(domain).appendingPathComponent(rel).standardizedFileURL
         if target == root { return true }
-        // target must have root as an ancestor component-wise
         let rootParts = root.pathComponents
         let targetParts = target.pathComponents
         guard targetParts.count > rootParts.count else { return false }
@@ -140,7 +153,7 @@ struct Store {
         }
     }
 
-    // MARK: sentinel sets (.stage1_done / .stage2_done / .ingested)
+    // MARK: - sentinel sets
 
     func sentinelSet(domain: String, name: String) -> Set<String> {
         guard let txt = try? String(contentsOf: wikiDir(domain).appendingPathComponent(name),
@@ -163,13 +176,47 @@ struct Store {
         }
     }
 
+    func sentinelCount(domain: String, name: String) -> Int {
+        sentinelSet(domain: domain, name: name).count
+    }
+
+    /// Delete a single sentinel file (used to invalidate a stage).
+    func deleteSentinel(domain: String, name: String) {
+        try? fm.removeItem(at: wikiDir(domain).appendingPathComponent(name))
+    }
+
+    // MARK: - wiki destruction helpers
+
+    /// Delete the entire wiki/{domain}/ directory.
     func deleteWiki(_ domain: String) {
         try? fm.removeItem(at: wikiDir(domain))
     }
 
-    // MARK: utilities
+    /// Delete atoms/ directory (for full rebuild).
+    func deleteAtoms(_ domain: String) {
+        try? fm.removeItem(at: wikiDir(domain).appendingPathComponent("atoms"))
+    }
 
-    /// URL → safe flat slug + md5-ish hash suffix, mirroring scraper.url_to_slug.
+    /// Delete Stage-3 shard directory relations/ (derived; Stage-2 keeps relations.md).
+    func deleteRelationsShards(_ domain: String) {
+        try? fm.removeItem(at: wikiDir(domain).appendingPathComponent("relations"))
+    }
+
+    /// Delete all curated wiki pages but keep atoms/ + .stage1_done + .ingested.
+    /// Used by forceRebuildStage2() to start a clean Stage-2 assembly.
+    func deleteCuratedPages(_ domain: String) {
+        let wikiDir = self.wikiDir(domain)
+        guard let contents = try? fm.contentsOfDirectory(at: wikiDir,
+                                                         includingPropertiesForKeys: nil) else { return }
+        let keep: Set<String> = ["atoms", ".stage1_done", ".ingested"]
+        for item in contents {
+            if keep.contains(item.lastPathComponent) { continue }
+            try? fm.removeItem(at: item)
+        }
+    }
+
+    // MARK: - utilities
+
     static func urlToSlug(_ url: String) -> String {
         let comps = URLComponents(string: url)
         var path = (comps?.path ?? "").trimmingCharacters(in: ["/"])
@@ -182,9 +229,7 @@ struct Store {
         return "\(path)_\(stableHash(url))"
     }
 
-    /// Deterministic FNV-1a hash → 8 hex chars. Swift's `hashValue` is seeded
-    /// per process, so it must NOT be used for on-disk slugs (filenames would
-    /// change every launch, breaking dedup / resume).
+    /// Deterministic FNV-1a hash → 8 hex chars.
     static func stableHash(_ s: String) -> String {
         var h: UInt64 = 1469598103934665603
         for b in s.utf8 { h = (h ^ UInt64(b)) &* 1099511628211 }
