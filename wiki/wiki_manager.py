@@ -33,6 +33,7 @@ from wiki.schema import (
     DISTILL_ATOM_PROMPT_TEMPLATE,
     ASSEMBLE_PROMPT_TEMPLATE,
     ASSEMBLE_INCREMENTAL_PROMPT_TEMPLATE,
+    RELATIONS_CONSOLIDATE_PROMPT_TEMPLATE,
     PAGE_SELECT_PROMPT_TEMPLATE,
     QUERY_PROMPT_TEMPLATE,
     LINT_PROMPT_TEMPLATE,
@@ -52,6 +53,9 @@ MAX_CONTEXT_CHARS = 80_000   # safe limit per LLM call
 EXISTING_PAGE_CAP = 24_000   # max chars of fetched existing pages fed to write phase
 RELATIONS_CAP_CHARS = 20_000  # relations.md grows without bound over many ingests;
                                # cap it so it can't crowd out pages_content in query()
+RELATIONS_SHARD_THRESHOLD = 30_000  # Stage-3: shard relations.md once it exceeds this
+                                     # (chars). Above it a single monolithic relation
+                                     # file becomes a query/assembly scalability ceiling.
 
 # ── Multi-layer distillation budgets (in tokens) ──────────────────────────────
 # Quality-optimal window for relationship assembly. We favour MORE small calls
@@ -98,10 +102,16 @@ SKIP_SOURCE_RE = re.compile(
 
 class WikiManager:
     def __init__(self, domain: str, api_key: str,
-                 model: str = deepseek_client.DEFAULT_MODEL):
+                 model: Optional[str] = None):
         self.domain    = domain
         self.api_key   = api_key
-        self.model     = model
+        # Hybrid model strategy: construction (Stage 1/2/3) uses BUILD_MODEL
+        # (v4-pro, quality first); query/page-select uses QUERY_MODEL (v4-flash,
+        # speed/cost first). An explicit `model` override forces both tiers.
+        self.build_model = model or deepseek_client.BUILD_MODEL
+        self.query_model = model or deepseek_client.QUERY_MODEL
+        # Retained for backward compatibility (older call sites used self.model).
+        self.model     = self.build_model
         self.wiki_path = Path(os.getcwd()) / "wiki" / domain
         self.raw_path  = Path(os.getcwd()) / "scraped_data" / domain
         self.wiki_path.mkdir(parents=True, exist_ok=True)
@@ -368,7 +378,7 @@ class WikiManager:
                          "content": DISTILL_ATOM_PROMPT_TEMPLATE.format(
                              filename=path.name, body=body)},
                     ],
-                    model=self.model, stream=False,
+                    model=self.build_model, stream=False,   # Stage 1：v4-pro
                     api_key=self.api_key, temperature=0.2,
                 )
             except Exception as e:
@@ -418,7 +428,14 @@ class WikiManager:
 
     def _read_network_pages(self, cap_tokens: int) -> str:
         """Read existing curated network (relations/index/concepts/entities/
-        synthesis) for incremental-assembly context, capped by token budget."""
+        synthesis) for incremental-assembly context, capped by token budget.
+
+        Fix: previously an oversized entry was `continue`-d (silently dropped),
+        which meant relations.md could vanish from assembly context once it grew
+        past the cap — exactly the scaffold Stage-2 most needs. Now we truncate
+        an oversized entry to the remaining budget so it always appears, just
+        shorter. The Stage-3 shard dir (relations/) is excluded — it's a derived
+        view of relations.md and would double-count edges here."""
         priority = ["relations.md", "index.md"]
         parts, total = [], 0
         seen = set()
@@ -426,6 +443,7 @@ class WikiManager:
             p for p in self.list_pages()
             if p not in priority
             and not p.startswith("atoms/")
+            and not p.startswith("relations/")   # Stage-3 shards are derived
             and p not in ("log.md",)
         ]
         for rel in ordered:
@@ -437,8 +455,17 @@ class WikiManager:
                 continue
             entry = f"=== {rel} ===\n{content}"
             t = estimate_tokens(entry)
-            if total + t > cap_tokens:
-                continue
+            remaining = cap_tokens - total
+            if remaining <= 20:
+                break                        # budget exhausted
+            if t > remaining:
+                # Truncate proportionally (estimate_tokens ≈ 1 char/CJK token)
+                # rather than dropping the whole page silently.
+                approx_chars = max(0, remaining * 2)
+                entry = entry[:approx_chars] + "\n…（已截断）"
+                parts.append(entry)
+                total = cap_tokens
+                break
             parts.append(entry)
             total += t
         return "\n\n".join(parts)
@@ -478,7 +505,7 @@ class WikiManager:
                 {"role": "system", "content": DEFAULT_SCHEMA},
                 {"role": "user",   "content": prompt},
             ],
-            model=self.model, stream=False, api_key=self.api_key,
+            model=self.build_model, stream=False, api_key=self.api_key,   # Stage 2：v4-pro
             timeout=ASSEMBLY_TIMEOUT,
         )
         blocks = await asyncio.to_thread(self._parse_file_blocks, response)
@@ -551,15 +578,191 @@ class WikiManager:
                 print(f"[wiki/{self.domain}] assemble chunk {idx} error: {e}")
         return tot_c, tot_u
 
+    # ── Stage 3: relation-network sharding ─────────────────────────────────────
+
+    async def _stage3_consolidate_relations_if_needed(self, report) -> None:
+        """When relations.md exceeds RELATIONS_SHARD_THRESHOLD, cluster its edges
+        into topic shards (relations/<topic>.md) + a lightweight index
+        (relations/_index.md) via BUILD_MODEL. Queries then load only the
+        matching shard instead of the whole growing file, breaking the
+        single-file scalability ceiling. Non-fatal: query falls back to the
+        monolithic relations.md if sharding fails. Stage-3 is a derived view —
+        Stage-2 keeps writing relations.md."""
+        relations = await asyncio.to_thread(self.read_page, "relations.md")
+        if not relations or len(relations) <= RELATIONS_SHARD_THRESHOLD:
+            return
+
+        report(
+            f"阶段③ 关系网分片：relations.md（{len(relations)} 字符 > 阈值 "
+            f"{RELATIONS_SHARD_THRESHOLD}），按主题分片以保持可扩展性…",
+            "info",
+        )
+        try:
+            response = await deepseek_client.chat_completion(
+                [
+                    {"role": "system", "content": DEFAULT_SCHEMA},
+                    {"role": "user",
+                     "content": RELATIONS_CONSOLIDATE_PROMPT_TEMPLATE.format(
+                         relations_content=relations)},
+                ],
+                model=self.build_model, stream=False, api_key=self.api_key,   # Stage 3：v4-pro
+                timeout=ASSEMBLY_TIMEOUT,
+            )
+            blocks = await asyncio.to_thread(self._parse_file_blocks, response)
+            # Defensive: never let the consolidator overwrite relations.md itself.
+            blocks = [(p, c) for p, c in blocks if p.strip() != "relations.md"]
+            created, updated = await asyncio.to_thread(self._apply_file_blocks, blocks)
+            report(f"阶段③完成：生成 {created} 个关系分片 / 更新 {updated} 个分片页面",
+                   "success")
+        except Exception as e:
+            report(f"阶段③分片失败（非致命，查询将降级为 relations.md）：{e}", "warn")
+            print(f"[wiki/{self.domain}] stage3 shard error: {e}")
+
+    # ── Destructive helpers (rebuild support) ──────────────────────────────────
+
+    def _delete_atoms(self):
+        """Remove the atoms/ directory (full rebuild)."""
+        import shutil
+        atoms_dir = self.wiki_path / "atoms"
+        if atoms_dir.is_dir():
+            shutil.rmtree(atoms_dir, ignore_errors=True)
+
+    def _delete_relations_shards(self):
+        """Remove the Stage-3 relations/ shard directory (derived view)."""
+        import shutil
+        shard_dir = self.wiki_path / "relations"
+        if shard_dir.is_dir():
+            shutil.rmtree(shard_dir, ignore_errors=True)
+
+    def _delete_curated_pages(self):
+        """Remove all curated Stage-2 output but KEEP atoms/, .stage1_done and
+        .ingested — so Stage-2 can be re-assembled from existing atoms without
+        re-distilling. Removes index/relations/log + concepts/entities/synthesis/
+        summaries/ dirs, the relations/ shard dir, and the .stage2_done sentinel."""
+        import shutil
+        keep = {"atoms", ".stage1_done", ".ingested"}
+        if not self.wiki_path.is_dir():
+            return
+        for entry in self.wiki_path.iterdir():
+            if entry.name in keep:
+                continue
+            if entry.is_dir():
+                shutil.rmtree(entry, ignore_errors=True)
+            else:
+                try:
+                    entry.unlink()
+                except OSError:
+                    pass
+
+    def _delete_wiki(self):
+        """Remove the entire wiki/{domain}/ directory (full rebuild)."""
+        import shutil
+        if self.wiki_path.is_dir():
+            shutil.rmtree(self.wiki_path, ignore_errors=True)
+        self.wiki_path.mkdir(parents=True, exist_ok=True)
+
+    # ── Rebuild entry points (no re-crawl) ─────────────────────────────────────
+
+    async def force_rebuild_stage2(self, progress=None) -> dict:
+        """Clear Stage-2 curated pages and re-assemble from existing atoms.
+        Use after a Stage-2 prompt/architecture upgrade: avoids re-crawling AND
+        re-distilling (Stage-1 atoms are reused). Then re-runs Stage 3."""
+        def report(msg, mtype="log"):
+            if progress:
+                try:
+                    progress(msg, mtype)
+                except Exception:
+                    pass
+
+        atoms = await asyncio.to_thread(self._list_atoms)
+        if not atoms:
+            report("Stage-2 重建：没有知识原子可重组（请先完成 Stage-1 蒸馏）", "warn")
+            return {"pages_created": 0, "pages_updated": 0,
+                    "docs_processed": 0, "atoms_made": 0, "no_atoms": True}
+
+        report(f"Stage-2 重建：保留 {len(atoms)} 个知识原子，清除已有策展页面…", "info")
+        await asyncio.to_thread(self._delete_curated_pages)
+        report("策展页面已清除，开始重新组装关系网…", "info")
+
+        created, updated = await self._stage2_assemble(report)
+        await self._stage3_consolidate_relations_if_needed(report)
+
+        total_atoms = len(await asyncio.to_thread(self._list_atoms))
+        await asyncio.to_thread(
+            self.append_log, "force_rebuild_stage2",
+            f"atoms_reused={total_atoms} created={created} updated={updated}",
+        )
+        report(f"Stage-2 重建完成：新建 {created} 页 / 更新 {updated} 页", "done")
+        return {"pages_created": created, "pages_updated": updated,
+                "docs_processed": 0, "atoms_made": 0, "total_atoms": total_atoms}
+
+    async def force_rebuild_full(self, progress=None) -> dict:
+        """Delete the entire wiki (atoms included) and rebuild from the raw
+        scraped source files. Use after a Stage-1 prompt or data-schema upgrade.
+        Does NOT re-crawl — it reuses scraped_data/{domain}/."""
+        def report(msg, mtype="log"):
+            if progress:
+                try:
+                    progress(msg, mtype)
+                except Exception:
+                    pass
+
+        src_count = len(await asyncio.to_thread(self._get_unprocessed_sources)) \
+            if self.raw_path.is_dir() else 0
+        report(f"全量重建：清除整个知识库（含知识原子），将从原始文件重新蒸馏…", "warn")
+        await asyncio.to_thread(self._delete_wiki)
+        report("知识库已清除，开始全量重新蒸馏…", "info")
+        return await self.ingest(progress=progress)
+
+    async def ingest_from_files(self, file_paths: list[str], progress=None) -> dict:
+        """Build the knowledge base directly from raw .md files, independent of
+        the crawler. Copies the given files into scraped_data/{domain}/ (so the
+        atoms keep a real source pointer and citations resolve) and then runs the
+        full pipeline. Lets users build/refresh a KB from previously-downloaded
+        source files without re-crawling when the architecture version changes.
+
+        `file_paths` are absolute or cwd-relative paths to .md files."""
+        import shutil
+        def report(msg, mtype="log"):
+            if progress:
+                try:
+                    progress(msg, mtype)
+                except Exception:
+                    pass
+
+        self.raw_path.mkdir(parents=True, exist_ok=True)
+        copied = []
+        for fp in file_paths:
+            src = Path(fp)
+            if src.suffix.lower() != ".md":
+                report(f"跳过非 .md 文件：{src.name}", "warn")
+                continue
+            if not src.is_file():
+                report(f"文件不存在：{src}", "error")
+                continue
+            dest = self.raw_path / src.name
+            try:
+                if src.resolve() != dest.resolve():
+                    await asyncio.to_thread(shutil.copy2, src, dest)
+                copied.append(src.name)
+                report(f"已导入：{src.name}", "log")
+            except OSError as e:
+                report(f"导入失败 {src.name}：{e}", "error")
+
+        report(f"文件导入完成：{len(copied)} 个文件 → scraped_data/{self.domain}/，开始建库…", "info")
+        # Build only from the freshly-imported files (still resumable via .ingested).
+        return await self.ingest(source_files=copied or None, progress=progress)
+
     async def ingest(self, source_files: Optional[list[str]] = None,
                      batch_size: int = 5, progress=None) -> dict:
         """
-        Two-stage knowledge-distillation pipeline:
+        Three-stage knowledge-distillation pipeline:
           Stage 1 — distill every source doc into a compact knowledge atom.
           Stage 2 — assemble all atoms into a curated relation network.
-        Both stages are resumable (.stage1_done / .ingested). `batch_size` is
-        retained for API compatibility but no longer drives the pipeline.
-        Returns {pages_created, pages_updated, docs_processed, atoms_made}.
+          Stage 3 — shard relations.md into topic shards once it grows large.
+        Stages are resumable (.stage1_done / .stage2_done / .ingested).
+        `batch_size` is retained for API compatibility but no longer drives the
+        pipeline. Returns {pages_created, pages_updated, docs_processed, atoms_made}.
         """
         def report(msg, mtype="log"):
             if progress:
@@ -595,6 +798,9 @@ class WikiManager:
 
         # ── Stage 2: relation-network assembly ────────────────────────────────
         created, updated = await self._stage2_assemble(report)
+
+        # ── Stage 3: shard relations.md if it has grown large ─────────────────
+        await self._stage3_consolidate_relations_if_needed(report)
 
         total_atoms = len(await asyncio.to_thread(self._list_atoms))
         await asyncio.to_thread(
@@ -636,7 +842,7 @@ class WikiManager:
                          index_content=index,
                      )},
                 ],
-                model=self.model, stream=False,
+                model=self.query_model, stream=False,   # 选页：v4-flash
                 api_key=self.api_key, temperature=0.0,
             )
             paths = []
@@ -675,13 +881,10 @@ class WikiManager:
                 )
 
         # Relation network = reasoning scaffold (always loaded if present).
-        relations_content = await asyncio.to_thread(self.read_page, "relations.md")
-        relations_content = relations_content or "（暂无显式关系网页面）"
-        if len(relations_content) > RELATIONS_CAP_CHARS:
-            relations_content = (
-                relations_content[:RELATIONS_CAP_CHARS]
-                + "\n\n（关系网内容过长，已截断——完整内容请查看 relations.md 页面）"
-            )
+        # Stage-3-aware: if relations/ shards exist, load the shard index plus the
+        # keyword-matched shard(s) instead of the whole monolithic relations.md.
+        relations_content = await asyncio.to_thread(
+            self._load_relations_for_query, question)
 
         # Step 1: LLM page selection
         page_paths = await self._select_relevant_pages(question)
@@ -728,18 +931,55 @@ class WikiManager:
             return self._stream_query(messages, question, save_answer)
         else:
             response = await deepseek_client.chat_completion(
-                messages, model=self.model, stream=False, api_key=self.api_key
+                messages, model=self.query_model, stream=False, api_key=self.api_key   # 问答：v4-flash
             )
             if save_answer and response:
                 await self._save_answer_as_synthesis(question, response)
             return response
+
+    def _load_relations_for_query(self, question: str) -> str:
+        """Stage-3-aware relations loading for the query prompt.
+
+        If Stage-3 shards exist (relations/_index.md), load the shard index plus
+        the keyword-matched shard(s) — capped at RELATIONS_CAP_CHARS — so a large
+        relation network doesn't crowd out pages_content. Otherwise fall back to
+        the monolithic relations.md (truncated)."""
+        shard_index = self.read_page("relations/_index.md")
+        if shard_index:
+            parts = [f"=== relations/_index.md ===\n{shard_index}"]
+            total = len(parts[0])
+            shards = [
+                p for p in self.list_pages()
+                if p.startswith("relations/") and p != "relations/_index.md"
+            ]
+            scored = []
+            for rel in shards:
+                content = self.read_page(rel) or ""
+                scored.append((self._score_text(question, content), rel, content))
+            scored.sort(reverse=True, key=lambda x: x[0])
+            for _, rel, content in scored[:2]:
+                entry = f"=== {rel} ===\n{content}"
+                if total + len(entry) > RELATIONS_CAP_CHARS:
+                    break
+                parts.append(entry)
+                total += len(entry)
+            return "\n\n".join(parts)
+
+        # Fall back to monolithic relations.md.
+        relations_content = self.read_page("relations.md") or "（暂无显式关系网页面）"
+        if len(relations_content) > RELATIONS_CAP_CHARS:
+            relations_content = (
+                relations_content[:RELATIONS_CAP_CHARS]
+                + "\n\n（关系网内容过长，已截断——完整内容请查看 relations.md 页面）"
+            )
+        return relations_content
 
     async def _stream_query(self, messages: list[dict], question: str,
                              save_answer: bool) -> "AsyncGenerator[str, None]":
         full_answer: list[str] = []
         try:
             gen = await deepseek_client.chat_completion(
-                messages, model=self.model, stream=True, api_key=self.api_key
+                messages, model=self.query_model, stream=True, api_key=self.api_key   # 问答：v4-flash
             )
             async for chunk in gen:
                 full_answer.append(chunk)
@@ -791,7 +1031,7 @@ class WikiManager:
         ]
         try:
             response = await deepseek_client.chat_completion(
-                messages, model=self.model, stream=False, api_key=self.api_key
+                messages, model=self.build_model, stream=False, api_key=self.api_key   # 体检/修订：v4-pro
             )
             blocks = await asyncio.to_thread(self._parse_file_blocks, response)
             _, updated = await asyncio.to_thread(self._apply_file_blocks, blocks)

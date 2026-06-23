@@ -5,7 +5,7 @@ import sys
 import uuid
 import uvicorn
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Header, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Header, Request, UploadFile, File, Form
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.routing import APIRouter
@@ -209,6 +209,11 @@ class WikiBuildRequest(BaseModel):
     api_key: str
     batch_size: int = 5
 
+class WikiRebuildRequest(BaseModel):
+    domain: str
+    api_key: str
+    level: str = "stage2"   # "stage2" (keep atoms) | "full" (re-distill from raw files)
+
 class WikiQueryRequest(BaseModel):
     question: str
     domain: Optional[str] = None
@@ -271,6 +276,125 @@ async def wiki_build(req: WikiBuildRequest, background_tasks: BackgroundTasks):
 
     background_tasks.add_task(run_build)
     return {"status": "building", "domain": req.domain}
+
+@wiki_router.post("/rebuild")
+async def wiki_rebuild(req: WikiRebuildRequest, background_tasks: BackgroundTasks):
+    """Rebuild a knowledge base WITHOUT re-crawling — for architecture/version
+    upgrades. level=stage2 keeps Stage-1 atoms and re-assembles the relation
+    network; level=full deletes everything and re-distills from the raw scraped
+    source files. Progress streams via /api/wiki/events/{domain}."""
+    active = await asyncio.to_thread(db_manager.get_active_tasks)
+    if active:
+        raise HTTPException(status_code=409,
+                            detail="爬虫正在运行，请等待爬取完成后再重建知识库")
+    if req.domain in _wiki_building:
+        raise HTTPException(status_code=409,
+                            detail="该知识库正在建设中，请勿重复点击")
+    if req.level not in ("stage2", "full"):
+        raise HTTPException(status_code=400, detail="level 必须为 stage2 或 full")
+
+    from scraper import push_status, create_log_queue
+    from wiki.wiki_manager import WikiManager
+
+    qid = _wiki_queue_id(req.domain)
+    q = create_log_queue(qid)
+    _wiki_building.add(req.domain)
+
+    async def run_rebuild():
+        def progress(msg, mtype="log"):
+            push_status(qid, msg, mtype)
+        try:
+            label = "Stage-2 重建（保留原子）" if req.level == "stage2" else "全量重建（重新蒸馏）"
+            push_status(qid, f"开始{label}：{req.domain}", "info")
+            mgr = WikiManager(req.domain, req.api_key)
+            if req.level == "stage2":
+                result = await mgr.force_rebuild_stage2(progress=progress)
+            else:
+                result = await mgr.force_rebuild_full(progress=progress)
+            db_manager.log_wiki_operation(req.domain, f"rebuild_{req.level}", result)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            push_status(qid, f"知识库重建失败：{e}", "error")
+            db_manager.log_wiki_operation(req.domain, "rebuild_error", {"error": str(e)})
+        finally:
+            _wiki_building.discard(req.domain)
+            try:
+                q.put_nowait(None)
+            except Exception:
+                pass
+
+    background_tasks.add_task(run_rebuild)
+    return {"status": "rebuilding", "domain": req.domain, "level": req.level}
+
+@wiki_router.post("/import")
+async def wiki_import(
+    background_tasks: BackgroundTasks,
+    domain: str = Form(...),
+    api_key: str = Form(...),
+    files: list[UploadFile] = File(...),
+):
+    """Build a knowledge base directly from uploaded raw .md files, independent
+    of the crawler. Files are saved into scraped_data/{domain}/ then the full
+    pipeline runs. Lets users (re)build a KB from previously-downloaded sources
+    without re-crawling. Progress streams via /api/wiki/events/{domain}."""
+    domain = domain.strip()
+    if not domain:
+        raise HTTPException(status_code=400, detail="缺少域名")
+    if domain in _wiki_building:
+        raise HTTPException(status_code=409, detail="该知识库正在建设中，请勿重复提交")
+
+    from pathlib import Path as _Path
+    md_files = [f for f in files if (f.filename or "").lower().endswith(".md")]
+    if not md_files:
+        raise HTTPException(status_code=400, detail="请上传至少一个 .md 文件")
+
+    # Persist uploads into scraped_data/{domain}/ before returning so the build
+    # task reads them off disk (UploadFile streams aren't safe to use later).
+    raw_dir = _Path(os.getcwd()) / "scraped_data" / domain
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    saved_names: list[str] = []
+    for f in md_files:
+        safe_name = os.path.basename(f.filename)            # strip any path segments
+        if not safe_name.endswith(".md"):
+            continue
+        data = await f.read()
+        (raw_dir / safe_name).write_bytes(data)
+        saved_names.append(safe_name)
+
+    if not saved_names:
+        raise HTTPException(status_code=400, detail="没有有效的 .md 文件被保存")
+
+    from scraper import push_status, create_log_queue
+    from wiki.wiki_manager import WikiManager
+
+    qid = _wiki_queue_id(domain)
+    q = create_log_queue(qid)
+    _wiki_building.add(domain)
+
+    async def run_import_build():
+        def progress(msg, mtype="log"):
+            push_status(qid, msg, mtype)
+        try:
+            push_status(qid, f"已接收 {len(saved_names)} 个文件，开始导入建库：{domain}", "info")
+            mgr = WikiManager(domain, api_key)
+            paths = [str(raw_dir / n) for n in saved_names]
+            result = await mgr.ingest_from_files(paths, progress=progress)
+            db_manager.log_wiki_operation(domain, "import_build", result)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            push_status(qid, f"导入建库失败：{e}", "error")
+            db_manager.log_wiki_operation(domain, "import_error", {"error": str(e)})
+        finally:
+            _wiki_building.discard(domain)
+            try:
+                q.put_nowait(None)
+            except Exception:
+                pass
+
+    background_tasks.add_task(run_import_build)
+    return {"status": "importing", "domain": domain, "files": saved_names}
 
 @wiki_router.get("/events/{domain}")
 async def wiki_events(domain: str):
