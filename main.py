@@ -220,6 +220,8 @@ class WikiQueryRequest(BaseModel):
     api_key: str
     stream: bool = True
     history: list = []   # prior turns: [{"role":"user","content":"..."},...]
+    deep: bool = False   # escalate the answer step to v4-pro for query-time
+                         # synthesis (connecting clues into new logic chains)
 
 def _wiki_queue_id(domain: str) -> str:
     return f"wiki::{domain}"
@@ -464,7 +466,8 @@ async def wiki_query(req: WikiQueryRequest):
         async def event_stream():
             for mgr in managers:
                 try:
-                    gen = await mgr.query(req.question, stream=True, history=req.history)
+                    gen = await mgr.query(req.question, stream=True,
+                                          history=req.history, deep=req.deep)
                     async for chunk in gen:
                         yield f"data: {json.dumps({'delta': chunk}, ensure_ascii=False)}\n\n"
                 except Exception as e:
@@ -479,7 +482,8 @@ async def wiki_query(req: WikiQueryRequest):
     else:
         parts = []
         for mgr in managers:
-            answer = await mgr.query(req.question, stream=False, history=req.history)
+            answer = await mgr.query(req.question, stream=False,
+                                     history=req.history, deep=req.deep)
             parts.append(answer)
         return {"answer": "\n\n".join(parts)}
 

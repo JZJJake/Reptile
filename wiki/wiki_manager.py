@@ -1,20 +1,35 @@
 """
-Karpathy LLM Wiki Manager — two-phase ingest with read-before-write.
+Karpathy LLM Wiki Manager — three-stage distillation for a compounding KB.
 
 Three layers:
   1. Raw Sources   — scraped_data/{domain}/*.md  (immutable, crawler output)
   2. The Wiki      — wiki/{domain}/*.md           (LLM-curated, compounding)
   3. The Schema    — wiki/schema.py               (governs all LLM operations)
 
-Ingest pipeline (two phases per batch):
-  Phase 1 (plan)  — light DeepSeek call: given doc titles + current index,
-                    identify which existing pages to update vs create fresh.
-  Phase 2 (write) — main DeepSeek call: with full doc text + existing page
-                    content, produce FILE_WRITE blocks that preserve and extend.
+Ingest pipeline (resumable, three stages):
+  Stage 1 (distil)   — each source doc → one compact "knowledge atom" (v4-pro).
+  Stage 2 (assemble) — atoms → relation network (concepts/entities/synthesis/
+                       relations.md). Entity merge / relation extraction /
+                       contradiction detection / forced sourcing (v4-pro).
+  Stage 3 (shard)    — split relations.md into topic shards once it grows large.
+
+Long-term-stability machinery (this module's core job is to stay coherent as the
+corpus grows without bound across many separate ingests):
+  - Persistent entity registry (.entity_registry.json): a cross-batch entity
+    identity table. Stage 2's context window can only hold a slice of the curated
+    network, so without a registry an entity whose page falls outside that slice
+    gets a duplicate page instead of being merged — the dominant failure mode at
+    scale. The registry surfaces "these entities already exist" to every batch
+    regardless of what fits in context, and learns alias forms over time.
+  - Relevance-ordered + relations-sub-capped existing-network context, so entity/
+    concept pages are not crowded out by an ever-growing relations.md.
+  - Anti-loss backup: a page that shrinks drastically on rewrite is snapshotted
+    to .backups/ before being overwritten ("绝不丢失" with a real safety net).
 
 Query pipeline (two-step):
-  Step 1 — DeepSeek selects the most relevant wiki pages from the index.
-  Step 2 — DeepSeek answers from exactly those pages (not raw sources).
+  Step 1 — cheap model selects the most relevant wiki pages from the index.
+  Step 2 — model answers from exactly those pages (v4-flash; deep=True → v4-pro
+           for genuine query-time synthesis / clue-connecting).
 
 Source tracking via wiki/{domain}/.ingested (one filename per line, append-only).
 """
@@ -56,6 +71,19 @@ RELATIONS_CAP_CHARS = 20_000  # relations.md grows without bound over many inges
 RELATIONS_SHARD_THRESHOLD = 30_000  # Stage-3: shard relations.md once it exceeds this
                                      # (chars). Above it a single monolithic relation
                                      # file becomes a query/assembly scalability ceiling.
+INDEX_SELECT_CAP_CHARS = 8_000  # index.md fed to the LLM page-select call. Without
+                                 # this cap, index.md grows unbounded and eventually
+                                 # blows the page-select context once the KB is large.
+
+# ── Cross-batch entity identity (long-term anti-fragmentation) ────────────────
+ENTITY_REGISTRY_FILE = ".entity_registry.json"  # canonical entity → {page, aliases}
+ENTITY_HINT_CAP_CHARS = 4_000   # cap on the merge-candidate hint injected per batch
+ENTITY_MIN_MATCH_LEN = 3        # min normalized length for a containment match
+                                 # (avoid a generic suffix like "中心" matching all)
+# Anti-loss: if an existing, substantial page is rewritten to under this fraction
+# of its former size, snapshot the old version to .backups/ before overwriting.
+PAGE_SHRINK_BACKUP_RATIO = 0.5
+PAGE_SHRINK_BACKUP_MIN_CHARS = 800
 
 # ── Multi-layer distillation budgets (in tokens) ──────────────────────────────
 # Quality-optimal window for relationship assembly. We favour MORE small calls
@@ -240,11 +268,165 @@ class WikiManager:
             for name in atom_names:
                 f.write(name.strip() + "\n")
 
+    # ── Cross-batch entity registry (long-term anti-fragmentation) ────────────
+    #
+    # Stage 2 can only fit a slice of the curated network in its context window.
+    # Once the network outgrows that window, a new atom mentioning an entity whose
+    # page isn't in the slice would spawn a DUPLICATE entity page — the dominant
+    # quality failure as the KB grows. The registry is a compact, persistent map
+    # of canonical entity → {page, aliases} that we inject into every assembly
+    # batch so the model can merge correctly regardless of what fits in context.
+    # It also LEARNS alias forms over time (compounding the index itself).
+
+    @staticmethod
+    def _normalize_entity(name: str) -> str:
+        """Normalize an entity mention for matching: lowercase, drop spaces,
+        punctuation and bracketing, keep CJK + alphanumerics."""
+        return re.sub(
+            r'[\s　\-_·、，,。.()（）\[\]【】「」『』"\'：:；;!！?？/\\]+',
+            '', (name or '').lower(),
+        ).strip()
+
+    @staticmethod
+    def _page_title(content: str) -> Optional[str]:
+        """First '# Heading' line of a page, or None."""
+        for line in (content or "").splitlines():
+            s = line.strip()
+            if s.startswith("# "):
+                return s[2:].strip() or None
+        return None
+
+    def _extract_atom_entities(self, atom_text: str) -> list[str]:
+        """Pull entity mentions from the '关键实体:' line(s) of joined atom text."""
+        out = []
+        for line in atom_text.splitlines():
+            s = line.strip().lstrip('-').strip()
+            if s.startswith("关键实体"):
+                val = re.split(r'[:：]', s, maxsplit=1)
+                val = val[1] if len(val) > 1 else ""
+                for part in re.split(r'[;；,，、]', val):
+                    part = part.strip()
+                    if part and part not in ("无", "None", "无。", "暂无"):
+                        out.append(part)
+        return out
+
+    def _registry_path(self) -> Path:
+        return self.wiki_path / ENTITY_REGISTRY_FILE
+
+    def _load_entity_registry(self) -> dict:
+        p = self._registry_path()
+        if not p.is_file():
+            return {}
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    def _save_entity_registry(self, reg: dict):
+        try:
+            self._registry_path().write_text(
+                json.dumps(reg, ensure_ascii=False, sort_keys=True, indent=0),
+                encoding="utf-8",
+            )
+        except OSError as e:
+            print(f"[wiki/{self.domain}] registry save failed: {e}")
+
+    def _rebuild_registry_from_pages(self, reg: dict) -> dict:
+        """Ensure every entities/*.md page is registered (keyed by normalized
+        title). Preserves any learned aliases already on an entry."""
+        for rel in self.list_pages():
+            if not rel.startswith("entities/"):
+                continue
+            content = self.read_page(rel) or ""
+            title = self._page_title(content) or Path(rel).stem
+            key = self._normalize_entity(title)
+            if not key:
+                continue
+            entry = reg.get(key, {})
+            entry["page"] = rel
+            entry["canonical"] = title
+            entry.setdefault("aliases", [])
+            reg[key] = entry
+        return reg
+
+    def _refresh_entity_registry(self) -> dict:
+        """Load → rebuild from current entity pages → save → return."""
+        reg = self._load_entity_registry()
+        reg = self._rebuild_registry_from_pages(reg)
+        self._save_entity_registry(reg)
+        return reg
+
+    def _match_existing_entities(self, mentions: list[str], reg: dict) -> dict:
+        """Conservatively map new mentions to already-registered entities.
+
+        Returns {canonical: page}. A match is exact-normalized, or one side
+        contains the other with the shorter side >= ENTITY_MIN_MATCH_LEN chars
+        (so "制造业创新中心" matches "国家制造业创新中心" but a bare "中心" does
+        not match everything). Newly observed surface forms are learned as
+        aliases on the matched entry (mutates `reg`)."""
+        results: dict[str, str] = {}
+        keys = list(reg.keys())
+        for m in mentions:
+            nm = self._normalize_entity(m)
+            if not nm or len(nm) < 2:
+                continue
+            if nm in reg:
+                results[reg[nm].get("canonical", m)] = reg[nm].get("page", "")
+                continue
+            for k in keys:
+                if k == nm:
+                    continue
+                short, long = (nm, k) if len(nm) <= len(k) else (k, nm)
+                if len(short) >= ENTITY_MIN_MATCH_LEN and short in long:
+                    results[reg[k].get("canonical", k)] = reg[k].get("page", "")
+                    aliases = reg[k].setdefault("aliases", [])
+                    if m != reg[k].get("canonical") and m not in aliases:
+                        aliases.append(m)
+                    break
+        return results
+
+    def _build_entity_hint(self, atoms_text: str, reg: dict) -> str:
+        """Build the merge-candidate hint injected into a Stage-2 assembly call."""
+        if not reg:
+            return "（暂无已登记实体——首次组装，按需新建实体页即可）"
+        mentions = self._extract_atom_entities(atoms_text)
+        if not mentions:
+            return "（本批未解析到关键实体）"
+        matches = self._match_existing_entities(mentions, reg)
+        if not matches:
+            return "（本批实体在已登记实体表中暂无同名/近名项，按需新建）"
+        lines, used = [], 0
+        for canonical, page in sorted(matches.items()):
+            pagename = Path(page).stem if page else canonical
+            line = f"- [[{pagename}]]（已登记实体：{canonical}）"
+            if used + len(line) > ENTITY_HINT_CAP_CHARS:
+                lines.append("- …（候选实体过多，已截断）")
+                break
+            lines.append(line)
+            used += len(line)
+        return ("以下实体已存在于知识库，若本批原子提及同一对象，"
+                "请复用对应页面名归并，不要新建重复页：\n" + "\n".join(lines))
+
     # ── Shared helpers ─────────────────────────────────────────────────────────
 
     def _parse_file_blocks(self, text: str) -> list[tuple[str, str]]:
         return [(path.strip(), content.strip())
                 for path, content in FILE_WRITE_RE.findall(text)]
+
+    def _backup_page(self, rel_path: str, old_content: str):
+        """Snapshot a page to .backups/ before a destructive overwrite. Stored as
+        '*.md.bak' under a dot-dir so list_pages() (rglob '*.md') never sees it."""
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        safe = slugify(rel_path) or "page"
+        bdir = self.wiki_path / ".backups"
+        try:
+            bdir.mkdir(exist_ok=True)
+            (bdir / f"{safe}-{ts}.md.bak").write_text(old_content, encoding="utf-8")
+            print(f"[wiki/{self.domain}] backed up shrinking page {rel_path} "
+                  f"({len(old_content)} chars) before overwrite")
+        except OSError as e:
+            print(f"[wiki/{self.domain}] backup failed for {rel_path}: {e}")
 
     def _apply_file_blocks(self, blocks: list[tuple[str, str]]) -> tuple[int, int]:
         created = updated = 0
@@ -259,6 +441,18 @@ class WikiManager:
                 print(f"[wiki] Blocked path traversal: {rel_path}")
                 continue
             existed = target.is_file()
+            if existed:
+                # Anti-loss safety net: "增量更新…绝不丢失" is an instruction the LLM
+                # can still violate by emitting a truncated page. If a substantial
+                # page shrinks past the backup ratio, snapshot the old version
+                # first so the knowledge is always recoverable.
+                try:
+                    old = target.read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    old = ""
+                if (len(old) >= PAGE_SHRINK_BACKUP_MIN_CHARS
+                        and len(content) < len(old) * PAGE_SHRINK_BACKUP_RATIO):
+                    self._backup_page(rel_path, old)
             self.write_page(rel_path, content)
             updated += existed
             created += not existed
@@ -426,26 +620,42 @@ class WikiManager:
 
     # ── Stage 2: assemble atoms → relation network ─────────────────────────────
 
-    def _read_network_pages(self, cap_tokens: int) -> str:
+    def _read_network_pages(self, cap_tokens: int,
+                            focus_text: Optional[str] = None) -> str:
         """Read existing curated network (relations/index/concepts/entities/
         synthesis) for incremental-assembly context, capped by token budget.
 
-        Fix: previously an oversized entry was `continue`-d (silently dropped),
-        which meant relations.md could vanish from assembly context once it grew
-        past the cap — exactly the scaffold Stage-2 most needs. Now we truncate
-        an oversized entry to the remaining budget so it always appears, just
-        shorter. The Stage-3 shard dir (relations/) is excluded — it's a derived
-        view of relations.md and would double-count edges here."""
+        Two scalability fixes layered here:
+
+        1. relations.md sub-cap. relations.md is loaded first (it's the scaffold)
+           but it grows without bound, and at scale it would eat the WHOLE budget
+           and starve the entity/concept pages Stage-2 needs to merge correctly.
+           We cap its share at half the budget so curated pages always get room.
+        2. Relevance ordering. When `focus_text` is given (the current chunk's
+           atoms), non-priority pages are loaded most-relevant-first instead of in
+           filesystem order — so the slice that fits is the slice that matters to
+           this batch, not just the alphabetical head.
+
+        An oversized entry is truncated (not dropped) so it still appears. The
+        Stage-3 shard dir (relations/) is excluded — it's a derived view of
+        relations.md and would double-count edges here."""
         priority = ["relations.md", "index.md"]
-        parts, total = [], 0
-        seen = set()
-        ordered = priority + [
+        nonprio = [
             p for p in self.list_pages()
             if p not in priority
             and not p.startswith("atoms/")
             and not p.startswith("relations/")   # Stage-3 shards are derived
             and p not in ("log.md",)
         ]
+        if focus_text:
+            nonprio.sort(
+                key=lambda p: self._score_text(focus_text, self.read_page(p) or ""),
+                reverse=True,
+            )
+        ordered = priority + nonprio
+        relations_subcap = cap_tokens // 2   # relations.md may take at most half
+        parts, total = [], 0
+        seen = set()
         for rel in ordered:
             if rel in seen:
                 continue
@@ -458,14 +668,18 @@ class WikiManager:
             remaining = cap_tokens - total
             if remaining <= 20:
                 break                        # budget exhausted
-            if t > remaining:
+            # relations.md is sub-capped so it can't crowd out curated pages.
+            eff_remaining = min(remaining, relations_subcap) if rel == "relations.md" \
+                else remaining
+            if t > eff_remaining:
                 # Truncate proportionally (estimate_tokens ≈ 1 char/CJK token)
-                # rather than dropping the whole page silently.
-                approx_chars = max(0, remaining * 2)
+                # rather than dropping the whole page silently; keep filling the
+                # rest of the budget with the following (relevance-ordered) pages.
+                approx_chars = max(0, eff_remaining * 2)
                 entry = entry[:approx_chars] + "\n…（已截断）"
                 parts.append(entry)
-                total = cap_tokens
-                break
+                total += estimate_tokens(entry)
+                continue
             parts.append(entry)
             total += t
         return "\n\n".join(parts)
@@ -546,11 +760,15 @@ class WikiManager:
                    "（实体归并 / 关系提取 / 矛盾检测）", "info")
             atoms_text = await asyncio.to_thread(self._join_atoms, new_atoms)
             prompt = ASSEMBLE_PROMPT_TEMPLATE.format(
+                entity_hint="（暂无已登记实体——首次组装，按需新建实体页即可）",
                 existing_network="（空——首次组装）",
                 atoms=atoms_text,
             )
             result = await self._assemble_call(prompt, "阶段②", report)
             await asyncio.to_thread(self._mark_assembled, [a.name for a in new_atoms])
+            # Seed the cross-batch entity registry from the freshly-built pages so
+            # the very next ingest can merge against these entities.
+            await asyncio.to_thread(self._refresh_entity_registry)
             return result
 
         report(f"阶段② 关系组装：{len(new_atoms)} 个新知识原子，"
@@ -558,11 +776,20 @@ class WikiManager:
         tot_c = tot_u = 0
         for idx, chunk in enumerate(chunks, 1):
             report(f"阶段②：组装第 {idx}/{n} 批（{len(chunk)} 个新原子）...", "log")
-            existing = await asyncio.to_thread(
-                self._read_network_pages, EXISTING_NETWORK_CAP_TOKENS)
             atoms_text = await asyncio.to_thread(self._join_atoms, chunk)
+            # Cross-batch entity identity: build a merge-candidate hint from the
+            # persistent registry (learns aliases — persist them), then load the
+            # existing network RELEVANT to this chunk (focus_text) so the slice
+            # that fits the budget is the slice that matters to these atoms.
+            reg = await asyncio.to_thread(self._load_entity_registry)
+            entity_hint = await asyncio.to_thread(
+                self._build_entity_hint, atoms_text, reg)
+            await asyncio.to_thread(self._save_entity_registry, reg)
+            existing = await asyncio.to_thread(
+                self._read_network_pages, EXISTING_NETWORK_CAP_TOKENS, atoms_text)
             prompt = ASSEMBLE_INCREMENTAL_PROMPT_TEMPLATE.format(
                 chunk_no=idx, n_chunks=n,
+                entity_hint=entity_hint,
                 existing_network=existing or "（空——首次组装）",
                 atoms=atoms_text,
             )
@@ -571,6 +798,8 @@ class WikiManager:
                 tot_c += c
                 tot_u += u
                 await asyncio.to_thread(self._mark_assembled, [a.name for a in chunk])
+                # Register entity pages created/updated by this batch for the next.
+                await asyncio.to_thread(self._refresh_entity_registry)
                 report(f"阶段②第 {idx}/{n} 批完成：新建 {c} 页 / 更新 {u} 页",
                        "success")
             except Exception as e:
@@ -831,6 +1060,11 @@ class WikiManager:
         index = await asyncio.to_thread(self.read_index)
         if not index or "尚无内容" in index or "empty" in index.lower():
             return []
+        # index.md grows without bound as the KB accumulates pages; cap what we
+        # feed the page-select call so a large library can't blow its context
+        # window (mirrors the iOS port's indexSelectCapChars guard).
+        if len(index) > INDEX_SELECT_CAP_CHARS:
+            index = index[:INDEX_SELECT_CAP_CHARS] + "\n…（目录过长，已截断）"
         try:
             response = await deepseek_client.chat_completion(
                 [
@@ -857,14 +1091,21 @@ class WikiManager:
 
     async def query(self, question: str, stream: bool = True,
                     save_answer: bool = False,
-                    history: list = None) -> "AsyncGenerator[str, None] | str":
+                    history: list = None,
+                    deep: bool = False) -> "AsyncGenerator[str, None] | str":
         """
         Answer a question from the wiki (not raw sources).
         Two steps:
-          1. DeepSeek selects the most relevant pages from index.md.
-          2. DeepSeek answers from exactly those pages.
+          1. A cheap model selects the most relevant pages from index.md.
+          2. The answer model answers from exactly those pages.
         Falls back to keyword-based page selection if Step 1 fails.
+
+        `deep=True` escalates ONLY the answer step to REASON_MODEL (v4-pro) for
+        genuine query-time synthesis — connecting clues across pages into a new
+        logic chain. Page-selection stays on the cheap tier, so routine Q&A is
+        unaffected and deep reasoning is opt-in per question.
         """
+        answer_model = deepseek_client.REASON_MODEL if deep else self.query_model
         index_content = await asyncio.to_thread(self.read_index)
 
         # When only Stage-1 atoms exist, tell DeepSeek the wiki is being built
@@ -928,10 +1169,11 @@ class WikiManager:
         messages.append({"role": "user", "content": query_turn})
 
         if stream:
-            return self._stream_query(messages, question, save_answer)
+            return self._stream_query(messages, question, save_answer, answer_model)
         else:
             response = await deepseek_client.chat_completion(
-                messages, model=self.query_model, stream=False, api_key=self.api_key   # 问答：v4-flash
+                messages, model=answer_model, stream=False, api_key=self.api_key
+                # 问答：默认 v4-flash；deep=True 时升级为 v4-pro 做跨页贯通推理
             )
             if save_answer and response:
                 await self._save_answer_as_synthesis(question, response)
@@ -975,11 +1217,14 @@ class WikiManager:
         return relations_content
 
     async def _stream_query(self, messages: list[dict], question: str,
-                             save_answer: bool) -> "AsyncGenerator[str, None]":
+                             save_answer: bool,
+                             answer_model: Optional[str] = None
+                             ) -> "AsyncGenerator[str, None]":
         full_answer: list[str] = []
         try:
             gen = await deepseek_client.chat_completion(
-                messages, model=self.query_model, stream=True, api_key=self.api_key   # 问答：v4-flash
+                messages, model=answer_model or self.query_model,
+                stream=True, api_key=self.api_key   # 问答：默认 v4-flash，deep 时 v4-pro
             )
             async for chunk in gen:
                 full_answer.append(chunk)
