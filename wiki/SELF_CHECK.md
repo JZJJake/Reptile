@@ -1,7 +1,9 @@
 # Wiki Pipeline Self-Check
 
-A recurring audit checklist for logic errors across the three Karpathy-wiki
-stages. Run this whenever `wiki/schema.py` or `wiki/wiki_manager.py` change.
+A recurring audit checklist for logic errors across the map-reduce Karpathy-wiki
+stages (distil → cluster-assemble → shard → cross-synthesis). Run this whenever
+`wiki/schema.py` or `wiki/wiki_manager.py` change. The deterministic items are
+covered by `python -m wiki.test_pipeline_offline` (no API key needed).
 
 ## Stage 1 — 数据的蒸馏 (doc → knowledge atom)
 
@@ -50,6 +52,18 @@ stages. Run this whenever `wiki/schema.py` or `wiki/wiki_manager.py` change.
 - [ ] These four items are covered by `python -m wiki.test_pipeline_offline`
       (no API key needed) — run it whenever this file or `wiki_manager.py` changes.
 
+## Stage 2 "map" — topic-affinity clustering (atoms → coherent batches)
+
+- [ ] When new atoms exceed one assembly budget (or a network already exists),
+      `_cluster_atoms_by_affinity` groups them by shared concept-tags/entities,
+      NOT by file order — verify atoms on the same topic land in the same batch.
+- [ ] First/small build (all new atoms fit one budget AND no existing network)
+      still goes through the SINGLE full-corpus call (best global view) — clustering
+      only kicks in once scale forces multiple batches.
+- [ ] `_cluster_atoms_by_affinity` respects the token budget (splits same-topic
+      atoms when needed) and never drops an atom; falls back to budget chunking
+      when no atom exposes any features.
+
 ## Stage 3 — 关系网分片 (relations.md → relations/ shards)
 
 - [ ] `_stage3_consolidate_relations_if_needed` only fires once `relations.md`
@@ -65,6 +79,20 @@ stages. Run this whenever `wiki/schema.py` or `wiki/wiki_manager.py` change.
 - [ ] **`_read_network_pages` truncates** oversized entries to the remaining
       budget instead of `continue`-dropping them — `relations.md` must never
       vanish from assembly context once it grows past the cap.
+
+## Stage 4 "reduce" — cross-topic synthesis (connect clues → logic chains)
+
+- [ ] `_stage4_cross_synthesis` runs after Stage 3 in `ingest` /
+      `force_rebuild_stage2`, but ONLY when `created or updated` (a no-op
+      re-ingest must not spend tokens re-synthesising).
+- [ ] It writes ONLY `synthesis/*.md` + `index.md` — blocks targeting atoms,
+      `relations.md`, concepts or entities are filtered out before apply (it is a
+      read-only consumer of the network, not a writer of it).
+- [ ] No-fabrication: the prompt requires inferred (not network-stated) links to
+      carry a `[推断]` tag; spot-check synthesis pages don't assert invented facts
+      as sourced. `CROSS_SYNTHESIS_PROMPT_TEMPLATE` must keep that rule.
+- [ ] Incremental: existing `synthesis/` pages are fed back (capped) and merged,
+      not overwritten — prior insights survive across ingests.
 
 ## Rebuild / import (no re-crawl)
 

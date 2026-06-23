@@ -6,12 +6,17 @@ Three layers:
   2. The Wiki      — wiki/{domain}/*.md           (LLM-curated, compounding)
   3. The Schema    — wiki/schema.py               (governs all LLM operations)
 
-Ingest pipeline (resumable, three stages):
+Ingest pipeline (resumable, map-reduce shape):
   Stage 1 (distil)   — each source doc → one compact "knowledge atom" (v4-pro).
-  Stage 2 (assemble) — atoms → relation network (concepts/entities/synthesis/
-                       relations.md). Entity merge / relation extraction /
+  Stage 2 (assemble) — atoms → relation network. The "MAP": atoms are clustered by
+                       topic affinity (shared tags/entities) so each batch is
+                       coherent → reliable entity merge / relation extraction /
                        contradiction detection / forced sourcing (v4-pro).
   Stage 3 (shard)    — split relations.md into topic shards once it grows large.
+  Stage 4 (synthesis)— the "REDUCE": read the whole relation network and forge
+                       non-obvious cross-topic links into explicit, sourced logic
+                       chains (synthesis/) — "贯通线索 / 创造新逻辑链路". Inferred
+                       links are tagged [推断]; never fabricates facts (v4-pro).
 
 Long-term-stability machinery (this module's core job is to stay coherent as the
 corpus grows without bound across many separate ingests):
@@ -49,6 +54,7 @@ from wiki.schema import (
     ASSEMBLE_PROMPT_TEMPLATE,
     ASSEMBLE_INCREMENTAL_PROMPT_TEMPLATE,
     RELATIONS_CONSOLIDATE_PROMPT_TEMPLATE,
+    CROSS_SYNTHESIS_PROMPT_TEMPLATE,
     PAGE_SELECT_PROMPT_TEMPLATE,
     QUERY_PROMPT_TEMPLATE,
     LINT_PROMPT_TEMPLATE,
@@ -95,6 +101,17 @@ EXISTING_NETWORK_CAP_TOKENS = 30_000  # cap on prior-network context in chunked 
 STAGE1_DOC_CHARS = 40_000           # max source chars fed to one distillation call
 STAGE1_CONCURRENCY = 4              # parallel single-doc distillation calls
 ASSEMBLY_TIMEOUT = 600.0            # deepseek-reasoner "thinking" adds latency on large assembly calls
+
+# ── Stage 2 "map": topic-affinity clustering ──────────────────────────────────
+# When atoms exceed a single assembly call, group them by shared concept-tags /
+# entities instead of by file order, so each batch is topically coherent → far
+# better entity merge & relation extraction (cross-batch identity is still held
+# by the entity registry). Deterministic, embedding-free.
+CLUSTER_MIN_OVERLAP = 1             # min shared features to join an open cluster
+# ── Stage 4 "reduce": cross-topic synthesis caps ──────────────────────────────
+SYNTHESIS_RELATIONS_CAP_CHARS = 24_000  # relation-network context fed to synthesis
+SYNTHESIS_INDEX_CAP_CHARS      = 8_000   # index (connectable nodes) fed to synthesis
+SYNTHESIS_EXISTING_CAP_CHARS   = 16_000  # prior synthesis pages fed back for merge
 
 
 def estimate_tokens(text: str) -> int:
@@ -702,6 +719,72 @@ class WikiManager:
             chunks.append(cur)
         return chunks
 
+    def _atom_features(self, atom_text: str) -> set[str]:
+        """Topic signature of an atom: normalized concept-tags + key entities.
+
+        Used to cluster atoms by topic for assembly. Concept tags come from the
+        '概念标签:' line; entities reuse `_extract_atom_entities`. Both are
+        normalized so '工信部' / '工信部 ' / '工业和信息化部' (when written as a
+        tag) collapse to comparable tokens."""
+        feats: set[str] = set()
+        for line in atom_text.splitlines():
+            s = line.strip().lstrip('-').strip()
+            if s.startswith("概念标签"):
+                val = re.split(r'[:：]', s, maxsplit=1)
+                val = val[1] if len(val) > 1 else ""
+                for part in re.split(r'[;；,，、]', val):
+                    n = self._normalize_entity(part)
+                    if n and n not in ("无", "none", "暂无"):
+                        feats.add(n)
+        for ent in self._extract_atom_entities(atom_text):
+            n = self._normalize_entity(ent)
+            if n:
+                feats.add(n)
+        return feats
+
+    def _cluster_atoms_by_affinity(self, atoms: list[Path],
+                                   budget_tokens: int) -> list[list[Path]]:
+        """Group atoms into topic-coherent, budget-bounded clusters (the "map").
+
+        Greedy single pass over atoms (sorted for determinism): each atom joins
+        the open cluster it shares the most features with — provided the overlap
+        is at least CLUSTER_MIN_OVERLAP and the cluster still has budget — else it
+        starts a new cluster. Topic-coherent batches make in-batch entity merge
+        and relation extraction far more reliable than file-order chunking; the
+        entity registry still stitches identity ACROSS clusters.
+
+        Falls back to plain budget chunking if no atom exposes any features."""
+        items = []
+        any_feats = False
+        for ap in sorted(atoms, key=lambda p: p.name):
+            try:
+                text = ap.read_text(encoding="utf-8")
+            except Exception:
+                text = ""
+            feats = self._atom_features(text)
+            any_feats = any_feats or bool(feats)
+            items.append((ap, feats, estimate_tokens(text)))
+        if not any_feats:
+            return self._chunk_atoms_by_budget(atoms, budget_tokens)
+
+        clusters: list[dict] = []   # {atoms:[Path], feats:set, tokens:int}
+        for ap, feats, tok in items:
+            best_i, best_ov = -1, 0
+            for i, c in enumerate(clusters):
+                if c["tokens"] + tok > budget_tokens:
+                    continue
+                ov = len(feats & c["feats"])
+                if ov > best_ov:       # strict '>' → first/lowest index wins ties
+                    best_ov, best_i = ov, i
+            if best_i >= 0 and best_ov >= CLUSTER_MIN_OVERLAP:
+                c = clusters[best_i]
+                c["atoms"].append(ap)
+                c["feats"] |= feats
+                c["tokens"] += tok
+            else:
+                clusters.append({"atoms": [ap], "feats": set(feats), "tokens": tok})
+        return [c["atoms"] for c in clusters]
+
     def _join_atoms(self, atoms: list[Path]) -> str:
         parts = []
         for ap in atoms:
@@ -751,11 +834,13 @@ class WikiManager:
 
         existing = await asyncio.to_thread(
             self._read_network_pages, EXISTING_NETWORK_CAP_TOKENS)
-        chunks = await asyncio.to_thread(
+        # Single full-corpus call only when the whole new set fits one budget AND
+        # there's no prior network — that gives the model a global view for the
+        # best first build. Otherwise we switch to topic-affinity clustering.
+        budget_chunks = await asyncio.to_thread(
             self._chunk_atoms_by_budget, new_atoms, ASSEMBLY_BUDGET_TOKENS)
-        n = len(chunks)
 
-        if n == 1 and not existing:
+        if len(budget_chunks) == 1 and not existing:
             report(f"阶段② 关系组装：{len(new_atoms)} 个原子一次性全量组装"
                    "（实体归并 / 关系提取 / 矛盾检测）", "info")
             atoms_text = await asyncio.to_thread(self._join_atoms, new_atoms)
@@ -771,8 +856,16 @@ class WikiManager:
             await asyncio.to_thread(self._refresh_entity_registry)
             return result
 
+        # "Map" step: cluster atoms by topic affinity (shared tags/entities) so
+        # each assembly batch is topically coherent — much better in-batch entity
+        # merge & relation extraction than file-order chunking. Cross-cluster
+        # identity is held by the entity registry; cross-cluster INSIGHT is forged
+        # by the Stage-4 synthesis "reduce" pass after assembly.
+        chunks = await asyncio.to_thread(
+            self._cluster_atoms_by_affinity, new_atoms, ASSEMBLY_BUDGET_TOKENS)
+        n = len(chunks)
         report(f"阶段② 关系组装：{len(new_atoms)} 个新知识原子，"
-               f"分 {n} 批增量融合进关系网", "info")
+               f"按主题亲和聚为 {n} 批增量融合进关系网", "info")
         tot_c = tot_u = 0
         for idx, chunk in enumerate(chunks, 1):
             report(f"阶段②：组装第 {idx}/{n} 批（{len(chunk)} 个新原子）...", "log")
@@ -847,6 +940,73 @@ class WikiManager:
             report(f"阶段③分片失败（非致命，查询将降级为 relations.md）：{e}", "warn")
             print(f"[wiki/{self.domain}] stage3 shard error: {e}")
 
+    # ── Stage 4: cross-topic synthesis (the "reduce" — connect clues) ──────────
+
+    def _read_synthesis_pages(self, cap_chars: int) -> str:
+        """Concatenate existing synthesis/*.md (capped) to feed back for merge."""
+        parts, total = [], 0
+        for rel in self.list_pages():
+            if not rel.startswith("synthesis/"):
+                continue
+            content = self.read_page(rel) or ""
+            entry = f"=== {rel} ===\n{content}"
+            if total + len(entry) > cap_chars:
+                break
+            parts.append(entry)
+            total += len(entry)
+        return "\n\n".join(parts) if parts else "（暂无 synthesis 页面）"
+
+    async def _stage4_cross_synthesis(self, report) -> tuple[int, int]:
+        """Forge non-obvious cross-topic links into explicit, sourced logic chains.
+
+        Topic-clustered assembly (the "map") keeps each batch coherent but means
+        no single call ever sees the whole corpus, so genuinely cross-topic
+        connections can go unmade. This "reduce" pass reads the full relation
+        network + index and writes synthesis/ pages that connect clues across
+        topics — the wiki's highest-value layer ("贯通线索 / 创造新逻辑链路").
+        It must not fabricate: inferred links are tagged [推断] by the prompt.
+        Non-fatal and incremental (merges into existing synthesis)."""
+        relations = await asyncio.to_thread(self._read_network_pages,
+                                            EXISTING_NETWORK_CAP_TOKENS)
+        if not relations.strip():
+            report("阶段④：关系网为空，跳过跨主题贯通", "info")
+            return 0, 0
+        relations = relations[:SYNTHESIS_RELATIONS_CAP_CHARS]
+        index_content = await asyncio.to_thread(self.read_index)
+        index_content = (index_content or "")[:SYNTHESIS_INDEX_CAP_CHARS]
+        existing_syn = await asyncio.to_thread(
+            self._read_synthesis_pages, SYNTHESIS_EXISTING_CAP_CHARS)
+
+        report("阶段④ 跨主题贯通：在关系网上串联线索、生成逻辑链路与洞察…", "info")
+        try:
+            response = await deepseek_client.chat_completion(
+                [
+                    {"role": "system", "content": DEFAULT_SCHEMA},
+                    {"role": "user",
+                     "content": CROSS_SYNTHESIS_PROMPT_TEMPLATE.format(
+                         relations_content=relations,
+                         index_content=index_content,
+                         existing_synthesis=existing_syn)},
+                ],
+                model=self.build_model, stream=False, api_key=self.api_key,  # Stage 4：v4-pro
+                timeout=ASSEMBLY_TIMEOUT,
+            )
+            blocks = await asyncio.to_thread(self._parse_file_blocks, response)
+            # The synthesis pass must not touch atoms or the relation network —
+            # it only writes synthesis/ pages and updates index.md.
+            blocks = [(p, c) for p, c in blocks
+                      if p.strip() == "index.md" or p.strip().startswith("synthesis/")]
+            if not blocks:
+                report("阶段④：未产出有效贯通页面（跳过）", "warn")
+                return 0, 0
+            created, updated = await asyncio.to_thread(self._apply_file_blocks, blocks)
+            report(f"阶段④完成：生成/更新 {created + updated} 个跨主题贯通页面", "success")
+            return created, updated
+        except Exception as e:
+            report(f"阶段④贯通失败（非致命）：{e}", "warn")
+            print(f"[wiki/{self.domain}] stage4 synthesis error: {e}")
+            return 0, 0
+
     # ── Destructive helpers (rebuild support) ──────────────────────────────────
 
     def _delete_atoms(self):
@@ -915,6 +1075,8 @@ class WikiManager:
 
         created, updated = await self._stage2_assemble(report)
         await self._stage3_consolidate_relations_if_needed(report)
+        if created or updated:
+            await self._stage4_cross_synthesis(report)
 
         total_atoms = len(await asyncio.to_thread(self._list_atoms))
         await asyncio.to_thread(
@@ -985,13 +1147,15 @@ class WikiManager:
     async def ingest(self, source_files: Optional[list[str]] = None,
                      batch_size: int = 5, progress=None) -> dict:
         """
-        Three-stage knowledge-distillation pipeline:
+        Map-reduce knowledge-distillation pipeline:
           Stage 1 — distill every source doc into a compact knowledge atom.
-          Stage 2 — assemble all atoms into a curated relation network.
+          Stage 2 — assemble atoms into a relation network (topic-clustered map).
           Stage 3 — shard relations.md into topic shards once it grows large.
-        Stages are resumable (.stage1_done / .stage2_done / .ingested).
-        `batch_size` is retained for API compatibility but no longer drives the
-        pipeline. Returns {pages_created, pages_updated, docs_processed, atoms_made}.
+          Stage 4 — cross-topic synthesis (reduce): connect clues into logic chains.
+        Stages 1-2 are resumable (.stage1_done / .stage2_done / .ingested); 3-4 run
+        when the network changed. `batch_size` is retained for API compatibility
+        but no longer drives the pipeline. Returns
+        {pages_created, pages_updated, docs_processed, atoms_made}.
         """
         def report(msg, mtype="log"):
             if progress:
@@ -1030,6 +1194,12 @@ class WikiManager:
 
         # ── Stage 3: shard relations.md if it has grown large ─────────────────
         await self._stage3_consolidate_relations_if_needed(report)
+
+        # ── Stage 4: cross-topic synthesis ("reduce" — connect clues) ─────────
+        # Only when this ingest actually changed the network, so a no-op re-ingest
+        # stays a no-op and doesn't spend tokens re-synthesising unchanged pages.
+        if created or updated:
+            await self._stage4_cross_synthesis(report)
 
         total_atoms = len(await asyncio.to_thread(self._list_atoms))
         await asyncio.to_thread(

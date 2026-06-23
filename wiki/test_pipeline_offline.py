@@ -27,6 +27,7 @@ from wiki.wiki_manager import (  # noqa: E402
 )
 from wiki.schema import (  # noqa: E402
     ASSEMBLE_PROMPT_TEMPLATE, ASSEMBLE_INCREMENTAL_PROMPT_TEMPLATE,
+    CROSS_SYNTHESIS_PROMPT_TEMPLATE,
 )
 
 _passed = 0
@@ -149,6 +150,66 @@ def test_assembly_prompts_format_with_all_fields():
           "ASSEMBLE_INCREMENTAL_PROMPT_TEMPLATE formats with all 5 fields")
 
 
+def _atom(title, tags, ents):
+    return (f"# {title}\n- 来源: {title}.md\n- 核心主张:\n  - x\n"
+            f"- 关键实体: {ents}\n- 概念标签: {tags}\n- 潜在关联: 无\n")
+
+
+def test_atom_features():
+    print("test_atom_features")
+    m = _mgr(tempfile.mkdtemp())
+    feats = m._atom_features(_atom("t", "新能源, 储能、电池", "宁德时代；比亚迪"))
+    check(m._normalize_entity("新能源") in feats, "concept tags become features")
+    check(m._normalize_entity("宁德时代") in feats, "key entities become features")
+    check(m._atom_features(_atom("t", "无", "无")) == set(),
+          "the '无' sentinel yields no features")
+
+
+def test_cluster_by_affinity_groups_by_topic():
+    print("test_cluster_by_affinity_groups_by_topic")
+    m = _mgr(tempfile.mkdtemp())
+    # Two clear topics; atom names interleaved to prove grouping is by topic,
+    # not by file order.
+    specs = {
+        "a_ev1.md":   _atom("电动车补贴", "新能源,电动车", "工信部"),
+        "b_chip1.md": _atom("芯片制程",   "半导体,芯片", "台积电"),
+        "c_ev2.md":   _atom("电池技术",   "新能源,电池", "宁德时代"),
+        "d_chip2.md": _atom("光刻机",     "半导体,光刻", "阿斯麦"),
+        "e_ev3.md":   _atom("充电桩",     "新能源,电动车", "国家电网"),
+    }
+    for name, body in specs.items():
+        m.write_page(f"atoms/{name}", body)
+    atoms = m._list_atoms()
+    clusters = m._cluster_atoms_by_affinity(atoms, budget_tokens=10_000)
+    names = [sorted(p.name for p in c) for c in clusters]
+    ev = next((s for s in names if "a_ev1.md" in s), [])
+    chip = next((s for s in names if "b_chip1.md" in s), [])
+    check(set(ev) == {"a_ev1.md", "c_ev2.md", "e_ev3.md"},
+          "all 新能源 atoms cluster together regardless of filename order")
+    check(set(chip) == {"b_chip1.md", "d_chip2.md"},
+          "all 半导体 atoms cluster together, separate from 新能源")
+
+
+def test_cluster_respects_budget():
+    print("test_cluster_respects_budget")
+    m = _mgr(tempfile.mkdtemp())
+    for i in range(4):
+        m.write_page(f"atoms/x{i}.md", _atom(f"同主题{i}", "同一主题", f"实体{i}"))
+    atoms = m._list_atoms()
+    # Tiny budget forces a split even though all atoms share a topic.
+    clusters = m._cluster_atoms_by_affinity(atoms, budget_tokens=30)
+    check(len(clusters) > 1, "a tiny token budget splits even same-topic atoms")
+    check(sum(len(c) for c in clusters) == 4, "no atom is dropped when splitting")
+
+
+def test_cross_synthesis_prompt_formats():
+    print("test_cross_synthesis_prompt_formats")
+    p = CROSS_SYNTHESIS_PROMPT_TEMPLATE.format(
+        relations_content="R", index_content="I", existing_synthesis="S")
+    check("R" in p and "I" in p and "S" in p, "synthesis prompt formats with 3 fields")
+    check("[推断]" in p, "synthesis prompt enforces the [推断] no-fabrication tag")
+
+
 def main():
     tests = [
         test_entity_normalize_and_extract,
@@ -157,6 +218,10 @@ def main():
         test_anti_loss_backup_on_shrink,
         test_network_pages_relations_subcap_and_focus,
         test_assembly_prompts_format_with_all_fields,
+        test_atom_features,
+        test_cluster_by_affinity_groups_by_topic,
+        test_cluster_respects_budget,
+        test_cross_synthesis_prompt_formats,
     ]
     cwd = os.getcwd()
     try:
