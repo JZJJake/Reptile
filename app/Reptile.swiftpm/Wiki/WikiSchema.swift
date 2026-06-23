@@ -1,8 +1,12 @@
 import Foundation
 
 /// Prompt templates governing all LLM wiki operations — a faithful port of
-/// wiki/schema.py. Kept as Swift string builders (no str.format) so there are
-/// no brace-escaping pitfalls.
+/// wiki/schema.py, extended with Stage-3 relation-sharding prompts.
+///
+/// 混合模型策略：
+/// - Stage 1 & 2 build prompts → DeepSeekClient.buildModel (v4-pro，质量优先)
+/// - Stage 3 consolidation     → DeepSeekClient.buildModel (v4-pro，关系推理)
+/// - Query / page-select       → DeepSeekClient.queryModel (v4-flash，速度优先)
 enum WikiSchema {
 
     static let defaultSchema = """
@@ -34,6 +38,8 @@ enum WikiSchema {
     每次操作后都要更新 `index.md`。除 FILE_WRITE 块外不输出多余解释。
     """
 
+    // MARK: - Stage 1: single-doc distillation → knowledge atom
+
     static func distillAtom(filename: String, body: String) -> String {
         """
         把下面这一篇文档蒸馏成一个高密度的「知识原子」。
@@ -59,6 +65,8 @@ enum WikiSchema {
         输出知识原子：
         """
     }
+
+    // MARK: - Stage 2: atoms → relation network
 
     static func assemble(existingNetwork: String, atoms: String) -> String {
         """
@@ -112,6 +120,40 @@ enum WikiSchema {
         输出 FILE_WRITE 块：
         """
     }
+
+    // MARK: - Stage 3: relation network sharding (scalability)
+    //
+    // Triggered when relations.md exceeds relationsShardThreshold.
+    // Clusters relations into topic shards + a lightweight _index so queries
+    // load only the relevant shard rather than the full monolithic file.
+    // Uses buildModel (v4-pro) for relation-clustering reasoning quality.
+
+    static func relationsConsolidate(relationsContent: String) -> String {
+        """
+        下面是当前知识库的关系网总图（relations.md）。它已经变得较大，需要进行**主题分片**
+        以保持在上下文预算内可管理。
+
+        你的任务：把这份关系网按**主题/领域/模块**聚类，每个主题输出一个独立分片文件，
+        再输出一个轻量总索引。
+
+        输出规则：
+        1. 若干 `relations/<英文短横线主题名>.md`——每个主题的关系边子集，
+           原样保留所有（来源: x.md）标注，不得增删或改写关系内容。
+        2. `relations/_index.md`——主题索引，格式：
+           `- [[<英文短横线名>]]：<一句话说明该主题涵盖的实体与关系类型>`
+           每行对应一个分片文件。
+        3. 每个分片控制在 3000 字以内；主题过细则合并，总分片数 3-8 个为宜。
+        4. **不要输出 `relations.md` 本身**（它由 Stage-2 管理，分片是其派生视图）。
+        5. 不要修改任何关系内容，只做聚类切割。
+
+        【当前 relations.md 内容】
+        \(relationsContent)
+
+        输出 FILE_WRITE 块：
+        """
+    }
+
+    // MARK: - Query: page selection + answer
 
     static func pageSelect(question: String, indexContent: String) -> String {
         """
