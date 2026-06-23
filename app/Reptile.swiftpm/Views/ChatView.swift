@@ -122,7 +122,9 @@ struct ChatView: View {
             let stream: AsyncThrowingStream<String, Error>
             if let domain = session.selectedDomain {
                 let mgr = WikiManager(domain: domain, apiKey: session.apiKey)
-                stream = mgr.query(question: q, history: Array(history))
+                // query() is now async: Step 1 (LLM page-select, v4-flash) runs
+                // before the stream starts; Step 2 streams the answer.
+                stream = await mgr.query(question: q, history: Array(history))
             } else {
                 var msgs: [[String: String]] = [["role": "system", "content": WikiSchema.generalChatSystem]]
                 msgs += history
