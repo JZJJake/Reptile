@@ -60,6 +60,7 @@ from wiki.schema import (
     LINT_PROMPT_TEMPLATE,
 )
 from wiki import deepseek_client
+from wiki.retrieval import VectorIndex
 
 # Path: no newlines, no '>', max 200 chars — prevents the lazy .+? from consuming
 # multiple lines when LLM writes garbage on the header line (e.g. >>>]# Title).
@@ -503,43 +504,55 @@ class WikiManager:
 
         return score
 
-    def _find_relevant_pages(self, question: str, max_chars: int = 20_000) -> str:
-        """Keyword-based fallback page selector (no API call).
-
-        First tries curated pages (concepts/entities/synthesis/summaries).
-        Falls back to Stage-1 atoms if no curated pages match.
-        Last resort: returns top atoms by filename sort when even scoring gives 0.
-        """
-        curated, atoms = [], []
+    def _collect_page_docs(self) -> tuple[dict, dict]:
+        """Return ({curated_path: content}, {atom_path: content}) for retrieval."""
+        curated, atoms = {}, {}
         for rel_path in self.list_pages():
-            if rel_path in ("log.md",) or rel_path in (".ingested", ".stage1_done"):
+            if rel_path in ("log.md", ".ingested", ".stage1_done"):
                 continue
             content = self.read_page(rel_path) or ""
-            score = self._score_text(question, content)
-            bucket = atoms if rel_path.startswith("atoms/") else curated
-            bucket.append((score, rel_path, content))
+            (atoms if rel_path.startswith("atoms/") else curated)[rel_path] = content
+        return curated, atoms
 
-        def _pack(scored_list, budget, min_score=0):
-            scored_list.sort(reverse=True, key=lambda x: x[0])
+    def _vector_retrieve_paths(self, question: str, k: int = 6) -> list[str]:
+        """Top page paths by TF-IDF/cosine vector relevance (curated first; atoms
+        only when no curated page exists yet). Used to augment LLM page-select."""
+        curated, atoms = self._collect_page_docs()
+        docs = curated or atoms
+        if not docs:
+            return []
+        return [p for p, _ in VectorIndex.build(docs).search(question, top_k=k)]
+
+    def _find_relevant_pages(self, question: str, max_chars: int = 20_000) -> str:
+        """Vector-space (TF-IDF/cosine) page selector — no API call.
+
+        Ranks curated pages (concepts/entities/synthesis/summaries) by cosine
+        relevance; falls back to Stage-1 atoms; last resort surfaces the index.
+        A strict upgrade over single-keyword overlap: term-weighted and
+        length-normalized, so the few strongly-related pages win over many
+        weakly-related long ones."""
+        curated_docs, atom_docs = self._collect_page_docs()
+
+        def _pack(docs: dict, budget: int) -> list[str]:
+            if not docs:
+                return []
+            hits = VectorIndex.build(docs).search(question, top_k=12, min_score=0.0)
             parts, total = [], 0
-            for sc, rel_path, content in scored_list:
-                if sc < min_score:
-                    break
-                entry = f"=== {rel_path} ===\n{content}"
+            for rel_path, _score in hits:
+                entry = f"=== {rel_path} ===\n{docs[rel_path]}"
                 if total + len(entry) > budget:
                     break
                 parts.append(entry)
                 total += len(entry)
             return parts
 
-        # 1. Curated pages with any relevance signal
-        curated_parts = _pack(curated, max_chars, min_score=1)
+        # 1. Curated pages with any vector relevance signal
+        curated_parts = _pack(curated_docs, max_chars)
         if curated_parts:
             return "\n\n".join(curated_parts)
 
         # 2. Atoms with relevance signal
-        atom_parts = _pack(atoms, max_chars, min_score=1)
-
+        atom_parts = _pack(atom_docs, max_chars)
         if atom_parts:
             disclaimer = (
                 "\n\n【提示：知识库尚未完成二级关系组装（Stage 2），"
@@ -548,13 +561,11 @@ class WikiManager:
             )
             return "\n\n".join(atom_parts) + disclaimer
 
-        # Last resort: no scored match anywhere. Don't dump arbitrary atom
-        # content (it may be entirely unrelated to the question) — instead
-        # surface the index plus an atom-count hint so the LLM can say
-        # honestly that the knowledge base doesn't yet cover this topic.
-        if atoms:
+        # Last resort: no vector match anywhere. Surface the index + atom count so
+        # the LLM can honestly say the KB doesn't yet cover this topic.
+        if atom_docs:
             return (
-                f"(未找到与问题直接相关的页面。知识库目前包含 {len(atoms)} 个知识原子，"
+                f"(未找到与问题直接相关的页面。知识库目前包含 {len(atom_docs)} 个知识原子，"
                 f"但均未匹配到问题中的关键词。目录:\n{self.read_index()})"
             )
 
@@ -1297,8 +1308,17 @@ class WikiManager:
         relations_content = await asyncio.to_thread(
             self._load_relations_for_query, question)
 
-        # Step 1: LLM page selection
-        page_paths = await self._select_relevant_pages(question)
+        # Step 1: HYBRID page selection — union of the LLM's index-based pick and
+        # vector (TF-IDF/cosine) retrieval. The LLM understands the question's
+        # intent against the curated index; the vector retriever guarantees
+        # strongly-term-overlapping pages are never missed (recall) and works even
+        # when the LLM select call fails. LLM picks lead (intent), vector hits fill.
+        llm_paths = await self._select_relevant_pages(question)
+        vec_paths = await asyncio.to_thread(self._vector_retrieve_paths, question, 6)
+        page_paths = list(llm_paths)
+        for p in vec_paths:
+            if p not in page_paths:
+                page_paths.append(p)
 
         if page_paths:
             parts = []
@@ -1308,9 +1328,8 @@ class WikiManager:
                 if not content:
                     continue
                 entry = f"=== {path} ===\n{content}"
-                # LLM-selected pages can be large (synthesis pages run tens of
-                # KB); cap the total like _find_relevant_pages does, or a big
-                # selection can blow DeepSeek's context window into a 400.
+                # Selected pages can be large (synthesis pages run tens of KB); cap
+                # the total or a big selection blows the answer model's context.
                 if total + len(entry) > MAX_CONTEXT_CHARS:
                     break
                 parts.append(entry)

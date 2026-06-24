@@ -128,6 +128,10 @@ covered by `python -m wiki.test_pipeline_offline` (no API key needed).
       `_find_relevant_pages` correctly when it returns `[]`.
 - [ ] `_select_relevant_pages` caps `index.md` to `INDEX_SELECT_CAP_CHARS` before
       the page-select call — at scale an uncapped index blows that call's context.
+- [ ] **Hybrid retrieval**: `query()` unions LLM page-select with
+      `_vector_retrieve_paths` (TF-IDF/cosine, `wiki/retrieval.py`). `_find_relevant_pages`
+      ranks by `VectorIndex`, not single-keyword overlap. Covered by
+      `test_vector_index_ranks_relevant_first` / `test_find_relevant_pages_uses_vector_ranking`.
 - [ ] `relations_content` + `pages_content` + `index_content` together stay
       under `MAX_CONTEXT_CHARS` (now enforced via `RELATIONS_CAP_CHARS` on
       `relations.md`) — a 400 from DeepSeek on `query()` usually means one of
