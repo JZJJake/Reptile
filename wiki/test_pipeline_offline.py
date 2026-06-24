@@ -248,6 +248,70 @@ def test_find_relevant_pages_uses_vector_ranking():
           "the relevant page is ranked ahead of the off-topic one")
 
 
+def _fake_embedder(vocab):
+    """A deterministic, network-free embedder: each text → a bag-of-words count
+    vector over `vocab`. Lets us exercise SemanticIndex's cache + cosine ranking
+    without a real embeddings API (the index machinery is what's under test)."""
+    calls = {"n": 0, "texts": 0}
+
+    def embed(texts):
+        calls["n"] += 1
+        calls["texts"] += len(texts)
+        return [[float(t.count(term)) for term in vocab] for t in texts]
+
+    return embed, calls
+
+
+def test_semantic_index_ranks_and_caches():
+    print("test_semantic_index_ranks_and_caches")
+    from wiki.embeddings import SemanticIndex
+    vocab = ["电池", "续航", "芯片", "光刻"]
+    docs = {
+        "ev.md":   "电池 电池 续航 续航 续航",
+        "chip.md": "芯片 芯片 光刻 光刻 光刻",
+    }
+    embed, calls = _fake_embedder(vocab)
+    cache = os.path.join(tempfile.mkdtemp(), ".embeddings.json")
+    idx = SemanticIndex.build(docs, cache_path=cache, embed_fn=embed)
+    check(calls["texts"] == 2, "first build embedded exactly the 2 new docs")
+    hits = idx.search("续航 电池 怎么样", top_k=2)
+    check(hits[0][0] == "ev.md", "semantic index ranks the on-topic doc first")
+    check(os.path.isfile(cache), "doc vectors are cached to disk")
+    # Rebuild with the SAME docs → cache hit, no doc re-embedding (only the query
+    # is embedded on the later search).
+    embed2, calls2 = _fake_embedder(vocab)
+    idx2 = SemanticIndex.build(docs, cache_path=cache, embed_fn=embed2)
+    check(calls2["texts"] == 0, "unchanged docs are served from cache, not re-embedded")
+    idx2.search("芯片 光刻", top_k=1)
+    check(calls2["texts"] == 1, "only the query is embedded on a cached search")
+
+
+def test_embeddings_enabled_toggle():
+    print("test_embeddings_enabled_toggle")
+    import importlib
+    emb = importlib.import_module("wiki.embeddings")
+    for k in ("WIKI_EMBED_BASE_URL", "WIKI_EMBED_API_KEY", "WIKI_EMBED_MODEL"):
+        os.environ.pop(k, None)
+    check(not emb.embeddings_enabled(), "disabled when env is unset (TF-IDF default)")
+    os.environ["WIKI_EMBED_BASE_URL"] = "https://x/v1"
+    os.environ["WIKI_EMBED_API_KEY"] = "k"
+    os.environ["WIKI_EMBED_MODEL"] = "m"
+    try:
+        check(emb.embeddings_enabled(), "enabled when all three env vars are set")
+    finally:
+        for k in ("WIKI_EMBED_BASE_URL", "WIKI_EMBED_API_KEY", "WIKI_EMBED_MODEL"):
+            os.environ.pop(k, None)
+
+
+def test_rank_falls_back_to_tfidf_when_embeddings_off():
+    print("test_rank_falls_back_to_tfidf_when_embeddings_off")
+    m = _mgr(tempfile.mkdtemp())
+    docs = {"a.md": "新能源 电池 续航", "b.md": "芯片 光刻 半导体"}
+    # Embeddings disabled → _rank must use TF-IDF and still rank correctly.
+    hits = m._rank(docs, "电池续航", top_k=2)
+    check(hits and hits[0][0] == "a.md", "_rank uses TF-IDF fallback and ranks correctly")
+
+
 def main():
     tests = [
         test_entity_normalize_and_extract,
@@ -263,6 +327,9 @@ def main():
         test_tokenize_cjk_and_ascii,
         test_vector_index_ranks_relevant_first,
         test_find_relevant_pages_uses_vector_ranking,
+        test_semantic_index_ranks_and_caches,
+        test_embeddings_enabled_toggle,
+        test_rank_falls_back_to_tfidf_when_embeddings_off,
     ]
     cwd = os.getcwd()
     try:
