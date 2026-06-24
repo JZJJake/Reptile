@@ -1212,7 +1212,7 @@ class WikiManager:
         # ── Stage 1: single-doc distillation ──────────────────────────────────
         atoms_made = 0
         if sources:
-            report(f"发现 {len(sources)} 篇新文档，开始两级蒸馏建设知识库", "info")
+            report(f"发现 {len(sources)} 篇新文档，开始三级蒸馏建设知识库", "info")
             atoms_made = await self._stage1_distill_all(sources, report)
             # Mark sources as ingested once distilled (Stage-1 ownership).
             done = await asyncio.to_thread(self._get_distilled_sources)

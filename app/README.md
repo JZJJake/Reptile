@@ -52,12 +52,12 @@ Reptile.swiftpm/
     CrawlEngine.swift          BFS 爬取编排（单页/全站/按日期 三模式）
   Wiki/
     WikiSchema.swift           Prompt 模板（移植自 wiki/schema.py）
-    WikiManager.swift          两级蒸馏：Stage1 原子 → Stage2 关系网 + 查询
+    WikiManager.swift          三级蒸馏：Stage1 原子 → Stage2 关系网 → Stage3 分片 + 查询
   Views/
     Theme.swift                品牌色（GitHub 暗色 + 绿色强调）
     LoginView.swift            API Key 登录（星座/绿叶 wordmark）
     ConsoleView.swift          采集控制台（URL / 模式 / 实时日志）
-    BuildView.swift            知识库构建（选择域 → 两级蒸馏 → 日志）
+    BuildView.swift            知识库构建（选择域 → 三级蒸馏 → 日志）
     ChatView.swift             智能问答（流式 + 可点引用）
     WikiBrowserView.swift      知识库浏览（按分类树）
     MarkdownView.swift         轻量 Markdown + [[页面]] / *.md 可点引用渲染
@@ -77,7 +77,7 @@ Reptile.swiftpm/
 1. **登录**：输入 DeepSeek API Key（`/models` 校验，存本设备 UserDefaults）。
 2. **采集**：输入 URL，选模式（全站 / 单页 / 按日期），WKWebView 抓取并存为
    `scraped_data/{域}/*.md`。
-3. **构建**：选择域，运行两级蒸馏 → `wiki/{域}/`（atoms → relations/concepts/...）。
+3. **构建**：选择域，运行三级蒸馏 → `wiki/{域}/`（atoms → relations/concepts/...）。
 4. **问答**：基于知识库流式问答，回答中的 `[[页面]]` / `*.md` 可点开回溯。
 5. **浏览**：按分类查看全部知识库页面。
 

@@ -7,13 +7,14 @@ import uvicorn
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Header, Request, UploadFile, File, Form
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, RedirectResponse
 from fastapi.routing import APIRouter
 from pydantic import BaseModel
 from typing import Optional
 from contextlib import asynccontextmanager
 
 import db_manager
+import access_gate
 from scraper import crawl_worker, task_events, task_log_queues, create_log_queue
 from site_analyzer import validate_api_key
 
@@ -36,6 +37,88 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Reptile Knowledge Crawler", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+# ── Access gate (handshake auth for network deployments) ─────────────────────
+# When REPTILE_ACCESS_PASSWORD is set, every page and API beyond the login page
+# and the handshake endpoints requires a valid access token. See access_gate.py.
+
+@app.middleware("http")
+async def access_gate_middleware(request: Request, call_next):
+    if not access_gate.gate_enabled():
+        return await call_next(request)
+
+    path = request.url.path
+    # Always-open: login page, the handshake API itself, favicon.
+    if path == "/" or path.startswith("/api/handshake") or path == "/favicon.ico":
+        return await call_next(request)
+
+    authed = access_gate.request_authorized(request)
+
+    # Static HTML shells are gated (don't leak the app shell); other assets pass.
+    if path.startswith("/static/"):
+        if path.endswith(".html") and not authed:
+            return RedirectResponse("/", status_code=302)
+        return await call_next(request)
+
+    # App page navigations → bounce to the login page when unauthorized.
+    if path in ("/app", "/wiki"):
+        if not authed:
+            return RedirectResponse("/", status_code=302)
+        return await call_next(request)
+
+    # Everything else (the APIs) → JSON 401 so the client redirects to login.
+    if not authed:
+        return JSONResponse(
+            {"error": "access_required",
+             "detail": "未通过握手验证，请先在登录页输入访问密码"},
+            status_code=401,
+        )
+    return await call_next(request)
+
+
+class HandshakeVerifyRequest(BaseModel):
+    nonce: str
+    proof: str
+
+@app.get("/api/handshake/info")
+async def handshake_info(request: Request):
+    """Tell the login page whether a handshake is required and whether this
+    client already holds a valid access token."""
+    return {"required": access_gate.gate_enabled(),
+            "authed": access_gate.request_authorized(request)}
+
+@app.post("/api/handshake/challenge")
+async def handshake_challenge(request: Request):
+    """Issue a one-time nonce for a handshake attempt (or report a lockout)."""
+    if not access_gate.gate_enabled():
+        return {"required": False}
+    cid = access_gate.client_id_from_request(request)
+    rem = access_gate.lock_remaining(cid)
+    if rem > 0:
+        return JSONResponse(
+            {"locked": True, "retry_after": rem,
+             "detail": f"密码错误次数过多，已锁定，请于 {rem} 秒后重试"},
+            status_code=429)
+    ch = access_gate.new_challenge()
+    return {"required": True, "nonce": ch["nonce"], "ttl": ch["ttl"],
+            "attempts_left": access_gate.attempts_left(cid)}
+
+@app.post("/api/handshake/verify")
+async def handshake_verify(req: HandshakeVerifyRequest, request: Request):
+    """Verify a handshake proof; on success set the access-token cookie."""
+    if not access_gate.gate_enabled():
+        return {"ok": True}
+    cid = access_gate.client_id_from_request(request)
+    result = access_gate.verify(cid, req.nonce, req.proof)
+    if result.get("ok"):
+        resp = JSONResponse({"ok": True})
+        resp.set_cookie(
+            access_gate.COOKIE_NAME, result["token"],
+            max_age=access_gate.TOKEN_TTL, httponly=True,
+            samesite="lax", path="/",
+        )
+        return resp
+    return JSONResponse(result, status_code=429 if result.get("locked") else 401)
 
 # ── Helper: read static HTML ─────────────────────────────────────────────────
 
@@ -549,50 +632,61 @@ async def wiki_status(domain: str):
 
 @wiki_router.get("/domains")
 async def wiki_domains():
-    wiki_base = os.path.join(os.getcwd(), "wiki")
-    if not os.path.isdir(wiki_base):
-        return {"domains": []}
-    domains = [d for d in os.listdir(wiki_base) if os.path.isdir(os.path.join(wiki_base, d))]
-    return {"domains": sorted(domains)}
+    from wiki.global_manager import list_global_domains
+    return {"domains": list_global_domains()}
 
 @wiki_router.post("/query")
 async def wiki_query(req: WikiQueryRequest):
-    from wiki.wiki_manager import WikiManager
-    domains = [req.domain] if req.domain else []
-    if not domains:
-        wiki_base = os.path.join(os.getcwd(), "wiki")
-        if os.path.isdir(wiki_base):
-            domains = [d for d in os.listdir(wiki_base)
-                       if os.path.isdir(os.path.join(wiki_base, d))]
-    if not domains:
-        raise HTTPException(status_code=404, detail="没有找到知识库，请先建设知识库")
+    """Answer a question from the knowledge base(s).
 
-    managers = [WikiManager(d, req.api_key) for d in domains]
+    Routing by `domain`:
+      • a specific domain          → that single knowledge base (WikiManager)
+      • "__global__" / empty       → GLOBAL mode: one unified, cross-base answer
+        with every supplied page labelled by its source base so the reply stays
+        traceable ("全局数据有据可查").
+    """
+    from wiki.global_manager import GlobalWikiManager, list_global_domains
+
+    is_global = (not req.domain) or req.domain == GlobalWikiManager.GLOBAL_KEY
+
+    if is_global:
+        if not list_global_domains():
+            raise HTTPException(status_code=404, detail="没有找到知识库，请先建设知识库")
+        mgr = GlobalWikiManager(req.api_key)
+    else:
+        from wiki.wiki_manager import WikiManager
+        wiki_base = os.path.join(os.getcwd(), "wiki")
+        if not os.path.isdir(os.path.join(wiki_base, req.domain)):
+            raise HTTPException(status_code=404, detail="没有找到该知识库，请先建设知识库")
+        mgr = WikiManager(req.domain, req.api_key)
 
     if req.stream:
         async def event_stream():
-            for mgr in managers:
-                try:
-                    gen = await mgr.query(req.question, stream=True,
-                                          history=req.history, deep=req.deep)
-                    async for chunk in gen:
-                        yield f"data: {json.dumps({'delta': chunk}, ensure_ascii=False)}\n\n"
-                except Exception as e:
-                    # Isolate per-domain failures in multi-domain queries — one
-                    # bad manager (bad API key, I/O error) shouldn't silently
-                    # truncate the whole stream with no [DONE]/error frame.
-                    err = f"\n\n【{mgr.domain} 查询出错：{e}】"
-                    yield f"data: {json.dumps({'delta': err}, ensure_ascii=False)}\n\n"
+            try:
+                gen = await mgr.query(req.question, stream=True,
+                                      history=req.history, deep=req.deep)
+                async for chunk in gen:
+                    yield f"data: {json.dumps({'delta': chunk}, ensure_ascii=False)}\n\n"
+            except Exception as e:
+                err = f"\n\n【{getattr(mgr, 'domain', '查询')} 出错：{e}】"
+                yield f"data: {json.dumps({'delta': err}, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
         return StreamingResponse(event_stream(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
     else:
-        parts = []
-        for mgr in managers:
-            answer = await mgr.query(req.question, stream=False,
-                                     history=req.history, deep=req.deep)
-            parts.append(answer)
-        return {"answer": "\n\n".join(parts)}
+        answer = await mgr.query(req.question, stream=False,
+                                 history=req.history, deep=req.deep)
+        return {"answer": answer}
+
+
+@wiki_router.get("/global/manifest")
+async def wiki_global_manifest():
+    """Return the global knowledge-base manifest — the coordinating catalogue
+    across all bases (each base's pages, titles, types and counts). Derived live
+    from the files, so it is always consistent and auditable."""
+    from wiki.global_manager import GlobalWikiManager
+    manifest = await asyncio.to_thread(GlobalWikiManager("").build_manifest)
+    return manifest
 
 @wiki_router.get("/graph/{domain}")
 async def wiki_graph(domain: str):
@@ -821,9 +915,53 @@ app.include_router(wiki_router)
 
 # ── Raw source file access ────────────────────────────────────────────────────
 
+import re as _re_fm
+
+def _parse_source_frontmatter(head: str) -> dict:
+    """Extract {source_url, title, publish_date} from a scraped file's YAML
+    frontmatter (best-effort; returns {} when absent). `head` need only be the
+    top of the file — the frontmatter block always sits at the very start."""
+    out = {}
+    if not head.startswith("---"):
+        return out
+    end = head.find("\n---", 3)
+    if end == -1:
+        return out
+    fm = head[3:end]
+    for key in ("source_url", "title", "publish_date"):
+        m = _re_fm.search(rf'^{key}:\s*"?(.*?)"?\s*$', fm, _re_fm.MULTILINE)
+        if m and m.group(1).strip():
+            out[key] = m.group(1).strip()
+    return out
+
+
+def _build_sources_map(domain: str) -> dict:
+    """{filename → {url, title, domain}} for a domain's scraped sources that
+    carry an external source_url. Used to turn internal '来源: x.md' citations
+    into real, externally-reachable web links."""
+    from pathlib import Path
+    base = Path(os.getcwd()) / "scraped_data" / domain
+    if not base.is_dir():
+        return {}
+    out = {}
+    for p in base.glob("*.md"):
+        try:
+            with open(p, encoding="utf-8") as f:
+                head = f.read(2000)
+        except OSError:
+            continue
+        meta = _parse_source_frontmatter(head)
+        if meta.get("source_url"):
+            out[p.name] = {"url": meta["source_url"],
+                           "title": meta.get("title", ""),
+                           "domain": domain}
+    return out
+
+
 @app.get("/api/source/{domain}/{filename:path}")
 async def get_source_file(domain: str, filename: str):
-    """Return the raw scraped markdown file for a domain."""
+    """Return the raw scraped markdown file for a domain, plus the original
+    external URL it was scraped from (parsed from the YAML frontmatter)."""
     from pathlib import Path
     base = (Path(os.getcwd()) / "scraped_data" / domain).resolve()
     target = (base / filename).resolve()
@@ -832,7 +970,23 @@ async def get_source_file(domain: str, filename: str):
     if not target.is_file():
         raise HTTPException(status_code=404, detail="源文件未找到")
     content = target.read_text(encoding="utf-8")
-    return {"domain": domain, "filename": filename, "content": content}
+    meta = _parse_source_frontmatter(content[:2000])
+    return {"domain": domain, "filename": filename, "content": content,
+            "source_url": meta.get("source_url", ""), "title": meta.get("title", "")}
+
+
+@app.get("/api/wiki/sources/{domain}")
+async def wiki_sources(domain: str):
+    """Map scraped source filename → external {url, title, domain} for a domain
+    (or every domain when domain == '__global__'), so the UI can render source
+    citations as real outbound web links instead of internal file names."""
+    from wiki.global_manager import GlobalWikiManager, list_global_domains
+    if domain == GlobalWikiManager.GLOBAL_KEY:
+        merged = {}
+        for d in list_global_domains():
+            merged.update(await asyncio.to_thread(_build_sources_map, d))
+        return {"sources": merged}
+    return {"sources": await asyncio.to_thread(_build_sources_map, domain)}
 
 # ── Direct chat (no wiki required) ───────────────────────────────────────────
 
@@ -885,4 +1039,11 @@ def install_playwright_browsers():
 if __name__ == "__main__":
     os.makedirs("static", exist_ok=True)
     os.makedirs("scraped_data", exist_ok=True)
+    if access_gate.gate_enabled():
+        print("🔒 访问握手已启用：客户端需输入访问密码（连续 "
+              f"{access_gate.MAX_ATTEMPTS} 次错误将锁定 "
+              f"{access_gate.LOCK_SECONDS // 60} 分钟）。")
+    else:
+        print("🔓 访问握手未启用（本地模式）。如需网络访问保护，"
+              "请设置环境变量 REPTILE_ACCESS_PASSWORD。")
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
