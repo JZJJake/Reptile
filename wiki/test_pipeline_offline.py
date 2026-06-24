@@ -29,6 +29,7 @@ from wiki.schema import (  # noqa: E402
     ASSEMBLE_PROMPT_TEMPLATE, ASSEMBLE_INCREMENTAL_PROMPT_TEMPLATE,
     CROSS_SYNTHESIS_PROMPT_TEMPLATE,
 )
+from wiki.retrieval import VectorIndex, tokenize  # noqa: E402
 
 _passed = 0
 
@@ -210,6 +211,43 @@ def test_cross_synthesis_prompt_formats():
     check("[推断]" in p, "synthesis prompt enforces the [推断] no-fabrication tag")
 
 
+def test_tokenize_cjk_and_ascii():
+    print("test_tokenize_cjk_and_ascii")
+    toks = tokenize("新能源汽车 EV battery")
+    check("新能" in toks and "能源" in toks, "CJK text yields character bigrams")
+    check("battery" in toks and "ev" in toks, "ASCII words are lowercased tokens")
+    check("a" not in tokenize("a 我"), "single ASCII chars are dropped (len<2)")
+
+
+def test_vector_index_ranks_relevant_first():
+    print("test_vector_index_ranks_relevant_first")
+    docs = {
+        "ev.md":    "# 电动车补贴 新能源汽车 电池 续航 充电",
+        "chip.md":  "# 半导体 芯片 光刻机 制程 台积电",
+        "policy.md": "# 产业政策 补贴 财政 税收",
+    }
+    idx = VectorIndex.build(docs)
+    hits = idx.search("新能源汽车电池续航", top_k=3)
+    check(hits[0][0] == "ev.md", "the on-topic doc ranks first by cosine")
+    check(hits[0][1] > 0, "top hit has positive similarity")
+    # An unrelated query returns the least-bad match but low score; a no-overlap
+    # query returns nothing.
+    check(idx.search("量子计算 zzz", top_k=3) == [],
+          "a query with no term overlap returns no hits")
+
+
+def test_find_relevant_pages_uses_vector_ranking():
+    print("test_find_relevant_pages_uses_vector_ranking")
+    m = _mgr(tempfile.mkdtemp())
+    m.write_page("concepts/ev.md", "# 新能源汽车\n电池 续航 充电桩 补贴 三电系统")
+    m.write_page("concepts/chip.md", "# 半导体\n芯片 光刻机 制程 EUV")
+    out = m._find_relevant_pages("新能源汽车的续航和充电问题")
+    check("concepts/ev.md" in out, "vector page-select surfaces the relevant page")
+    check(out.index("concepts/ev.md") < (out.index("concepts/chip.md")
+          if "concepts/chip.md" in out else len(out)),
+          "the relevant page is ranked ahead of the off-topic one")
+
+
 def main():
     tests = [
         test_entity_normalize_and_extract,
@@ -222,6 +260,9 @@ def main():
         test_cluster_by_affinity_groups_by_topic,
         test_cluster_respects_budget,
         test_cross_synthesis_prompt_formats,
+        test_tokenize_cjk_and_ascii,
+        test_vector_index_ranks_relevant_first,
+        test_find_relevant_pages_uses_vector_ranking,
     ]
     cwd = os.getcwd()
     try:
