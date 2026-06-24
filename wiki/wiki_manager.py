@@ -61,6 +61,7 @@ from wiki.schema import (
 )
 from wiki import deepseek_client
 from wiki.retrieval import VectorIndex
+from wiki.embeddings import SemanticIndex, embeddings_enabled
 
 # Path: no newlines, no '>', max 200 chars — prevents the lazy .+? from consuming
 # multiple lines when LLM writes garbage on the header line (e.g. >>>]# Title).
@@ -514,29 +515,48 @@ class WikiManager:
             (atoms if rel_path.startswith("atoms/") else curated)[rel_path] = content
         return curated, atoms
 
+    def _rank(self, docs: dict, question: str, top_k: int) -> list:
+        """Rank docs for a query, returning [(path, score)].
+
+        Uses neural semantic embeddings when configured (env WIKI_EMBED_*),
+        which understand meaning/synonymy; otherwise the zero-config TF-IDF
+        vector index. Any embedding failure (missing lib, network, bad config)
+        falls back transparently to TF-IDF so retrieval never hard-fails."""
+        if not docs:
+            return []
+        if embeddings_enabled():
+            try:
+                cache = str(self.wiki_path / ".embeddings.json")
+                return SemanticIndex.build(docs, cache_path=cache).search(
+                    question, top_k=top_k)
+            except Exception as e:
+                print(f"[wiki/{self.domain}] semantic retrieval failed, "
+                      f"falling back to TF-IDF: {e}")
+        return VectorIndex.build(docs).search(question, top_k=top_k)
+
     def _vector_retrieve_paths(self, question: str, k: int = 6) -> list[str]:
-        """Top page paths by TF-IDF/cosine vector relevance (curated first; atoms
-        only when no curated page exists yet). Used to augment LLM page-select."""
+        """Top page paths by vector relevance (semantic if configured, else
+        TF-IDF/cosine). Curated pages first; atoms only when no curated page
+        exists yet. Used to augment LLM page-select."""
         curated, atoms = self._collect_page_docs()
         docs = curated or atoms
         if not docs:
             return []
-        return [p for p, _ in VectorIndex.build(docs).search(question, top_k=k)]
+        return [p for p, _ in self._rank(docs, question, k)]
 
     def _find_relevant_pages(self, question: str, max_chars: int = 20_000) -> str:
-        """Vector-space (TF-IDF/cosine) page selector — no API call.
+        """Vector-space page selector — no answer-model call.
 
-        Ranks curated pages (concepts/entities/synthesis/summaries) by cosine
-        relevance; falls back to Stage-1 atoms; last resort surfaces the index.
-        A strict upgrade over single-keyword overlap: term-weighted and
-        length-normalized, so the few strongly-related pages win over many
-        weakly-related long ones."""
+        Ranks curated pages (concepts/entities/synthesis/summaries) by vector
+        relevance (semantic embeddings if configured, else TF-IDF/cosine); falls
+        back to Stage-1 atoms; last resort surfaces the index. Either way the few
+        strongly-related pages win over many weakly-related long ones."""
         curated_docs, atom_docs = self._collect_page_docs()
 
         def _pack(docs: dict, budget: int) -> list[str]:
             if not docs:
                 return []
-            hits = VectorIndex.build(docs).search(question, top_k=12, min_score=0.0)
+            hits = self._rank(docs, question, top_k=12)
             parts, total = [], 0
             for rel_path, _score in hits:
                 entry = f"=== {rel_path} ===\n{docs[rel_path]}"

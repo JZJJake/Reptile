@@ -129,9 +129,13 @@ covered by `python -m wiki.test_pipeline_offline` (no API key needed).
 - [ ] `_select_relevant_pages` caps `index.md` to `INDEX_SELECT_CAP_CHARS` before
       the page-select call — at scale an uncapped index blows that call's context.
 - [ ] **Hybrid retrieval**: `query()` unions LLM page-select with
-      `_vector_retrieve_paths` (TF-IDF/cosine, `wiki/retrieval.py`). `_find_relevant_pages`
-      ranks by `VectorIndex`, not single-keyword overlap. Covered by
-      `test_vector_index_ranks_relevant_first` / `test_find_relevant_pages_uses_vector_ranking`.
+      `_vector_retrieve_paths`. `_rank()` is the single ranking entry point:
+      neural embeddings (`wiki/embeddings.py`, `SemanticIndex`) when `WIKI_EMBED_*`
+      env is set, else zero-config TF-IDF (`wiki/retrieval.py`, `VectorIndex`).
+      Any embedding failure must fall back to TF-IDF — never hard-fail. Doc
+      vectors cache to `wiki/{domain}/.embeddings.json` (hash-keyed, pruned).
+      Covered by `test_semantic_index_ranks_and_caches` /
+      `test_rank_falls_back_to_tfidf_when_embeddings_off`.
 - [ ] `relations_content` + `pages_content` + `index_content` together stay
       under `MAX_CONTEXT_CHARS` (now enforced via `RELATIONS_CAP_CHARS` on
       `relations.md`) — a 400 from DeepSeek on `query()` usually means one of
