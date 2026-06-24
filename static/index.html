@@ -638,16 +638,44 @@ button:focus-visible, select:focus-visible {
         </div>
       </details>
 
-      <!-- Import raw .md files (no crawl) -->
+      <!-- Import content (no crawl): upload files OR paste text, under a category -->
       <details style="margin-top:10px;">
-        <summary style="cursor:pointer;font-size:12px;color:var(--muted);">📥 导入原始文件建库（无需爬取）</summary>
+        <summary style="cursor:pointer;font-size:12px;color:var(--muted);">📥 导入内容建库（上传文件 / 粘贴文本，无需爬取）</summary>
         <div style="margin-top:8px;">
-          <label class="field-lbl">目标域名（可输入新域或沿用上方所选）</label>
-          <input type="text" id="import-domain" placeholder="例如 example.com 或 my-docs" style="font-size:12px;"/>
-          <label class="field-lbl" style="margin-top:6px;">选择本地 .md 文件（可多选）</label>
-          <input type="file" id="import-files" accept=".md" multiple style="font-size:12px;color:var(--muted);"/>
-          <div class="btn-row" style="margin-top:6px;">
-            <button class="btn btn-ghost" id="btn-import" onclick="importFiles()">📥 导入并建库</button>
+          <label class="field-lbl">知识库类别（域名）— 同类内容归入同一个库，可多次累积</label>
+          <input type="text" id="import-domain" placeholder="例如 行业政策 / example.com / my-docs" style="font-size:12px;"/>
+
+          <div class="mode-pills" style="display:flex;gap:6px;margin-top:8px;">
+            <button type="button" class="pill active" id="imode-file" onclick="setImportMode('file')">📄 上传文件</button>
+            <button type="button" class="pill" id="imode-paste" onclick="setImportMode('paste')">📝 粘贴文本</button>
+          </div>
+
+          <!-- File upload -->
+          <div id="import-file-box" style="margin-top:8px;">
+            <label class="field-lbl">选择本地文件（可多选）：Word(.docx) / PDF / Markdown / TXT</label>
+            <input type="file" id="import-files" accept=".md,.markdown,.txt,.pdf,.docx" multiple
+                   style="font-size:12px;color:var(--muted);"/>
+            <div class="btn-row" style="margin-top:6px;">
+              <button class="btn btn-ghost" id="btn-import" onclick="importFiles()">📥 导入并建库</button>
+            </div>
+          </div>
+
+          <!-- Paste text -->
+          <div id="import-paste-box" style="margin-top:8px;display:none;">
+            <label class="field-lbl">标题（可选）</label>
+            <input type="text" id="paste-title" placeholder="给这段内容起个标题" style="font-size:12px;"/>
+            <label class="field-lbl" style="margin-top:6px;">粘贴正文</label>
+            <textarea id="paste-text" rows="6" placeholder="在此粘贴文章 / 资料正文……"
+                      style="width:100%;background:var(--bg);border:1px solid var(--border);border-radius:6px;
+                             color:var(--text);padding:7px 10px;font-size:12.5px;font-family:inherit;
+                             outline:none;resize:vertical;"></textarea>
+            <div class="btn-row" style="margin-top:6px;">
+              <button class="btn btn-ghost" id="btn-paste" onclick="pasteText()">📝 粘贴并建库</button>
+            </div>
+          </div>
+
+          <div style="font-size:11px;color:var(--muted);margin-top:8px;line-height:1.5;">
+            扫描件 PDF（纯图片）无法提取文字；旧版 .doc 请另存为 .docx。同一类别可反复导入，知识持续累积。
           </div>
         </div>
       </details>
@@ -1216,15 +1244,28 @@ async function rebuildWiki() {
   }
 }
 
-// ── Import raw .md files (no crawl) ──────────────────────────────────────────
+// ── Import content (no crawl): file upload OR paste ──────────────────────────
+function setImportMode(mode) {
+  const fileBox  = document.getElementById('import-file-box');
+  const pasteBox = document.getElementById('import-paste-box');
+  document.getElementById('imode-file').classList.toggle('active', mode === 'file');
+  document.getElementById('imode-paste').classList.toggle('active', mode === 'paste');
+  fileBox.style.display  = mode === 'file'  ? 'block' : 'none';
+  pasteBox.style.display = mode === 'paste' ? 'block' : 'none';
+}
+
+function _importDomain() {
+  return document.getElementById('import-domain').value.trim()
+      || document.getElementById('wiki-sel').value;
+}
+
 async function importFiles() {
   if (wikiBuilding) return;
   const fileInput = document.getElementById('import-files');
   const files = fileInput.files;
-  if (!files || !files.length) { alert('请先选择 .md 文件'); return; }
-  let domain = document.getElementById('import-domain').value.trim()
-            || document.getElementById('wiki-sel').value;
-  if (!domain) { alert('请填写目标域名'); return; }
+  if (!files || !files.length) { alert('请先选择文件（Word/PDF/Markdown/TXT）'); return; }
+  const domain = _importDomain();
+  if (!domain) { alert('请先填写「知识库类别（域名）」'); return; }
 
   const statusEl = document.getElementById('wiki-status');
   const fd = new FormData();
@@ -1232,14 +1273,46 @@ async function importFiles() {
   fd.append('api_key', API_KEY);
   for (const f of files) fd.append('files', f);
 
-  statusEl.textContent = '⏳ 正在上传文件...';
+  statusEl.textContent = '⏳ 正在上传并解析文件...';
   statusEl.style.color = 'var(--orange)';
   try {
     const r = await fetch('/api/wiki/import', { method: 'POST', body: fd });
     const d = await r.json();
     if (!r.ok) { statusEl.textContent = `❌ ${d.detail || '导入失败'}`; statusEl.style.color = 'var(--red)'; return; }
     fileInput.value = '';
+    if (d.skipped && d.skipped.length) {
+      appendLog('', `已跳过 ${d.skipped.length} 个文件：${d.skipped.join('；')}`, 'warn');
+    }
     beginWikiJob(domain, statusEl, '导入建库');
+  } catch(e) {
+    statusEl.textContent = `网络错误: ${e.message}`; statusEl.style.color = 'var(--red)';
+  }
+}
+
+async function pasteText() {
+  if (wikiBuilding) return;
+  const text = document.getElementById('paste-text').value.trim();
+  if (!text) { alert('请先粘贴正文内容'); return; }
+  const title = document.getElementById('paste-title').value.trim();
+  const domain = _importDomain();
+  if (!domain) { alert('请先填写「知识库类别（域名）」'); return; }
+
+  const statusEl = document.getElementById('wiki-status');
+  const fd = new FormData();
+  fd.append('domain', domain);
+  fd.append('api_key', API_KEY);
+  fd.append('text', text);
+  fd.append('title', title);
+
+  statusEl.textContent = '⏳ 正在提交粘贴内容...';
+  statusEl.style.color = 'var(--orange)';
+  try {
+    const r = await fetch('/api/wiki/paste', { method: 'POST', body: fd });
+    const d = await r.json();
+    if (!r.ok) { statusEl.textContent = `❌ ${d.detail || '提交失败'}`; statusEl.style.color = 'var(--red)'; return; }
+    document.getElementById('paste-text').value = '';
+    document.getElementById('paste-title').value = '';
+    beginWikiJob(domain, statusEl, '粘贴建库');
   } catch(e) {
     statusEl.textContent = `网络错误: ${e.message}`; statusEl.style.color = 'var(--red)';
   }

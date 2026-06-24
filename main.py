@@ -329,56 +329,24 @@ async def wiki_rebuild(req: WikiRebuildRequest, background_tasks: BackgroundTask
     background_tasks.add_task(run_rebuild)
     return {"status": "rebuilding", "domain": req.domain, "level": req.level}
 
-@wiki_router.post("/import")
-async def wiki_import(
-    background_tasks: BackgroundTasks,
-    domain: str = Form(...),
-    api_key: str = Form(...),
-    files: list[UploadFile] = File(...),
-):
-    """Build a knowledge base directly from uploaded raw .md files, independent
-    of the crawler. Files are saved into scraped_data/{domain}/ then the full
-    pipeline runs. Lets users (re)build a KB from previously-downloaded sources
-    without re-crawling. Progress streams via /api/wiki/events/{domain}."""
-    domain = domain.strip()
-    if not domain:
-        raise HTTPException(status_code=400, detail="缺少域名")
-    if domain in _wiki_building:
-        raise HTTPException(status_code=409, detail="该知识库正在建设中，请勿重复提交")
-
-    from pathlib import Path as _Path
-    md_files = [f for f in files if (f.filename or "").lower().endswith(".md")]
-    if not md_files:
-        raise HTTPException(status_code=400, detail="请上传至少一个 .md 文件")
-
-    # Persist uploads into scraped_data/{domain}/ before returning so the build
-    # task reads them off disk (UploadFile streams aren't safe to use later).
-    raw_dir = _Path(os.getcwd()) / "scraped_data" / domain
-    raw_dir.mkdir(parents=True, exist_ok=True)
-    saved_names: list[str] = []
-    for f in md_files:
-        safe_name = os.path.basename(f.filename)            # strip any path segments
-        if not safe_name.endswith(".md"):
-            continue
-        data = await f.read()
-        (raw_dir / safe_name).write_bytes(data)
-        saved_names.append(safe_name)
-
-    if not saved_names:
-        raise HTTPException(status_code=400, detail="没有有效的 .md 文件被保存")
-
+def _start_category_build(domain: str, api_key: str, raw_dir, saved_names: list,
+                          background_tasks: BackgroundTasks, label: str):
+    """Kick off a background KB build from already-saved source files under
+    scraped_data/{domain}/. Shared by both the file-import and paste endpoints.
+    `domain` is the user-assigned category. Progress streams via
+    /api/wiki/events/{domain}."""
     from scraper import push_status, create_log_queue
     from wiki.wiki_manager import WikiManager
 
     qid = _wiki_queue_id(domain)
-    q = create_log_queue(qid)
+    q = create_log_queue(qid)            # create BEFORE returning so SSE can attach
     _wiki_building.add(domain)
 
-    async def run_import_build():
+    async def run_build():
         def progress(msg, mtype="log"):
             push_status(qid, msg, mtype)
         try:
-            push_status(qid, f"已接收 {len(saved_names)} 个文件，开始导入建库：{domain}", "info")
+            push_status(qid, f"已接收 {len(saved_names)} 个文档，开始{label}：{domain}", "info")
             mgr = WikiManager(domain, api_key)
             paths = [str(raw_dir / n) for n in saved_names]
             result = await mgr.ingest_from_files(paths, progress=progress)
@@ -386,7 +354,7 @@ async def wiki_import(
         except Exception as e:
             import traceback
             traceback.print_exc()
-            push_status(qid, f"导入建库失败：{e}", "error")
+            push_status(qid, f"建库失败：{e}", "error")
             db_manager.log_wiki_operation(domain, "import_error", {"error": str(e)})
         finally:
             _wiki_building.discard(domain)
@@ -395,8 +363,102 @@ async def wiki_import(
             except Exception:
                 pass
 
-    background_tasks.add_task(run_import_build)
-    return {"status": "importing", "domain": domain, "files": saved_names}
+    background_tasks.add_task(run_build)
+
+
+@wiki_router.post("/import")
+async def wiki_import(
+    background_tasks: BackgroundTasks,
+    domain: str = Form(...),
+    api_key: str = Form(...),
+    files: list[UploadFile] = File(...),
+):
+    """Build a knowledge base from uploaded local documents — .md/.txt/.pdf/.docx —
+    independent of the crawler. Each file is converted to titled markdown and
+    saved into scraped_data/{domain}/, then the pipeline runs. `domain` is the
+    category the user assigns. Progress streams via /api/wiki/events/{domain}."""
+    import doc_extract
+    from pathlib import Path as _Path
+
+    domain = domain.strip()
+    if not domain:
+        raise HTTPException(status_code=400, detail="缺少知识库类别（域名）")
+    if domain in _wiki_building:
+        raise HTTPException(status_code=409, detail="该知识库正在建设中，请勿重复提交")
+    if not files:
+        raise HTTPException(status_code=400, detail="请至少上传一个文档")
+
+    raw_dir = _Path(os.getcwd()) / "scraped_data" / domain
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_names: list[str] = []
+    skipped: list[str] = []
+    used: set = set()
+    for f in files:
+        fname = f.filename or ""
+        data = await f.read()
+        try:
+            md = doc_extract.extract_to_markdown(fname, data)
+        except ValueError as e:
+            skipped.append(f"{os.path.basename(fname)}：{e}")
+            continue
+        name = doc_extract.safe_md_name(fname)
+        stem = name[:-3]
+        i = 1
+        while name in used or (raw_dir / name).exists():
+            name = f"{stem}-{i}.md"
+            i += 1
+        used.add(name)
+        (raw_dir / name).write_text(md, encoding="utf-8")
+        saved_names.append(name)
+
+    if not saved_names:
+        detail = "没有可导入的有效文档"
+        if skipped:
+            detail += "：" + "；".join(skipped)
+        raise HTTPException(status_code=400, detail=detail)
+
+    _start_category_build(domain, api_key, raw_dir, saved_names,
+                          background_tasks, "导入建库")
+    return {"status": "importing", "domain": domain,
+            "files": saved_names, "skipped": skipped}
+
+
+@wiki_router.post("/paste")
+async def wiki_paste(
+    background_tasks: BackgroundTasks,
+    domain: str = Form(...),
+    api_key: str = Form(...),
+    text: str = Form(...),
+    title: str = Form(""),
+):
+    """Build (or extend) a category's knowledge base from pasted text. `domain`
+    is the user-assigned category; the text is saved as a titled markdown source
+    under scraped_data/{domain}/ and the pipeline runs."""
+    import doc_extract, re as _re
+    from datetime import datetime as _dt
+    from pathlib import Path as _Path
+
+    domain = domain.strip()
+    if not domain:
+        raise HTTPException(status_code=400, detail="缺少知识库类别（域名）")
+    if domain in _wiki_building:
+        raise HTTPException(status_code=409, detail="该知识库正在建设中，请勿重复提交")
+    try:
+        md = doc_extract.markdown_from_text(text, title)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    raw_dir = _Path(os.getcwd()) / "scraped_data" / domain
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    ts = _dt.utcnow().strftime("%Y%m%d%H%M%S")
+    slug = _re.sub(r'[^0-9A-Za-z一-鿿_\-]+', '_', (title or "paste")).strip('_')[:40] or "paste"
+    name = f"paste-{slug}-{ts}.md"
+    (raw_dir / name).write_text(md, encoding="utf-8")
+
+    _start_category_build(domain, api_key, raw_dir, [name],
+                          background_tasks, "粘贴建库")
+    return {"status": "importing", "domain": domain, "files": [name]}
 
 @wiki_router.get("/events/{domain}")
 async def wiki_events(domain: str):
