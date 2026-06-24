@@ -460,6 +460,51 @@ async def wiki_paste(
                           background_tasks, "粘贴建库")
     return {"status": "importing", "domain": domain, "files": [name]}
 
+@wiki_router.post("/preview")
+async def wiki_preview(
+    files: Optional[list[UploadFile]] = File(None),
+    text: str = Form(""),
+    title: str = Form(""),
+):
+    """Convert uploaded files / pasted text to markdown and return a PREVIEW
+    (no save, no build), so the user can verify extraction — especially for PDF
+    and Word, where extraction happens server-side — before committing to a build.
+    Returns {items: [{name, markdown, chars, error}]}."""
+    import doc_extract
+
+    PREVIEW_CAP = 4000   # chars of markdown returned per item (enough to eyeball)
+    items: list = []
+
+    if text and text.strip():
+        try:
+            md = doc_extract.markdown_from_text(text, title)
+            items.append({"name": (title or "粘贴内容"),
+                          "markdown": md[:PREVIEW_CAP],
+                          "chars": len(md),
+                          "truncated": len(md) > PREVIEW_CAP, "error": None})
+        except ValueError as e:
+            items.append({"name": (title or "粘贴内容"), "markdown": "",
+                          "chars": 0, "truncated": False, "error": str(e)})
+
+    for f in (files or []):
+        fname = f.filename or ""
+        if not fname:
+            continue
+        data = await f.read()
+        try:
+            md = doc_extract.extract_to_markdown(fname, data)
+            items.append({"name": os.path.basename(fname),
+                          "markdown": md[:PREVIEW_CAP],
+                          "chars": len(md),
+                          "truncated": len(md) > PREVIEW_CAP, "error": None})
+        except ValueError as e:
+            items.append({"name": os.path.basename(fname), "markdown": "",
+                          "chars": 0, "truncated": False, "error": str(e)})
+
+    if not items:
+        raise HTTPException(status_code=400, detail="没有可预览的内容")
+    return {"items": items}
+
 @wiki_router.get("/events/{domain}")
 async def wiki_events(domain: str):
     """SSE stream of wiki-build progress for a domain."""

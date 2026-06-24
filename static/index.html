@@ -642,8 +642,13 @@ button:focus-visible, select:focus-visible {
       <details style="margin-top:10px;">
         <summary style="cursor:pointer;font-size:12px;color:var(--muted);">📥 导入内容建库（上传文件 / 粘贴文本，无需爬取）</summary>
         <div style="margin-top:8px;">
-          <label class="field-lbl">知识库类别（域名）— 同类内容归入同一个库，可多次累积</label>
-          <input type="text" id="import-domain" placeholder="例如 行业政策 / example.com / my-docs" style="font-size:12px;"/>
+          <label class="field-lbl">知识库类别 — 同类内容归入同一个库，可多次累积</label>
+          <select id="import-domain-select" onchange="onImportCategoryPick(this.value)"
+                  style="margin-bottom:6px;font-size:12px;">
+            <option value="">— 选择已有类别，或在下方新建 —</option>
+          </select>
+          <input type="text" id="import-domain" placeholder="新建类别名，例如 行业政策 / example.com / my-docs"
+                 style="font-size:12px;"/>
 
           <div class="mode-pills" style="display:flex;gap:6px;margin-top:8px;">
             <button type="button" class="pill active" id="imode-file" onclick="setImportMode('file')">📄 上传文件</button>
@@ -654,8 +659,10 @@ button:focus-visible, select:focus-visible {
           <div id="import-file-box" style="margin-top:8px;">
             <label class="field-lbl">选择本地文件（可多选）：Word(.docx) / PDF / Markdown / TXT</label>
             <input type="file" id="import-files" accept=".md,.markdown,.txt,.pdf,.docx" multiple
+                   onchange="clearImportPreview()"
                    style="font-size:12px;color:var(--muted);"/>
             <div class="btn-row" style="margin-top:6px;">
+              <button class="btn btn-ghost" id="btn-import-preview" onclick="previewImport('file')">👁 预览</button>
               <button class="btn btn-ghost" id="btn-import" onclick="importFiles()">📥 导入并建库</button>
             </div>
           </div>
@@ -666,16 +673,23 @@ button:focus-visible, select:focus-visible {
             <input type="text" id="paste-title" placeholder="给这段内容起个标题" style="font-size:12px;"/>
             <label class="field-lbl" style="margin-top:6px;">粘贴正文</label>
             <textarea id="paste-text" rows="6" placeholder="在此粘贴文章 / 资料正文……"
+                      oninput="clearImportPreview()"
                       style="width:100%;background:var(--bg);border:1px solid var(--border);border-radius:6px;
                              color:var(--text);padding:7px 10px;font-size:12.5px;font-family:inherit;
                              outline:none;resize:vertical;"></textarea>
             <div class="btn-row" style="margin-top:6px;">
+              <button class="btn btn-ghost" id="btn-paste-preview" onclick="previewImport('paste')">👁 预览</button>
               <button class="btn btn-ghost" id="btn-paste" onclick="pasteText()">📝 粘贴并建库</button>
             </div>
           </div>
 
+          <!-- Conversion preview -->
+          <div id="import-preview" style="display:none;margin-top:8px;border:1px solid var(--border);
+                      border-radius:6px;background:var(--bg);padding:8px;max-height:240px;overflow:auto;">
+          </div>
+
           <div style="font-size:11px;color:var(--muted);margin-top:8px;line-height:1.5;">
-            扫描件 PDF（纯图片）无法提取文字；旧版 .doc 请另存为 .docx。同一类别可反复导入，知识持续累积。
+            建库前可「预览」确认解析效果（PDF/Word 由服务器解析）。扫描件 PDF（纯图片）无法提取文字；旧版 .doc 请另存为 .docx。
           </div>
         </div>
       </details>
@@ -968,6 +982,15 @@ function fillSelects(doms) {
   gs.innerHTML = '<option value="">— 选择域名 —</option>' + opts;
   if (gc) gs.value = gc;
 
+  // Import-category dropdown (existing knowledge bases to import more into)
+  const is = document.getElementById('import-domain-select');
+  if (is) {
+    const ic = is.value;
+    is.innerHTML = '<option value="">— 选择已有类别，或在下方新建 —</option>' +
+      doms.map(d => `<option value="${esc(d.name)}">${esc(d.name)} (${d.file_count}篇)</option>`).join('');
+    if (ic) is.value = ic;
+  }
+
   onWikiSelChange();
   onChatSelChange();
 }
@@ -1252,11 +1275,67 @@ function setImportMode(mode) {
   document.getElementById('imode-paste').classList.toggle('active', mode === 'paste');
   fileBox.style.display  = mode === 'file'  ? 'block' : 'none';
   pasteBox.style.display = mode === 'paste' ? 'block' : 'none';
+  clearImportPreview();
 }
 
 function _importDomain() {
   return document.getElementById('import-domain').value.trim()
       || document.getElementById('wiki-sel').value;
+}
+
+// ── Category dropdown (pick an existing knowledge base, or type a new one) ────
+// The dropdown's options are populated centrally by fillSelects() alongside the
+// other domain selects, so it refreshes on startup and after every build.
+function onImportCategoryPick(value) {
+  if (value) document.getElementById('import-domain').value = value;
+  clearImportPreview();
+}
+
+// ── Conversion preview (verify extraction before building) ───────────────────
+function clearImportPreview() {
+  const box = document.getElementById('import-preview');
+  if (box) { box.style.display = 'none'; box.innerHTML = ''; }
+}
+
+function renderImportPreview(items) {
+  const box = document.getElementById('import-preview');
+  box.innerHTML = items.map(it => {
+    if (it.error) {
+      return `<div style="margin-bottom:8px;">
+        <div style="font-size:11px;color:var(--red);">✖ ${esc(it.name)}：${esc(it.error)}</div></div>`;
+    }
+    const more = it.truncated ? ' …（预览截断）' : '';
+    return `<div style="margin-bottom:10px;">
+      <div style="font-size:11px;color:var(--green);">✔ ${esc(it.name)} · ${it.chars} 字</div>
+      <pre style="margin:4px 0 0;white-space:pre-wrap;word-break:break-word;font-size:11.5px;
+                  color:var(--text);font-family:inherit;">${esc(it.markdown)}${more}</pre></div>`;
+  }).join('');
+  box.style.display = 'block';
+}
+
+async function previewImport(mode) {
+  const fd = new FormData();
+  if (mode === 'file') {
+    const files = document.getElementById('import-files').files;
+    if (!files || !files.length) { alert('请先选择文件'); return; }
+    for (const f of files) fd.append('files', f);
+  } else {
+    const text = document.getElementById('paste-text').value.trim();
+    if (!text) { alert('请先粘贴正文内容'); return; }
+    fd.append('text', text);
+    fd.append('title', document.getElementById('paste-title').value.trim());
+  }
+  const box = document.getElementById('import-preview');
+  box.style.display = 'block';
+  box.innerHTML = '<div style="font-size:11px;color:var(--muted);">⏳ 正在解析预览…</div>';
+  try {
+    const r = await fetch('/api/wiki/preview', { method: 'POST', body: fd });
+    const d = await r.json();
+    if (!r.ok) { box.innerHTML = `<div style="font-size:11px;color:var(--red);">${esc(d.detail || '预览失败')}</div>`; return; }
+    renderImportPreview(d.items || []);
+  } catch(e) {
+    box.innerHTML = `<div style="font-size:11px;color:var(--red);">网络错误: ${esc(e.message)}</div>`;
+  }
 }
 
 async function importFiles() {
