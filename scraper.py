@@ -28,6 +28,7 @@ import html2text
 import aiohttp
 
 import db_manager
+import content_filter
 from site_analyzer import analyze_site_structure
 
 # ── Global state ────────────────────────────────────────────────────────────
@@ -342,6 +343,19 @@ def determine_static_boundary(start_url: str) -> str:
             base_path += '/'
     return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, base_path, '', '', ''))
 
+def compute_link_density(soup) -> float:
+    """Fraction of the page's text that lives inside <a> tags. High density →
+    navigation / link-list hub rather than an article. Returns 0.0 on error."""
+    try:
+        total = soup.get_text(strip=True)
+        if not total:
+            return 1.0
+        link_text = ''.join(a.get_text(strip=True) for a in soup.find_all('a'))
+        return min(1.0, len(link_text) / max(1, len(total)))
+    except Exception:
+        return 0.0
+
+
 def get_sub_domain_links(html: str, current_url: str, base_url: str,
                           dynamic_root_prefix=None) -> list:
     soup = BeautifulSoup(html, 'lxml')
@@ -355,6 +369,10 @@ def get_sub_domain_links(html: str, current_url: str, base_url: str,
         parsed = urllib.parse.urlparse(full_url)
         ext = os.path.splitext(parsed.path)[1].lower()
         if parsed.scheme in ['http', 'https'] and ext not in ignored:
+            # Drop structurally non-content URLs (login/search/share/feeds…) up
+            # front so they never enter the queue or cost a fetch.
+            if content_filter.should_skip_url(full_url):
+                continue
             if (full_url.lower() == base_url.lower() or
                     full_url.lower().startswith(base_prefix.lower())):
                 links.append(full_url)
@@ -519,9 +537,14 @@ async def process_single_url(task_id: str, current_url: str, start_url: str,
             _skip("↩ 跳过 (列表/导航页)", "list_page")
             return
 
-        # Skip near-empty pages (navigation hubs / index pages)
-        if len(content_md.strip()) < 100:
-            _skip("↩ 跳过 (内容过少)", "content_too_short")
+        # Quality gate: only keep formal, paragraphed, substantial prose. Drops
+        # nav hubs (high link density), menu/list pages, number/symbol dumps and
+        # near-empty stubs — the knowledge base only wants real article content.
+        link_density = compute_link_density(full_soup)
+        low_quality, reason = content_filter.is_low_quality_content(
+            content_md, link_density)
+        if low_quality:
+            _skip(f"↩ 跳过 (低质量内容: {reason})", f"low_quality:{reason}")
             return
 
         # Page has real content — reset the branch-skip counter
@@ -543,6 +566,17 @@ async def process_single_url(task_id: str, current_url: str, start_url: str,
                 )
                 record_domain_success(domain)
                 return
+
+        # ── Cross-URL duplicate content: same article reached via another URL ──
+        # (mirror pages, print/lang variants, trailing-slash dups). Skip the
+        # redundant download instead of saving a second identical file.
+        if await asyncio.to_thread(
+                db_manager.content_hash_seen, task_id, new_hash, current_url):
+            push_status(task_id, f"↩ 跳过 (内容与已保存页面重复): {title}", "info")
+            await asyncio.to_thread(
+                db_manager.mark_url_filtered, task_id, current_url, "duplicate_content")
+            record_domain_success(domain)
+            return
 
         # ── Save flat file ──
         slug = url_to_slug(current_url)

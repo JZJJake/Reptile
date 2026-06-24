@@ -4,6 +4,8 @@ import json
 from datetime import datetime
 from typing import List, Dict, Optional, Any
 
+import content_filter
+
 DB_FILE = 'scraper_state.db'
 
 def init_db():
@@ -42,11 +44,23 @@ def init_db():
             UNIQUE(task_id, url)
         )
     ''')
-    for col in ['content_hash TEXT', 'last_crawled_at TEXT', 'saved_file TEXT']:
+    for col in ['content_hash TEXT', 'last_crawled_at TEXT', 'saved_file TEXT',
+                'priority INTEGER DEFAULT 10']:
         try:
             cursor.execute(f'ALTER TABLE urls ADD COLUMN {col}')
         except sqlite3.OperationalError:
             pass
+    # Index to make priority-ordered dequeue and content-hash dedup fast at scale.
+    try:
+        cursor.execute(
+            'CREATE INDEX IF NOT EXISTS idx_urls_dequeue '
+            'ON urls(task_id, status, priority, id)'
+        )
+        cursor.execute(
+            'CREATE INDEX IF NOT EXISTS idx_urls_hash ON urls(task_id, content_hash)'
+        )
+    except sqlite3.OperationalError:
+        pass
 
     # Cache DeepSeek site analysis per domain
     cursor.execute('''
@@ -128,14 +142,16 @@ def get_active_tasks() -> List[dict]:
 
 def get_and_lock_pending_url(task_id: str) -> "Optional[tuple[str, Optional[str]]]":
     """Return (url, parent_url) for the next pending URL, or None.
-    Uses FIFO ordering (ORDER BY id ASC) for breadth-first crawl — avoids
-    depth-first spirals where a dead branch consumes all workers."""
+    Ordering: priority DESC then id ASC — article/detail pages (high priority)
+    are crawled before list/index pages, while id ASC keeps breadth-first FIFO
+    within a priority band, avoiding depth-first spirals that starve workers."""
     conn = None
     try:
         conn = get_db_connection()
         conn.execute("BEGIN EXCLUSIVE")
         row = conn.execute(
-            'SELECT url, parent_url FROM urls WHERE task_id=? AND status=? ORDER BY id ASC LIMIT 1',
+            'SELECT url, parent_url FROM urls WHERE task_id=? AND status=? '
+            'ORDER BY priority DESC, id ASC LIMIT 1',
             (task_id, 'pending')
         ).fetchone()
         if row:
@@ -221,15 +237,47 @@ def get_url_content_hash(task_id: str, url: str) -> Optional[str]:
     return row['content_hash'] if row else None
 
 def add_discovered_urls(task_id: str, parent_url: str, new_urls: List[str]):
+    """Queue newly-discovered URLs. Structurally non-content URLs (login/search/
+    share/feeds…) are dropped here so they never cost a fetch; each kept URL is
+    tagged with a crawl priority (article/detail > default > home > list) that
+    drives dequeue ordering. INSERT OR IGNORE + UNIQUE(task_id,url) prevents
+    re-queuing a URL already seen (anti-duplicate traversal)."""
     conn = get_db_connection()
     cursor = conn.cursor()
     for u in new_urls:
+        if content_filter.should_skip_url(u):
+            continue
         cursor.execute(
-            'INSERT OR IGNORE INTO urls (task_id, url, parent_url, status) VALUES (?,?,?,?)',
-            (task_id, u, parent_url, 'pending')
+            'INSERT OR IGNORE INTO urls (task_id, url, parent_url, status, priority) '
+            'VALUES (?,?,?,?,?)',
+            (task_id, u, parent_url, 'pending', content_filter.url_priority(u))
         )
     conn.commit()
     conn.close()
+
+
+def content_hash_seen(task_id: str, content_hash: str,
+                      exclude_url: str = None) -> bool:
+    """True if some already-scraped URL in this task saved identical content
+    (same hash). Lets the crawler skip re-downloading the same article reached
+    via a different URL — anti-duplicate DOWNLOAD on top of anti-duplicate
+    traversal."""
+    if not content_hash:
+        return False
+    conn = get_db_connection()
+    if exclude_url:
+        row = conn.execute(
+            "SELECT 1 FROM urls WHERE task_id=? AND content_hash=? AND status='scraped' "
+            "AND url<>? LIMIT 1",
+            (task_id, content_hash, exclude_url)
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT 1 FROM urls WHERE task_id=? AND content_hash=? AND status='scraped' LIMIT 1",
+            (task_id, content_hash)
+        ).fetchone()
+    conn.close()
+    return row is not None
 
 def get_url_tree(task_id: str) -> List[Dict[str, Any]]:
     conn = get_db_connection()
